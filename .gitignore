@@ -1,0 +1,26 @@
+# Local secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+
+# Personal resume files and exported profile data
+*.pdf
+*.doc
+*.docx
+*.rtf
+*resume*.json
+*profile*.json
+
+# Browser, editor, and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+*.tmp
+
+# Packaged extension output
+*.crx
+*.zip
+dist/

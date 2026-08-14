@@ -1,0 +1,100 @@
+.resume-autofill-filled {
+  outline: 2px solid #12b76a !important;
+  outline-offset: 2px !important;
+  transition: outline-color .2s ease;
+}
+.resume-autofill-unmatched {
+  outline: 2px dashed #f79009 !important;
+  outline-offset: 2px !important;
+}
+.resume-autofill-toast {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  right: 22px !important;
+  bottom: 22px !important;
+  max-width: 360px !important;
+  padding: 13px 16px !important;
+  border-radius: 10px !important;
+  background: #101828 !important;
+  color: white !important;
+  box-shadow: 0 14px 40px rgba(16, 24, 40, .28) !important;
+  font: 13px/1.5 Inter, "PingFang SC", "Microsoft YaHei", sans-serif !important;
+}
+.resume-autofill-completion {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  right: 22px !important;
+  bottom: 22px !important;
+  width: min(380px, calc(100vw - 44px)) !important;
+  box-sizing: border-box !important;
+  padding: 16px 18px !important;
+  border: 1px solid #75e0a7 !important;
+  border-radius: 12px !important;
+  background: #ecfdf3 !important;
+  color: #054f31 !important;
+  box-shadow: 0 16px 48px rgba(16, 24, 40, .24) !important;
+  font: 13px/1.55 Inter, "PingFang SC", "Microsoft YaHei", sans-serif !important;
+  max-height: min(76vh, 680px) !important;
+  overflow: auto !important;
+}
+.resume-autofill-completion__header {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 12px !important;
+  margin-bottom: 8px !important;
+  font-size: 16px !important;
+}
+.resume-autofill-completion p {
+  margin: 5px 0 !important;
+}
+.resume-autofill-completion button {
+  appearance: none !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: #067647 !important;
+  cursor: pointer !important;
+  padding: 0 4px !important;
+  font: 24px/1 sans-serif !important;
+}
+
+.resume-autofill-completion__hint {
+  color: #36634e !important;
+  font-size: 12px !important;
+}
+
+.resume-autofill-completion details {
+  margin: 8px 0 !important;
+  padding-top: 6px !important;
+  border-top: 1px solid rgba(6, 118, 71, .16) !important;
+}
+
+.resume-autofill-completion summary {
+  cursor: pointer !important;
+  font-weight: 600 !important;
+}
+
+.resume-autofill-completion ol {
+  margin: 6px 0 0 !important;
+  padding-left: 22px !important;
+  color: #234f3b !important;
+}
+
+.resume-autofill-completion li {
+  margin: 3px 0 !important;
+  overflow-wrap: anywhere !important;
+}
+
+.resume-autofill-completion__actions {
+  display: flex !important;
+  justify-content: flex-end !important;
+  margin-top: 10px !important;
+}
+
+.resume-autofill-completion .resume-autofill-completion__action {
+  border: 1px solid #067647 !important;
+  border-radius: 7px !important;
+  padding: 6px 10px !important;
+  background: #fff !important;
+  font: 600 12px/1.2 Inter, "PingFang SC", "Microsoft YaHei", sans-serif !important;
+}

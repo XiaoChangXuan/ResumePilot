@@ -1,0 +1,56 @@
+:root { font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif; color: #182230; background: #f5f7fb; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.shell { width: min(980px, calc(100% - 32px)); margin: 34px auto 60px; }
+header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 24px; }
+.eyebrow { color: #2563eb; letter-spacing: .14em; font-size: 11px; font-weight: 800; }
+h1 { font-size: 30px; letter-spacing: -.03em; margin: 5px 0 8px; }
+header p, .section-note { color: #667085; margin: 0; font-size: 13px; }
+.save-state { background: #eef2ff; color: #3730a3; padding: 8px 12px; border-radius: 99px; font-size: 12px; white-space: nowrap; }
+.save-state.saved { background: #ecfdf3; color: #067647; }
+form { display: grid; gap: 16px; }
+section { background: white; border: 1px solid #e4e7ec; border-radius: 14px; padding: 22px; box-shadow: 0 4px 18px rgba(16, 24, 40, .035); }
+h2 { margin: 0 0 18px; font-size: 17px; }
+.import-card { margin-bottom: 16px; }
+.import-copy h2 { margin: 6px 0 7px; }
+.import-copy p { margin: 0 0 16px; color: #667085; font-size: 13px; line-height: 1.55; }
+.step { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .08em; }
+.resume-drop { position: relative; display: grid; place-items: center; gap: 4px; min-height: 132px; border: 1.5px dashed #98a2b3; border-radius: 12px; color: #344054; background: #f9fafb; cursor: pointer; }
+.resume-drop.dragging { border-color: #2563eb; background: #eff6ff; }
+.resume-drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.resume-drop strong { font-size: 14px; }
+.resume-drop span { color: #667085; font-size: 12px; }
+.keep-file { display: flex; grid-template-columns: auto 1fr; align-items: center; gap: 8px; margin-top: 13px; font-weight: 500; }
+.keep-file input { width: auto; }
+.resume-file-state { margin-top: 11px; color: #667085; font-size: 12px; }
+.resume-file-state.saved { color: #067647; }
+.resume-file-state button { padding: 3px 8px; margin-left: 8px; color: #b42318; font-size: 11px; }
+.parse-result { display: none; margin-top: 14px; padding: 12px 14px; border-radius: 9px; background: #ecfdf3; color: #067647; font-size: 12px; line-height: 1.6; }
+.parse-result.show { display: block; }
+.parse-result.error { display: block; background: #fef3f2; color: #b42318; }
+.text-preview { margin-top: 12px; color: #475467; font-size: 12px; }
+.text-preview[open] summary { margin-bottom: 8px; }
+.text-preview pre { max-height: 260px; overflow: auto; white-space: pre-wrap; padding: 12px; border-radius: 8px; background: #101828; color: #e4e7ec; font: 11px/1.55 ui-monospace, Consolas, monospace; }
+.section-note { margin: -9px 0 18px; }
+.section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 17px; }
+.section-heading h2 { margin-bottom: 10px; }
+.section-heading .section-note { margin: 0; }
+.add-entry { flex: none; padding: 7px 10px; color: #175cd3; border-color: #b2ccff; background: #eff8ff; }
+.entries { display: grid; gap: 14px; }
+.entry { padding: 17px; border: 1px solid #eaecf0; border-radius: 11px; background: #fcfcfd; }
+.entry-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.entry-head strong { font-size: 13px; }
+.entry-head button { padding: 4px 8px; color: #b42318; font-size: 11px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 18px; }
+label { display: grid; gap: 7px; color: #344054; font-size: 13px; font-weight: 600; }
+.wide { grid-column: 1 / -1; }
+input, select, textarea { width: 100%; border: 1px solid #d0d5dd; border-radius: 8px; padding: 10px 11px; color: #101828; background: white; font: inherit; outline: none; }
+textarea { resize: vertical; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: #528bff; box-shadow: 0 0 0 3px rgba(37, 99, 235, .11); }
+footer { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 4px; }
+button, .file-button { border: 1px solid #d0d5dd; border-radius: 8px; padding: 10px 14px; background: white; color: #344054; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
+button.primary { background: #2563eb; color: white; border-color: #2563eb; min-width: 130px; }
+button.danger { color: #b42318; margin-left: auto; }
+.file-button { display: inline-flex; }
+.file-button input { display: none; }
+@media (max-width: 680px) { .grid { grid-template-columns: 1fr; } .wide { grid-column: auto; } header { display: block; } .save-state { display: inline-block; margin-top: 14px; } button.danger { margin-left: 0; } }

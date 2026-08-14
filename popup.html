@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>简历一键填表</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mark">简</div>
+      <div>
+        <h1>简历一键填表</h1>
+        <p>本地资料 · 人工确认提交</p>
+      </div>
+    </header>
+
+    <div id="profileStatus" class="status">正在读取资料…</div>
+    <div id="resumeStatus" class="resume-status">正在检查简历附件…</div>
+
+    <label class="toggle">
+      <input id="overwrite" type="checkbox">
+      <span>覆盖页面中已有内容</span>
+    </label>
+
+    <button id="uploadResumeButton" class="primary upload" type="button">① 先上传并解析简历</button>
+    <button id="fillButton" class="primary" type="button">② 补充填写当前页面</button>
+    <button id="optionsButton" class="secondary" type="button">编辑我的资料</button>
+    <button id="diagnoseButton" class="secondary" type="button">复制当前页面诊断信息</button>
+    <button id="clearButton" class="link" type="button">清除页面填写标记</button>
+
+    <div id="result" class="result" aria-live="polite"></div>
+    <p class="footnote">插件不会点击“提交”。请检查所有内容，尤其是薪资、日期和资格类问题。</p>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

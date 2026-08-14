@@ -38,7 +38,7 @@ async function loadAISettings() {
   aiModel.value = config.model;
   aiApiKey.value = config.apiKey;
   const complete = Boolean(config.model && config.apiKey);
-  setAIConfigState(complete ? '已保存；填写失败时可用于下拉框语义复核' : '尚未完整配置', complete ? 'saved' : '');
+  setAIConfigState(complete ? '已保存；可用于候选选择和缺失文本生成' : '尚未完整配置', complete ? 'saved' : '');
 }
 
 const DIRECT_ADMINISTRATIONS = /^(?:北京市|上海市|天津市|重庆市|香港特别行政区|澳门特别行政区)$/;
@@ -420,7 +420,7 @@ aiConfigForm.addEventListener('submit', async (event) => {
   try {
     const permitted = await requestAIGatewayPermission();
     await saveAIConfig({ model, apiKey });
-    setAIConfigState(permitted ? '保存成功；已启用下拉框失败复核' : '配置已保存，但未授权访问 AI 网关', permitted ? 'saved' : 'error');
+    setAIConfigState(permitted ? '保存成功；已启用候选选择和缺失文本生成' : '配置已保存，但未授权访问 AI 网关', permitted ? 'saved' : 'error');
   } catch (error) {
     setAIConfigState(`保存失败：${error?.message || error}`, 'error');
   }

@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.6.52';
+  const CONTENT_SCRIPT_VERSION = '0.6.53';
   if (globalThis.__resumeAutofillLoadedVersion === CONTENT_SCRIPT_VERSION) return;
   globalThis.__resumeAutofillLoadedVersion = CONTENT_SCRIPT_VERSION;
   globalThis.__resumeAutofillLoaded = true;
@@ -108,6 +108,7 @@
     { key: 'linkedin', patterns: [/linkedin/] },
     { key: 'github', patterns: [/github/] },
     { key: 'portfolio', patterns: [/个人网站/, /作品集/, /个人主页/, /portfolio/, /personal\s*(site|website)/, /website/] },
+    { key: 'whyCompany', patterns: [/为何.*(?:加入|选择|应聘).*(?:本公司|公司|企业)/, /为什么.*(?:加入|选择|应聘)/, /加入.*(?:本公司|公司).*(?:原因|理由)/, /应聘.*(?:原因|理由|动机)/, /求职动机/, /why.*(?:join|company)/, /motivation/] },
     { key: 'summary', patterns: [/个人介绍/, /自我介绍/, /个人优势/, /自我评价/, /自我描述/, /个人简介/, /summary/, /about\s*you/, /bio/] },
     { key: 'needsSponsorship', patterns: [/签证担保/, /visa\s*sponsorship/, /require.*sponsorship/] },
     { key: 'workAuthorized', patterns: [/合法工作资格/, /工作授权/, /authorized\s*to\s*work/, /work\s*authorization/] },
@@ -1354,13 +1355,31 @@
     return String(target).replace(/(?:特别行政区|自治州|地区|盟|市|区|县|旗)$/u, '') || String(target);
   }
 
-  function interactionOptionPreview(session) {
+  function interactionOptionPreview(session, limit = 8) {
     const roots = discoverInteractionRoots(session);
     const texts = roots.flatMap((root) => [...root.querySelectorAll(OPTION_SELECTORS.join(','))])
       .filter(visible)
       .map((node) => cleanText(node.innerText || node.textContent))
       .filter((text) => text && text.length <= 50 && !GENERIC_PLACEHOLDER.test(text));
-    return [...new Set(texts)].slice(0, 8);
+    return [...new Set(texts)].slice(0, limit);
+  }
+
+  async function waitForInteractionOptionList(session, timeout = 2200) {
+    const started = Date.now();
+    let previous = '';
+    let stableRounds = 0;
+    let latest = [];
+    while (Date.now() - started < timeout) {
+      discoverInteractionRoots(session);
+      latest = interactionOptionPreview(session, 30);
+      const signature = latest.join('\u0000');
+      if (latest.length && signature === previous) stableRounds += 1;
+      else stableRounds = 0;
+      if (latest.length && stableRounds >= 2) return latest;
+      previous = signature;
+      await wait(100);
+    }
+    return latest;
   }
 
   async function findBestCustomSelectOption(session, element, target) {
@@ -1388,6 +1407,13 @@
     return Boolean(key && !CASCADE_LOCATION_KEYS.has(key) && !/Date$|Date\b/.test(key));
   }
 
+  const AI_LIST_FIRST_KEYS = new Set([
+    'highestDegree', 'degree', 'academicDegree', 'studyMode', 'ranking', 'rankingPercent',
+    'politicalStatus', 'maritalStatus', 'englishLevel', 'languageProficiency'
+  ]);
+
+  const AI_GENERATED_TEXT_KEYS = new Set(['summary', 'whyCompany']);
+
   async function applyAISelectSuggestion(element, trigger, value, key) {
     const session = beginDynamicInteraction(trigger);
     activateOption(trigger);
@@ -1406,8 +1432,10 @@
     return controlValueSatisfied(element, trigger, value, key);
   }
 
-  async function resolveCustomSelectMismatchWithAI(element, trigger, key, target, candidates = []) {
+  async function resolveCustomSelectMismatchWithAI(element, trigger, key, target, candidates = [], options = {}) {
     if (!aiSelectReviewEligible(key)) return false;
+    const silent = Boolean(options.silent);
+    const recordClear = options.recordClear !== false;
     const observed = controlReadback(element, trigger);
     const safeCandidates = [...new Set(candidates.map(cleanText).filter(Boolean))].slice(0, 20);
     let response;
@@ -1423,11 +1451,11 @@
         }
       });
     } catch (error) {
-      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核调用失败：${error?.message || error}`);
+      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核调用失败：${error?.message || error}`);
       return false;
     }
     if (!response?.ok) {
-      if (response?.enabled) {
+      if (!silent && response?.enabled) {
         fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核失败：${response.reason || '未知错误'}`);
       }
       return false;
@@ -1441,7 +1469,7 @@
       return true;
     }
     if (response.decision === 'keep') {
-      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议保留，但页面没有可确认的非占位选中值`);
+      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议保留，但页面没有可确认的非占位选中值`);
       return false;
     }
     if (response.decision === 'select' && safeCandidates.includes(response.value)) {
@@ -1455,19 +1483,98 @@
         fillFailureReasons.delete(element);
         return true;
       }
-      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议改选“${response.value}”，但页面未接受`);
+      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议改选“${response.value}”，但页面未接受`);
     }
-    if (response.decision === 'clear') {
+    if (response.decision === 'clear' && recordClear) {
       fillAIClearRequests.add(element);
-      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核建议清除：${response.reason || '无法安全确认目标与页面值一致'}`);
+      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核建议清除：${response.reason || '无法安全确认目标与页面值一致'}`);
     }
     return false;
+  }
+
+  function redactAIText(value, profile = {}) {
+    let text = cleanText(value)
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig, '[邮箱已隐藏]')
+      .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '[手机号已隐藏]')
+      .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, '[证件号已隐藏]');
+    const directSecrets = [profile.fullName, profile.phone, profile.email, profile.identityDocumentNumber, profile.address]
+      .map((item) => cleanText(item)).filter((item) => item.length >= 2);
+    for (const secret of directSecrets) text = text.split(secret).join('[个人信息已隐藏]');
+    return text;
+  }
+
+  function aiProfileContext(profile) {
+    const compactEntries = (entries, keys, limit = 6) => (Array.isArray(entries) ? entries : []).slice(0, limit).map((entry) => {
+      const result = {};
+      for (const key of keys) {
+        const value = redactAIText(entry?.[key], profile);
+        if (value) result[key] = value.slice(0, 500);
+      }
+      return result;
+    }).filter((entry) => Object.keys(entry).length);
+    return {
+      education: compactEntries(profile.educationEntries, ['school', 'college', 'major', 'degree', 'academicDegree', 'studyMode', 'gpa', 'ranking']),
+      work: compactEntries(profile.workEntries, ['company', 'title', 'department', 'type', 'description']),
+      projects: compactEntries(profile.projectEntries, ['name', 'role', 'description']),
+      certificates: compactEntries(profile.certificateEntries, ['name', 'level', 'issuer'], 8),
+      languages: compactEntries(profile.languageEntries, ['name', 'proficiency', 'certificate', 'score'], 8),
+      skills: [profile.computerSkills, profile.computerProficiency, profile.otherSkills, profile.skills]
+        .map((value) => redactAIText(value, profile)).filter(Boolean).map((value) => value.slice(0, 600)),
+      existingSummary: redactAIText(profile.summary, profile).slice(0, 600)
+    };
+  }
+
+  function aiPageContext(profile) {
+    const headings = [...document.querySelectorAll('h1,h2,h3,[role="heading"],[class*="company-name"],[class*="job-title"]')]
+      .filter(visible).map((node) => redactAIText(node.textContent, profile)).filter(Boolean).slice(0, 10);
+    return {
+      title: redactAIText(document.title, profile).slice(0, 180),
+      host: location.hostname,
+      headings
+    };
+  }
+
+  async function requestAIGeneratedText(profile, key, field, element) {
+    if (!AI_GENERATED_TEXT_KEYS.has(key)) return null;
+    const declaredMax = Number(element.maxLength);
+    const maxLength = declaredMax > 0 ? Math.min(declaredMax, 600) : (key === 'whyCompany' ? 220 : 260);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'RESUME_AUTOFILL_AI_GENERATE_TEXT',
+        input: {
+          field: readableField(field, element), key, maxLength,
+          profileContext: aiProfileContext(profile),
+          pageContext: aiPageContext(profile)
+        }
+      });
+      if (!response?.ok || !cleanText(response.value)) {
+        return { value: '', error: response?.reason || 'AI 未返回可填写正文' };
+      }
+      return {
+        value: cleanText(response.value).slice(0, maxLength),
+        reason: response.reason || '根据去标识化经历信息生成'
+      };
+    } catch (error) {
+      return { value: '', error: error?.message || String(error) };
+    }
   }
 
   async function fillCustomSelect(element, value, key = '') {
     const trigger = customSelectTrigger(element);
     if (!trigger) return false;
     const snapshot = captureFillState(element, trigger);
+    if (AI_LIST_FIRST_KEYS.has(key)) {
+      const listSession = beginDynamicInteraction(trigger);
+      activateOption(trigger);
+      const listCandidates = await waitForInteractionOptionList(listSession);
+      await settleDynamicInteraction(listSession, element, 'AI 候选读取弹层', false);
+      if (listCandidates.length && await resolveCustomSelectMismatchWithAI(
+        element, trigger, key, value, listCandidates, { silent: true, recordClear: false }
+      )) {
+        trigger.classList.add(FILLED_CLASS);
+        return true;
+      }
+    }
     const session = beginDynamicInteraction(trigger);
     activateOption(trigger);
     // 可编辑地区控件先直接搜索最末级区/县；只读级联控件则保留
@@ -3120,7 +3227,7 @@
     actions.appendChild(copy);
 
     panel.append(header, summary, issues, legend, timing, explanation);
-    appendDiagnosticTable('绿色：AI 语义复核后保留或改选', stats.diagnostics.aiReview, 'ai-review');
+    appendDiagnosticTable('绿色：AI 生成、保留或改选', stats.diagnostics.aiReview, 'ai-review');
     if (!appendDiagnosticTable('红色：处理失败', stats.diagnostics.unsupported, 'unsupported', true)) appendDetails('实际处理失败', stats.details.unsupported);
     if (!appendDiagnosticTable('黄色：本地资料缺失', stats.diagnostics.missingData, 'missing')) appendDetails('本地资料缺失', stats.details.missingData);
     if (!appendDiagnosticTable('紫色：页面字段未映射', stats.diagnostics.unmatched, 'unmatched')) appendDetails('资料字段未映射', stats.details.unmatched);
@@ -4449,7 +4556,27 @@
         ? educationEntryResolution(profile, text, fallbackOccurrence)
         : { explicit: false, index: fallbackOccurrence, label: '' };
       const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
-      const value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
+      let value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
+      let aiGenerated = null;
+      // 本地没有自我评价/求职动机时，先保护页面已有内容；只有页面也为空
+      // 或用户明确开启覆盖时，才让 AI 基于去标识化经历信息生成正文。
+      if (!value && AI_GENERATED_TEXT_KEYS.has(key) && !logicalTrigger
+        && !overwrite && hasValue(element) && type !== 'radio' && type !== 'checkbox') {
+        markFillResult(element, EXISTING_CLASS);
+        stats.existing += 1;
+        const field = readableField(text, element);
+        const observed = controlReadback(element, null);
+        stats.details.existing.push(`${field}（页面已有：${diagnosticValue(observed)}）`);
+        recordDiagnostic(stats, 'existing', {
+          field, key, observed, stage: 'AI 生成前检查',
+          reason: '本地资料为空，但页面已有明确内容且未开启覆盖；保留页面内容，不调用 AI'
+        });
+        continue;
+      }
+      if (!value && AI_GENERATED_TEXT_KEYS.has(key) && !logicalTrigger && type !== 'radio' && type !== 'checkbox') {
+        aiGenerated = await requestAIGeneratedText(profile, key, text, element);
+        if (aiGenerated?.value) value = aiGenerated.value;
+      }
       if (!value) {
         markFillResult(logicalTrigger || element, MISSING_CLASS);
         stats.missingData += 1;
@@ -4458,6 +4585,8 @@
           field: readableField(text, element), key, stage: '本地资料取值',
           reason: educationResolution.explicit && occurrence < 0
             ? `页面字段明确指定${educationResolution.label}，但本地资料中没有对应教育经历；未尝试操作页面`
+            : aiGenerated?.error
+              ? `页面字段已映射为 ${key}，本地资料为空；AI 生成未完成：${aiGenerated.error}`
             : `页面字段已映射为 ${key}，但本地资料第 ${occurrence + 1} 个对应值为空；未尝试操作页面`
         });
         continue;
@@ -4486,6 +4615,12 @@
         if (filled) group.find((radio) => radio.checked)?.classList.add(FILLED_CLASS);
       } else {
         fillSnapshot = captureFillState(element, logicalTrigger || element);
+        if (aiGenerated) {
+          fillAIReviews.set(element, {
+            decision: '生成文本', target: '本地资料为空', observed: aiGenerated.value,
+            value: aiGenerated.value, reason: aiGenerated.reason
+          });
+        }
         filled = await fillElement(element, value, key, binding?.part || '');
         // 部分 React/Vue 组件已经成功更新可见值，却不会更新原始 input.value。
         // 在判红前再做一次独立回读，只要可见选中值与目标匹配就按成功处理。
@@ -4503,7 +4638,7 @@
           recordDiagnostic(stats, 'aiReview', {
             field: readableField(text, element), key, target: value,
             observed: aiReview.observed || controlReadback(element, logicalTrigger),
-            stage: `AI 语义复核：${aiReview.decision}`,
+            stage: `AI 表单辅助：${aiReview.decision}`,
             reason: `${aiReview.reason}${aiReview.value ? `；采用值：${aiReview.value}` : ''}`
           });
         }

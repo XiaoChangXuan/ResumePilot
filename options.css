@@ -53,4 +53,13 @@ button.primary { background: #2563eb; color: white; border-color: #2563eb; min-w
 button.danger { color: #b42318; margin-left: auto; }
 .file-button { display: inline-flex; }
 .file-button input { display: none; }
+.ai-config-card { margin-top: 16px; }
+.ai-config-badge { flex: none; padding: 5px 8px; border: 1px solid #b2ccff; border-radius: 999px; background: #eff8ff; color: #175cd3; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+.secret-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.secret-input button { min-width: 68px; padding: 8px 10px; }
+.ai-security-note { margin: 14px 0 0; color: #b54708; font-size: 12px; line-height: 1.55; }
+.ai-config-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
+.ai-config-state { color: #667085; font-size: 12px; }
+.ai-config-state.saved { color: #067647; }
+.ai-config-state.error { color: #b42318; }
 @media (max-width: 680px) { .grid { grid-template-columns: 1fr; } .wide { grid-column: auto; } header { display: block; } .save-state { display: inline-block; margin-top: 14px; } button.danger { margin-left: 0; } }

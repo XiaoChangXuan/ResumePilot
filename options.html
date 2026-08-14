@@ -56,7 +56,9 @@
           <label>身高（cm）<input name="height" type="number" min="50" max="250"></label>
           <label>体重（kg）<input name="weight" type="number" min="20" max="300" step="0.1"></label>
           <label>生源地<input name="studentOrigin"></label>
-          <label>籍贯<input name="nativePlace"></label>
+          <label>籍贯－省/直辖市<input name="nativePlaceProvince" placeholder="例如：湖北省"></label>
+          <label>籍贯－市/地区<input name="nativePlaceCity" placeholder="例如：孝感市"></label>
+          <label>籍贯－区/县<input name="nativePlaceDistrict" placeholder="例如：孝南区"></label>
           <label>现居地<input name="currentResidence"></label>
           <label>户籍所在地<input name="householdRegistration"></label>
           <label>民族<input name="ethnicity" placeholder="例如：汉族"></label>
@@ -159,6 +161,38 @@
         <button id="clearProfile" class="danger" type="button">清空资料</button>
       </footer>
     </form>
+
+    <section class="ai-config-card" aria-labelledby="aiConfigTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="aiConfigTitle">AI 模块（尚未启用业务功能）</h2>
+          <p class="section-note">当前只保存连接配置，不会向网关发送简历、页面内容或测试请求。</p>
+        </div>
+        <span class="ai-config-badge">LOCAL CONFIG</span>
+      </div>
+      <form id="aiConfigForm">
+        <div class="grid">
+          <label>AI 网关
+            <input id="aiGatewayUrl" type="url" readonly>
+          </label>
+          <label>模型名
+            <input id="aiModel" name="model" autocomplete="off" placeholder="例如：公司网关中可用的模型名">
+          </label>
+          <label class="wide">API Key
+            <span class="secret-input">
+              <input id="aiApiKey" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="仅保存在当前 Chrome 的扩展本地存储">
+              <button id="toggleAiApiKey" type="button" aria-label="显示 API Key">显示</button>
+            </span>
+          </label>
+        </div>
+        <p class="ai-security-note">注意：该网关使用 HTTP。只应在可信的公司内网中使用，后续真正调用时才会单独请求网关访问权限。</p>
+        <div class="ai-config-actions">
+          <button class="primary" type="submit">保存 AI 配置</button>
+          <button id="clearAiConfig" type="button">清除 AI 配置</button>
+          <span id="aiConfigState" class="ai-config-state" aria-live="polite">尚未配置</span>
+        </div>
+      </form>
+    </section>
 
     <template id="familyTemplate">
       <article class="entry" data-kind="family"><div class="entry-head"><strong>家庭成员</strong><button type="button" data-remove>删除</button></div><div class="grid">

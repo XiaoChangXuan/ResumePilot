@@ -7,6 +7,7 @@ const resumeInput = document.querySelector('#resumeInput');
 const resumeDrop = document.querySelector('#resumeDrop');
 import { inferProfile } from './resume-parser.mjs';
 import { migrateLegacyResumeFile, removeResumeFile, saveResumeFile } from './resume-file-store.js';
+import { AI_GATEWAY_URL, clearAIConfig, loadAIConfig, saveAIConfig } from './ai-client.js';
 
 function setState(text, saved = false) {
   state.textContent = text;
@@ -19,6 +20,47 @@ function showParseResult(text, error = false) {
 }
 
 const entryKinds = ['family', 'education', 'work', 'project', 'certificate', 'language'];
+
+const aiConfigForm = document.querySelector('#aiConfigForm');
+const aiGatewayUrl = document.querySelector('#aiGatewayUrl');
+const aiModel = document.querySelector('#aiModel');
+const aiApiKey = document.querySelector('#aiApiKey');
+const aiConfigState = document.querySelector('#aiConfigState');
+
+function setAIConfigState(text, kind = '') {
+  aiConfigState.textContent = text;
+  aiConfigState.className = `ai-config-state${kind ? ` ${kind}` : ''}`;
+}
+
+async function loadAISettings() {
+  const config = await loadAIConfig();
+  aiGatewayUrl.value = AI_GATEWAY_URL;
+  aiModel.value = config.model;
+  aiApiKey.value = config.apiKey;
+  const complete = Boolean(config.model && config.apiKey);
+  setAIConfigState(complete ? '已保存（尚未发送任何请求）' : '尚未完整配置', complete ? 'saved' : '');
+}
+
+const DIRECT_ADMINISTRATIONS = /^(?:北京市|上海市|天津市|重庆市|香港特别行政区|澳门特别行政区)$/;
+
+function splitLocationPath(value) {
+  const raw = String(value || '').replace(/[\s,，/／>]+/g, '').trim();
+  if (!raw) return [];
+  const parts = raw.match(/.+?(?:特别行政区|自治区|自治州|省|市|地区|盟|区|县|旗)(?=.+|$)/g) || [];
+  const consumed = parts.join('');
+  const remainder = raw.startsWith(consumed) ? raw.slice(consumed.length) : '';
+  if (remainder) parts.push(remainder);
+  return parts.length ? parts : [raw];
+}
+
+function nativePlaceLevels(profile = {}) {
+  const explicit = [profile.nativePlaceProvince, profile.nativePlaceCity, profile.nativePlaceDistrict].map((value) => String(value || '').trim());
+  if (explicit.some(Boolean)) return explicit;
+  const parsed = splitLocationPath(profile.nativePlace);
+  const province = parsed[0] || '';
+  if (DIRECT_ADMINISTRATIONS.test(province) && parsed.length === 2) return [province, province, parsed[1]];
+  return [province, parsed[1] || '', parsed[2] || ''];
+}
 
 function normalizeEnglishLevel(value) {
   const text = String(value || '').trim();
@@ -37,6 +79,9 @@ function readEntries(kind) {
 
 function profileFromForm() {
   const profile = Object.fromEntries(new FormData(form).entries());
+  const nativePlaceParts = [profile.nativePlaceProvince, profile.nativePlaceCity, profile.nativePlaceDistrict]
+    .map((value) => String(value || '').trim()).filter(Boolean);
+  profile.nativePlace = nativePlaceParts.filter((value, index) => index === 0 || value !== nativePlaceParts[index - 1]).join('');
   for (const kind of entryKinds) profile[`${kind}Entries`] = readEntries(kind);
   profile.englishLevel = normalizeEnglishLevel(profile.englishLevel);
   if (profile.educationEntries.length) {
@@ -133,8 +178,12 @@ function renumberEntries(kind) {
 
 function populateForm(profile = {}, onlyEmpty = false) {
   const savedEnglish = profile.languageEntries?.find((entry) => /^(?:英语|英文|english)$/i.test(entry.name || ''));
+  const [nativePlaceProvince, nativePlaceCity, nativePlaceDistrict] = nativePlaceLevels(profile);
   profile = {
     ...profile,
+    nativePlaceProvince: profile.nativePlaceProvince || nativePlaceProvince,
+    nativePlaceCity: profile.nativePlaceCity || nativePlaceCity,
+    nativePlaceDistrict: profile.nativePlaceDistrict || nativePlaceDistrict,
     englishLevel: normalizeEnglishLevel(profile.englishLevel || savedEnglish?.certificate || savedEnglish?.proficiency || '')
     , englishListeningSpeaking: profile.englishListeningSpeaking || savedEnglish?.listeningSpeaking || ''
     , englishReadingWriting: profile.englishReadingWriting || savedEnglish?.readingWriting || ''
@@ -359,5 +408,39 @@ document.querySelector('#clearProfile').addEventListener('click', async () => {
   setState('资料已清空');
 });
 
+aiConfigForm.addEventListener('input', () => setAIConfigState('AI 配置有未保存的修改'));
+aiConfigForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const model = aiModel.value.trim();
+  const apiKey = aiApiKey.value.trim();
+  if (!model || !apiKey) {
+    setAIConfigState(`请补充${!model ? '模型名' : 'API Key'}`, 'error');
+    return;
+  }
+  try {
+    await saveAIConfig({ model, apiKey });
+    setAIConfigState('保存成功；本版未发送任何 AI 请求', 'saved');
+  } catch (error) {
+    setAIConfigState(`保存失败：${error?.message || error}`, 'error');
+  }
+});
+
+document.querySelector('#toggleAiApiKey').addEventListener('click', (event) => {
+  const showing = aiApiKey.type === 'text';
+  aiApiKey.type = showing ? 'password' : 'text';
+  event.currentTarget.textContent = showing ? '显示' : '隐藏';
+  event.currentTarget.setAttribute('aria-label', showing ? '显示 API Key' : '隐藏 API Key');
+});
+
+document.querySelector('#clearAiConfig').addEventListener('click', async () => {
+  if (!confirm('确定清除保存在当前 Chrome 中的模型名和 API Key 吗？')) return;
+  await clearAIConfig();
+  aiModel.value = '';
+  aiApiKey.value = '';
+  aiApiKey.type = 'password';
+  document.querySelector('#toggleAiApiKey').textContent = '显示';
+  setAIConfigState('AI 配置已清除');
+});
+
 textPreview.hidden = true;
-await Promise.all([loadProfile(), updateResumeFileState()]);
+await Promise.all([loadProfile(), updateResumeFileState(), loadAISettings()]);

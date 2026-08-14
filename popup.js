@@ -145,9 +145,10 @@ fillButton.addEventListener('click', async () => {
       overwrite: $('#overwrite').checked
     });
     const examples = [];
-    if (summary.details?.unmatched?.length) examples.push(`未识别示例：${summary.details.unmatched.slice(0, 3).join('、')}`);
-    if (summary.details?.missingData?.length) examples.push(`资料为空示例：${summary.details.missingData.slice(0, 3).join('、')}`);
-    if (summary.details?.unsupported?.length) examples.push(`控件不兼容示例：${summary.details.unsupported.slice(0, 3).join('、')}`);
+    if (summary.details?.unmatched?.length) examples.push(`资料字段未映射示例：${summary.details.unmatched.slice(0, 3).join('、')}`);
+    if (summary.details?.missingData?.length) examples.push(`本地资料缺失示例：${summary.details.missingData.slice(0, 3).join('、')}`);
+    if (summary.details?.unsupported?.length) examples.push(`实际处理失败示例：${summary.details.unsupported.slice(0, 3).join('、')}`);
+    if (summary.details?.ignored?.length) examples.push(`有意忽略示例：${summary.details.ignored.slice(0, 3).join('、')}`);
     const sectionText = `${summary.sectionsAdded ? `已新增经历表单 ${summary.sectionsAdded} 段；` : ''}${summary.sectionAddFailed ? `仍缺少经历表单 ${summary.sectionAddFailed} 段；` : ''}`;
     const sectionPlan = (summary.sectionPlan || []).length
       ? `\n重复区块检查：${summary.sectionPlan.map((item) => `${item.label} 资料${item.desired}段/原有${item.existing}段/新增${item.added}段/最终${item.final}段`).join('；')}`
@@ -158,7 +159,7 @@ fillButton.addEventListener('click', async () => {
     const slowText = (summary.slowFields || []).length
       ? `\n最慢字段：${summary.slowFields.slice(0, 5).map((item) => `${item.field}→${item.key} ${(item.ms / 1000).toFixed(2)}秒${item.ok ? '' : '（失败）'}`).join('；')}`
       : '';
-    showResult(`补填完成：已填写 ${summary.filled} 项；${sectionText}跳过已有内容 ${summary.existing} 项；未识别字段 ${summary.unmatched} 项；资料为空 ${summary.missingData || 0} 项；控件不兼容 ${summary.unsupported || 0} 项。${sectionPlan}${timingText}${slowText}${examples.length ? `\n${examples.join('\n')}` : ''}`);
+    showResult(`补填完成：绿色成功 ${summary.filled} 项；${sectionText}蓝色已有值 ${summary.existing} 项；紫色未映射 ${summary.unmatched} 项；黄色资料缺失 ${summary.missingData || 0} 项；红色处理失败 ${summary.unsupported || 0} 项；灰色有意忽略 ${summary.ignored || 0} 项。\n逐项的目标值、页面回读值和判定原因已显示在网页右下角诊断表。${sectionPlan}${timingText}${slowText}${examples.length ? `\n${examples.join('\n')}` : ''}`);
   } catch (error) {
     showResult(error.message || '填写失败，请刷新页面后重试。', true);
   } finally {
@@ -170,9 +171,18 @@ fillButton.addEventListener('click', async () => {
 $('#optionsButton').addEventListener('click', () => chrome.runtime.openOptionsPage());
 $('#diagnoseButton').addEventListener('click', async () => {
   try {
+    const audit = await sendToPage({ type: 'RESUME_AUTOFILL_AUDIT_SHOW' });
+    const counts = audit.counts?.audit || {};
+    showResult(`页面解析结果已显示在网页右侧，并已按输入方式给原控件着色。共发现 ${audit.counts?.interactive || 0} 个可见交互元素：已有交互处理器 ${counts['understood-supported'] || 0} 个、已识别但当前处理不了 ${counts['understood-unsupported'] || 0} 个、交互方式未适配 ${counts['not-understood'] || 0} 个、安全忽略 ${counts['safe-ignored'] || 0} 个。资料字段是否成功映射只作为附加信息；这个步骤不会填写或点击网页。`);
+  } catch (error) {
+    showResult(`显示识别审计失败：${error.message}`, true);
+  }
+});
+$('#copyDiagnoseButton').addEventListener('click', async () => {
+  try {
     const diagnosis = await sendToPage({ type: 'RESUME_AUTOFILL_DIAGNOSE' });
     await navigator.clipboard.writeText(JSON.stringify(diagnosis, null, 2));
-    showResult(`诊断信息已复制：检测到 ${diagnosis.controls.length} 个控件、${diagnosis.iframes.length} 个 iframe。它不包含输入值和本地简历资料，请粘贴给我分析。`);
+    showResult(`完整诊断已复制：检测到 ${diagnosis.counts.interactive} 个可见交互元素、${diagnosis.semanticTexts.length} 条语义文字、${diagnosis.iframes.length} 个 iframe。它不包含输入值和本地简历资料，可以直接粘贴给我分析。`);
   } catch (error) {
     showResult(`复制诊断信息失败：${error.message}`, true);
   }

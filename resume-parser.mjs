@@ -166,6 +166,7 @@ export function inferProfile(rawText) {
     fullName: findName(text, email, rawPhone || phone), gender, phone, email, city, currentResidence: city,
     countryRegion: capture(text, [/(?:国家\s*[/／-]?\s*地区|国家|国籍)\s*[:：]?\s*([^\s，,；;]{2,30})/i]) || (/中国籍|中华人民共和国/i.test(text) ? '中国' : ''),
     studentOrigin: capture(text, [/(?:生源地)\s*[:：]?\s*([^\s，,；;]{2,30})/i]),
+    nativePlace: capture(text, [/(?:籍贯|祖籍)\s*[:：]?\s*([^\s，,；;]{2,40})/i]),
     householdRegistration: capture(text, [/(?:户籍|户口所在地)\s*[:：]?\s*([^\s，,；;]{2,40})/i]),
     ethnicity: capture(text, [/(?:民族)\s*[:：]?\s*([^\s，,；;]{1,10})/i]),
     politicalStatus: capture(text, [/(?:政治面貌)\s*[:：]?\s*([^\s，,；;]{2,20})/i]),

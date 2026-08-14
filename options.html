@@ -165,8 +165,8 @@
     <section class="ai-config-card" aria-labelledby="aiConfigTitle">
       <div class="section-heading">
         <div>
-          <h2 id="aiConfigTitle">AI 模块（尚未启用业务功能）</h2>
-          <p class="section-note">当前只保存连接配置，不会向网关发送简历、页面内容或测试请求。</p>
+          <h2 id="aiConfigTitle">AI 下拉框复核</h2>
+          <p class="section-note">仅在确定性校验失败时发送单个字段的目标值、页面回读值和候选列表，用于决定保留、改选或清除；不会发送整份简历。</p>
         </div>
         <span class="ai-config-badge">LOCAL CONFIG</span>
       </div>
@@ -185,7 +185,7 @@
             </span>
           </label>
         </div>
-        <p class="ai-security-note">注意：该网关使用 HTTP。只应在可信的公司内网中使用，后续真正调用时才会单独请求网关访问权限。</p>
+        <p class="ai-security-note">注意：该网关使用 HTTP，只应在可信公司内网中使用。保存时会请求网关访问权限；模型建议的改选值必须真实存在于页面候选列表。</p>
         <div class="ai-config-actions">
           <button class="primary" type="submit">保存 AI 配置</button>
           <button id="clearAiConfig" type="button">清除 AI 配置</button>

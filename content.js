@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.6.51';
+  const CONTENT_SCRIPT_VERSION = '0.6.52';
   if (globalThis.__resumeAutofillLoadedVersion === CONTENT_SCRIPT_VERSION) return;
   globalThis.__resumeAutofillLoadedVersion = CONTENT_SCRIPT_VERSION;
   globalThis.__resumeAutofillLoaded = true;
@@ -1143,6 +1143,8 @@
   ]);
   const fillFailureReasons = new WeakMap();
   const fillFailureObserved = new WeakMap();
+  const fillAIReviews = new WeakMap();
+  const fillAIClearRequests = new WeakSet();
 
   function setFocusedInputValue(element, value) {
     element.focus();
@@ -1159,6 +1161,8 @@
   function captureFillState(element, trigger = null) {
     fillFailureReasons.delete(element);
     fillFailureObserved.delete(element);
+    fillAIReviews.delete(element);
+    fillAIClearRequests.delete(element);
     return {
       value: 'value' in element ? String(element.value || '') : '',
       text: element.isContentEditable ? element.textContent || '' : '',
@@ -1174,9 +1178,10 @@
     if (!fillFailureObserved.has(element)) {
       fillFailureObserved.set(element, controlReadback(element, liveTrigger) || '操作后仍为空');
     }
+    const forceClear = fillAIClearRequests.has(element);
     // If this run started from an empty custom selector, clear any candidate that the
     // component accepted before the final validation failed.
-    if (!snapshot.hadValue && liveTrigger instanceof Element) {
+    if ((!snapshot.hadValue || forceClear) && liveTrigger instanceof Element) {
       const clear = liveTrigger.querySelector([
         '[class*="clearIcon"]', '[class*="clear-icon"]', '[class*="ClearIcon"]',
         '[aria-label*="清除"]', '[aria-label*="clear" i]', '[title*="清除"]', '[title*="clear" i]'
@@ -1187,11 +1192,12 @@
         if (hasValue(element)) await trustedClick(clear);
       }
     }
+    const restoreValue = forceClear ? '' : snapshot.value;
     if (element instanceof HTMLSelectElement) {
-      element.value = snapshot.value;
+      element.value = restoreValue;
       element.dispatchEvent(new Event('change', { bubbles: true }));
     } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      if (!element.disabled) setFocusedInputValue(element, snapshot.value);
+      if (!element.disabled) setFocusedInputValue(element, restoreValue);
       element.dispatchEvent(new Event('change', { bubbles: true }));
       element.blur();
     } else if (element.isContentEditable) {
@@ -1204,6 +1210,7 @@
       element.dispatchEvent(new Event('change', { bubbles: true }));
     }
     await wait(40);
+    if (forceClear) return !hasValue(element);
     return snapshot.hadValue ? String(element.value || '') === snapshot.value : !hasValue(element);
   }
 
@@ -1377,6 +1384,86 @@
     return { option, preview: interactionOptionPreview(session), query: '' };
   }
 
+  function aiSelectReviewEligible(key) {
+    return Boolean(key && !CASCADE_LOCATION_KEYS.has(key) && !/Date$|Date\b/.test(key));
+  }
+
+  async function applyAISelectSuggestion(element, trigger, value, key) {
+    const session = beginDynamicInteraction(trigger);
+    activateOption(trigger);
+    const match = await findBestCustomSelectOption(session, element, value);
+    if (!match.option) {
+      session.stop();
+      return false;
+    }
+    const activated = await activateInteractionCandidate(session, match.option, element, value);
+    if (!activated && !controlValueSatisfied(element, trigger, value, key)) {
+      await settleDynamicInteraction(session, element, 'AI 建议候选弹层');
+      return false;
+    }
+    await commitControl(element, trigger);
+    await settleDynamicInteraction(session, element, 'AI 建议候选弹层');
+    return controlValueSatisfied(element, trigger, value, key);
+  }
+
+  async function resolveCustomSelectMismatchWithAI(element, trigger, key, target, candidates = []) {
+    if (!aiSelectReviewEligible(key)) return false;
+    const observed = controlReadback(element, trigger);
+    const safeCandidates = [...new Set(candidates.map(cleanText).filter(Boolean))].slice(0, 20);
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({
+        type: 'RESUME_AUTOFILL_AI_REVIEW_SELECT',
+        input: {
+          field: readableField(labelText(element), element),
+          key,
+          target: String(target || ''),
+          observed,
+          candidates: safeCandidates
+        }
+      });
+    } catch (error) {
+      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核调用失败：${error?.message || error}`);
+      return false;
+    }
+    if (!response?.ok) {
+      if (response?.enabled) {
+        fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核失败：${response.reason || '未知错误'}`);
+      }
+      return false;
+    }
+    if (response.decision === 'keep' && observed && !placeholderLike(observed) && customTriggerHasSelection(trigger)) {
+      fillAIReviews.set(element, {
+        decision: '保留页面值', target: String(target || ''), observed,
+        value: observed, reason: response.reason || '模型判断页面值与目标值语义等价'
+      });
+      fillFailureReasons.delete(element);
+      return true;
+    }
+    if (response.decision === 'keep') {
+      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议保留，但页面没有可确认的非占位选中值`);
+      return false;
+    }
+    if (response.decision === 'select' && safeCandidates.includes(response.value)) {
+      const applied = await applyAISelectSuggestion(element, trigger, response.value, key);
+      if (applied) {
+        const finalObserved = controlReadback(element, trigger);
+        fillAIReviews.set(element, {
+          decision: '改选页面候选', target: String(target || ''), observed: finalObserved,
+          value: response.value, reason: response.reason || '模型选择了语义最接近的现有候选'
+        });
+        fillFailureReasons.delete(element);
+        return true;
+      }
+      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议改选“${response.value}”，但页面未接受`);
+    }
+    if (response.decision === 'clear') {
+      fillAIClearRequests.add(element);
+      fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核建议清除：${response.reason || '无法安全确认目标与页面值一致'}`);
+    }
+    return false;
+  }
+
   async function fillCustomSelect(element, value, key = '') {
     const trigger = customSelectTrigger(element);
     if (!trigger) return false;
@@ -1390,6 +1477,7 @@
     const fullLocationTargets = selectTargets(key, value, false);
     let targets = selectTargets(key, value, editableLocation);
     let locationFallbackUsed = false;
+    const candidateTexts = new Set();
     const explicitPanel = await waitForExplicitConfirmationPanel(session);
     if (explicitPanel) {
       const target = targets.at(-1) || String(value);
@@ -1407,6 +1495,7 @@
     for (let level = 0; level < targets.length; level += 1) {
       const target = targets[level];
       const match = await findBestCustomSelectOption(session, element, target);
+      for (const candidate of match.preview || []) candidateTexts.add(candidate);
       const option = match.option;
       if (!option) {
         if (editableLocation && !locationFallbackUsed && fullLocationTargets.length > 1) {
@@ -1426,9 +1515,14 @@
           : '';
         fillFailureReasons.set(element, `搜索别名并检查下拉候选后仍没有找到安全匹配项${locationStrategy}${preview}`);
         await settleDynamicInteraction(session, element, '下拉弹层');
+        if (await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts])) {
+          selectedAny = true;
+          continue;
+        }
         await rollbackFailedControl(element, trigger, snapshot);
         return false;
       }
+      candidateTexts.add(cleanText(option.innerText || option.textContent));
       let activated = await activateInteractionCandidate(session, option, element, target);
       if (!activated && controlValueSatisfied(element, trigger, target, key)) {
         activated = true;
@@ -1444,6 +1538,11 @@
           level = -1;
           continue;
         }
+        await settleDynamicInteraction(session, element, '下拉弹层');
+        if (await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts])) {
+          selectedAny = true;
+          continue;
+        }
         if (!fillFailureReasons.get(element)) {
           fillFailureReasons.set(element, `找到了“${target}”候选行，DOM 点击和浏览器级点击后字段仍未回读到该值`);
         }
@@ -1455,14 +1554,19 @@
     }
     await commitControl(element, trigger);
     const closed = await settleDynamicInteraction(session, element, '下拉弹层');
-    const confirmed = selectedAny && closed
+    let confirmed = Boolean(fillAIReviews.get(element)) || (selectedAny && closed
       && (selectionSatisfied(trigger, element, value) || selectionSatisfied(trigger, element, targets.at(-1))
-        || controlValueSatisfied(element, trigger, value, key));
+        || controlValueSatisfied(element, trigger, value, key)));
+    if (!confirmed) {
+      confirmed = await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts]);
+    }
     if (!confirmed) {
       const locationStrategy = editableLocation
         ? (locationFallbackUsed ? '（已尝试区/县直接搜索和省→市→区/县逐级选择）' : '（已尝试区/县直接搜索）')
         : '';
-      fillFailureReasons.set(element, closed ? `候选项已点击，但字段回读值与目标值不一致${locationStrategy}` : interactionBlocked);
+      if (!fillFailureReasons.get(element) || !/AI /.test(fillFailureReasons.get(element))) {
+        fillFailureReasons.set(element, closed ? `候选项已点击，但字段回读值与目标值不一致${locationStrategy}` : interactionBlocked);
+      }
     }
     if (confirmed) trigger.classList.add(FILLED_CLASS);
     if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
@@ -2906,7 +3010,7 @@
     header.append(title, close);
 
     const summary = document.createElement('p');
-    summary.textContent = `已填写 ${stats.filled} 项，新增经历 ${stats.sectionsAdded} 段，跳过已有内容 ${stats.existing} 项。`;
+    summary.textContent = `已填写 ${stats.filled} 项（AI 复核 ${stats.aiReviewed || 0} 项），新增经历 ${stats.sectionsAdded} 段，跳过已有内容 ${stats.existing} 项。`;
     const issues = document.createElement('p');
     issues.textContent = `资料字段未映射 ${stats.unmatched} 项，资料缺失 ${stats.missingData} 项，实际处理失败 ${stats.unsupported} 项，有意忽略 ${stats.ignored || 0} 项。`;
     const legend = document.createElement('div');
@@ -2996,6 +3100,7 @@
           missingData: stats.missingData,
           unsupported: stats.unsupported,
           ignored: stats.ignored || 0,
+          aiReviewed: stats.aiReviewed || 0,
           totalSeconds: Number((stats.timings.totalMs / 1000).toFixed(1))
         },
         details: stats.details,
@@ -3015,6 +3120,7 @@
     actions.appendChild(copy);
 
     panel.append(header, summary, issues, legend, timing, explanation);
+    appendDiagnosticTable('绿色：AI 语义复核后保留或改选', stats.diagnostics.aiReview, 'ai-review');
     if (!appendDiagnosticTable('红色：处理失败', stats.diagnostics.unsupported, 'unsupported', true)) appendDetails('实际处理失败', stats.details.unsupported);
     if (!appendDiagnosticTable('黄色：本地资料缺失', stats.diagnostics.missingData, 'missing')) appendDetails('本地资料缺失', stats.details.missingData);
     if (!appendDiagnosticTable('紫色：页面字段未映射', stats.diagnostics.unmatched, 'unmatched')) appendDetails('资料字段未映射', stats.details.unmatched);
@@ -4128,13 +4234,13 @@
     interactionBlocked = '';
     interactionWarnings = [];
     const stats = {
-      filled: 0, existing: 0, unmatched: 0, missingData: 0, unsupported: 0, ignored: 0,
+      filled: 0, existing: 0, unmatched: 0, missingData: 0, unsupported: 0, ignored: 0, aiReviewed: 0,
       sectionsAdded: 0, sectionAddFailed: 0,
       sectionPlan: [],
       timings: {},
       slowFields: [],
       details: { unmatched: [], missingData: [], unsupported: [], existing: [], ignored: [] },
-      diagnostics: { unmatched: [], missingData: [], unsupported: [], existing: [] },
+      diagnostics: { unmatched: [], missingData: [], unsupported: [], existing: [], aiReview: [] },
       diagnosticSignatures: new Set()
     };
 
@@ -4389,7 +4495,19 @@
         }
         if (filled) markFillResult(element, FILLED_CLASS);
       }
-      if (filled) stats.filled += 1;
+      if (filled) {
+        stats.filled += 1;
+        const aiReview = fillAIReviews.get(element);
+        if (aiReview) {
+          stats.aiReviewed += 1;
+          recordDiagnostic(stats, 'aiReview', {
+            field: readableField(text, element), key, target: value,
+            observed: aiReview.observed || controlReadback(element, logicalTrigger),
+            stage: `AI 语义复核：${aiReview.decision}`,
+            reason: `${aiReview.reason}${aiReview.value ? `；采用值：${aiReview.value}` : ''}`
+          });
+        }
+      }
       else {
         if (fillSnapshot) {
           const rolledBack = await rollbackFailedControl(element, logicalTrigger || element, fillSnapshot);

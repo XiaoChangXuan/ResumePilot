@@ -7,7 +7,7 @@ const resumeInput = document.querySelector('#resumeInput');
 const resumeDrop = document.querySelector('#resumeDrop');
 import { inferProfile } from './resume-parser.mjs';
 import { migrateLegacyResumeFile, removeResumeFile, saveResumeFile } from './resume-file-store.js';
-import { AI_GATEWAY_URL, clearAIConfig, loadAIConfig, saveAIConfig } from './ai-client.js';
+import { AI_GATEWAY_URL, clearAIConfig, loadAIConfig, requestAIGatewayPermission, saveAIConfig } from './ai-client.js';
 
 function setState(text, saved = false) {
   state.textContent = text;
@@ -38,7 +38,7 @@ async function loadAISettings() {
   aiModel.value = config.model;
   aiApiKey.value = config.apiKey;
   const complete = Boolean(config.model && config.apiKey);
-  setAIConfigState(complete ? '已保存（尚未发送任何请求）' : '尚未完整配置', complete ? 'saved' : '');
+  setAIConfigState(complete ? '已保存；填写失败时可用于下拉框语义复核' : '尚未完整配置', complete ? 'saved' : '');
 }
 
 const DIRECT_ADMINISTRATIONS = /^(?:北京市|上海市|天津市|重庆市|香港特别行政区|澳门特别行政区)$/;
@@ -418,8 +418,9 @@ aiConfigForm.addEventListener('submit', async (event) => {
     return;
   }
   try {
+    const permitted = await requestAIGatewayPermission();
     await saveAIConfig({ model, apiKey });
-    setAIConfigState('保存成功；本版未发送任何 AI 请求', 'saved');
+    setAIConfigState(permitted ? '保存成功；已启用下拉框失败复核' : '配置已保存，但未授权访问 AI 网关', permitted ? 'saved' : 'error');
   } catch (error) {
     setAIConfigState(`保存失败：${error?.message || error}`, 'error');
   }

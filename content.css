@@ -132,6 +132,7 @@
 .resume-autofill-completion__diagnostics--missing > summary { color: #b54708 !important; }
 .resume-autofill-completion__diagnostics--unmatched > summary { color: #6941c6 !important; }
 .resume-autofill-completion__diagnostics--existing > summary { color: #175cd3 !important; }
+.resume-autofill-completion__diagnostics--ai-review > summary { color: #067647 !important; }
 
 .resume-autofill-completion__table-wrap {
   width: 100% !important;

@@ -1,4 +1,5 @@
 import { migrateLegacyResumeFile } from './resume-file-store.js';
+import { hasAIGatewayPermission, loadAIConfig, requestAIGatewayPermission } from './ai-client.js';
 
 const $ = (selector) => document.querySelector(selector);
 const resultEl = $('#result');
@@ -13,6 +14,13 @@ function showResult(message, isError = false) {
 async function getProfile() {
   const { profile = {} } = await chrome.storage.local.get('profile');
   return profile;
+}
+
+async function ensureAIReviewPermission() {
+  const config = await loadAIConfig();
+  if (!config.model || !config.apiKey) return false;
+  if (await hasAIGatewayPermission()) return true;
+  return requestAIGatewayPermission();
 }
 
 async function getStoredResumeFile() {
@@ -138,6 +146,7 @@ fillButton.addEventListener('click', async () => {
   fillButton.disabled = true;
   fillButton.textContent = '正在识别并填写…';
   try {
+    const aiReviewEnabled = await ensureAIReviewPermission().catch(() => false);
     const profile = await getProfile();
     const summary = await sendToPage({
       type: 'RESUME_AUTOFILL_FILL',
@@ -159,7 +168,7 @@ fillButton.addEventListener('click', async () => {
     const slowText = (summary.slowFields || []).length
       ? `\n最慢字段：${summary.slowFields.slice(0, 5).map((item) => `${item.field}→${item.key} ${(item.ms / 1000).toFixed(2)}秒${item.ok ? '' : '（失败）'}`).join('；')}`
       : '';
-    showResult(`补填完成：绿色成功 ${summary.filled} 项；${sectionText}蓝色已有值 ${summary.existing} 项；紫色未映射 ${summary.unmatched} 项；黄色资料缺失 ${summary.missingData || 0} 项；红色处理失败 ${summary.unsupported || 0} 项；灰色有意忽略 ${summary.ignored || 0} 项。\n逐项的目标值、页面回读值和判定原因已显示在网页右下角诊断表。${sectionPlan}${timingText}${slowText}${examples.length ? `\n${examples.join('\n')}` : ''}`);
+    showResult(`补填完成：绿色成功 ${summary.filled} 项（AI 复核 ${summary.aiReviewed || 0} 项）；${sectionText}蓝色已有值 ${summary.existing} 项；紫色未映射 ${summary.unmatched} 项；黄色资料缺失 ${summary.missingData || 0} 项；红色处理失败 ${summary.unsupported || 0} 项；灰色有意忽略 ${summary.ignored || 0} 项。\nAI 失败复核：${aiReviewEnabled ? '已启用' : '未配置或未授权'}。逐项的目标值、页面回读值和判定原因已显示在网页右下角诊断表。${sectionPlan}${timingText}${slowText}${examples.length ? `\n${examples.join('\n')}` : ''}`);
   } catch (error) {
     showResult(error.message || '填写失败，请刷新页面后重试。', true);
   } finally {

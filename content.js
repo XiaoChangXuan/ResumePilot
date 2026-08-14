@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.6.50';
+  const CONTENT_SCRIPT_VERSION = '0.6.51';
   if (globalThis.__resumeAutofillLoadedVersion === CONTENT_SCRIPT_VERSION) return;
   globalThis.__resumeAutofillLoadedVersion = CONTENT_SCRIPT_VERSION;
   globalThis.__resumeAutofillLoaded = true;
@@ -10,8 +10,8 @@
   const FAILED_CLASS = 'resume-autofill-failed';
   const EXISTING_CLASS = 'resume-autofill-existing';
   const IGNORED_CLASS = 'resume-autofill-ignored';
-  const INTERACTION_TIMEOUT = 1200;
-  const INTERACTION_CLOSE_TIMEOUT = 1000;
+  const INTERACTION_TIMEOUT = 2800;
+  const INTERACTION_CLOSE_TIMEOUT = 1800;
   let interactionBlocked = '';
   let interactionWarnings = [];
   const GENERIC_PLACEHOLDER = /^(?:请输入|请选择|请填写|选择|输入|select|please\s+(?:select|enter)|nope|new_password|年|月|日|yyyy|mm|dd)?$/i;
@@ -236,6 +236,36 @@
                 : /basic|personal|个人信息|基本信息/i.test(text) ? 'basic' : '';
   }
 
+  function peerFieldSectionKind(element) {
+    const anchors = {
+      project: [/项目名称|课题名称|研究项目/i, /项目角色|项目职责|项目描述|项目内容/i],
+      work: [/公司名称|单位名称|雇主名称/i, /职位名称|工作职位|实习职位|工作内容|实习内容/i],
+      education: [/学校名称|毕业院校|就读院校/i, /专业名称|所学专业|学历|所获学位|学习形式/i],
+      certificate: [/证书名称|奖项名称|荣誉名称/i, /颁发机构|发证机构|获奖时间/i],
+      language: [/语言名称|语言类型|外语名称/i, /语言能力|熟练程度|听说|读写/i],
+      family: [/家庭成员.*姓名|联系人.*姓名/i, /与本人关系|亲属关系|工作单位/i]
+    };
+    let ancestor = semanticContainer(element)?.parentElement || element.parentElement;
+    for (let depth = 0; ancestor instanceof Element && depth < 8; depth += 1, ancestor = ancestor.parentElement) {
+      const controls = controlNodes(ancestor).filter((control) => control === element || visible(control));
+      // 到达整页表单后停止，避免用另一个区块的字段推断当前日期。
+      if (controls.length > 28) break;
+      if (controls.length < 2) continue;
+      const peerText = controls
+        .filter((control) => control !== element)
+        .slice(0, 20)
+        .map((control) => labelText(control))
+        .filter(Boolean)
+        .join(' ');
+      const ranked = Object.entries(anchors)
+        .map(([kind, patterns]) => ({ kind, score: patterns.reduce((score, pattern) => score + (pattern.test(peerText) ? 1 : 0), 0) }))
+        .filter((item) => item.score > 0)
+        .sort((left, right) => right.score - left.score);
+      if (ranked[0] && (!ranked[1] || ranked[0].score > ranked[1].score)) return ranked[0].kind;
+    }
+    return '';
+  }
+
   function sectionContext(element) {
     if (sectionContextCache.has(element)) return sectionContextCache.get(element);
     // 动态表单经常没有可见区块标题，但 name/data-cy/id 会保留
@@ -268,6 +298,13 @@
           return context;
         }
       }
+    }
+    // 有些 Phoenix 控件的 input 完全没有 name/id，只有“开始时间”这类通用标签。
+    // 此时用同一重复卡片内的“项目名称/公司名称/学校名称”等强锚点归属区块。
+    const peerContext = peerFieldSectionKind(element);
+    if (peerContext) {
+      sectionContextCache.set(element, peerContext);
+      return peerContext;
     }
     sectionContextCache.set(element, '');
     return '';
@@ -789,7 +826,7 @@
     );
   }
 
-  async function waitForInteractionOption(session, value, timeout = 650) {
+  async function waitForInteractionOption(session, value, timeout = 1400) {
     const started = Date.now();
     while (Date.now() - started < timeout) {
       const option = interactionOptions(session, value)[0];
@@ -800,7 +837,7 @@
     return null;
   }
 
-  async function waitForInteractionChange(session, previousRevision, timeout = 700) {
+  async function waitForInteractionChange(session, previousRevision, timeout = 1200) {
     const started = Date.now();
     while (Date.now() - started < timeout) {
       if (session.revision !== previousRevision) return true;
@@ -809,7 +846,7 @@
     return false;
   }
 
-  async function waitForCandidateOutcome(session, option, element, expectedValue, timeout = 180) {
+  async function waitForCandidateOutcome(session, option, element, expectedValue, timeout = 900) {
     const started = Date.now();
     while (Date.now() - started < timeout) {
       if (selectionSatisfied(session.trigger, element, expectedValue)
@@ -1329,14 +1366,14 @@
     // “硕士” find “硕士研究生”, and long study-mode names fall back to “全日制”.
     for (const query of queries) {
       setFocusedInputValue(element, query);
-      const option = await waitForInteractionOption(session, target, 380);
+      const option = await waitForInteractionOption(session, target, 1000);
       if (option) return { option, preview: interactionOptionPreview(session), query };
     }
     // Phase 2: clear the search so the full currently rendered option list becomes
     // visible, then rank every candidate by guarded similarity instead of guessing.
     setFocusedInputValue(element, '');
     await wait(100);
-    const option = await waitForInteractionOption(session, target, 520);
+    const option = await waitForInteractionOption(session, target, 1400);
     return { option, preview: interactionOptionPreview(session), query: '' };
   }
 
@@ -1478,7 +1515,7 @@
             || /calendar|date|panal/i.test(String(root.className || ''))))
         || structuralDatePanel();
     };
-    const waitForDateOverlay = async (timeout = 260) => {
+    const waitForDateOverlay = async (timeout = 1200) => {
       const started = Date.now();
       while (Date.now() - started < timeout) {
         const panel = dateOverlay();
@@ -1493,13 +1530,13 @@
     let openedPanel = null;
     for (const target of openTargets) {
       activateOption(target);
-      openedPanel = await waitForDateOverlay(260);
+      openedPanel = await waitForDateOverlay(900);
       if (openedPanel) break;
     }
     if (!openedPanel) {
       for (const target of openTargets) {
         const trusted = await trustedClick(target);
-        if (trusted?.ok) openedPanel = await waitForDateOverlay(400);
+        if (trusted?.ok) openedPanel = await waitForDateOverlay(1600);
         if (openedPanel) break;
       }
     }
@@ -1516,7 +1553,7 @@
     }
     // 完整日期不能走普通“精确文本候选”捷径。日历网格、顶部输入或其他隐藏节点
     // 可能恰好出现目标文本，但那不等于控件已经完成年/月/日选择。
-    async function waitUntil(test, timeout = 700) {
+    async function waitUntil(test, timeout = 1200) {
       const started = Date.now();
       while (Date.now() - started < timeout) {
         const result = test();
@@ -1528,9 +1565,9 @@
     async function fastComponentClick(target, changed) {
       if (!target) return false;
       activateOption(target);
-      if (await waitUntil(changed, 90)) return true;
+      if (await waitUntil(changed, 450)) return true;
       const trusted = await trustedClick(target);
-      return Boolean(trusted?.ok && await waitUntil(changed, 320));
+      return Boolean(trusted?.ok && await waitUntil(changed, 1200));
     }
     const currentPhoenixDatePanel = () => {
       const roots = discoverInteractionRoots(session);
@@ -1545,7 +1582,7 @@
         : root.closest?.('.phoenix-calendar') || root.querySelector?.('.phoenix-calendar');
       return calendar && visible(calendar) ? calendar : root;
     };
-    const phoenixDatePanel = await waitUntil(currentPhoenixDatePanel, 500);
+    const phoenixDatePanel = await waitUntil(currentPhoenixDatePanel, 1500);
     if (phoenixDatePanel) {
       rememberInteractionRoot(session, phoenixDatePanel);
       const targetYear = Number(match[1]);
@@ -1563,12 +1600,12 @@
         let target = currentPhoenixDatePanel()?.querySelector(selector);
         if (!target) return false;
         activateOption(target);
-        if (await waitUntil(changed, 90)) return true;
+        if (await waitUntil(changed, 450)) return true;
         // 普通事件之后组件可能替换箭头节点，浏览器级点击前必须重新定位当前节点。
         target = currentPhoenixDatePanel()?.querySelector(selector);
         if (!target) return Boolean(await waitUntil(changed, 60));
         const trusted = await trustedClick(target);
-        return Boolean(trusted?.ok && await waitUntil(changed, 320));
+        return Boolean(trusted?.ok && await waitUntil(changed, 1200));
       }
 
       // 先只移动年份，避免用月份箭头跨年后又重新推导当前层级。
@@ -1646,12 +1683,12 @@
         let target = kind === 'text' ? liveCell?.querySelector('.phoenix-calendar-date,[aria-selected]') : liveCell;
         if (!target) continue;
         activateOption(target);
-        clicked = Boolean(await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 500));
+        clicked = Boolean(await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 900));
         if (!clicked) {
           liveCell = currentDayCell();
           target = kind === 'text' ? liveCell?.querySelector('.phoenix-calendar-date,[aria-selected]') : liveCell;
           const trusted = target ? await trustedClick(target) : null;
-          clicked = Boolean(trusted?.ok && await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 900));
+          clicked = Boolean(trusted?.ok && await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 1600));
         }
         if (clicked && dateAccepted()) break;
       }
@@ -1668,7 +1705,7 @@
         || [...document.querySelectorAll('.common-unmodeled-layer .phoenix-date-picker')]
           .find((root) => visible(root) && !session.beforeVisible.has(root)
             && root.querySelector('.phoenix-calendar-month-panel-year-select-content'));
-    }, 500);
+    }, 1500);
     if (phoenixPanel) {
       rememberInteractionRoot(session, phoenixPanel);
       const yearNumber = () => Number(cleanText(phoenixPanel.querySelector('.phoenix-calendar-month-panel-year-select-content')?.textContent)

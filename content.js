@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.6.53';
+  const CONTENT_SCRIPT_VERSION = '0.6.57';
   if (globalThis.__resumeAutofillLoadedVersion === CONTENT_SCRIPT_VERSION) return;
   globalThis.__resumeAutofillLoadedVersion = CONTENT_SCRIPT_VERSION;
   globalThis.__resumeAutofillLoaded = true;
@@ -445,6 +445,67 @@
       && (!declaredDefault || normalizedExactText(fallback) !== normalizedExactText(declaredDefault)));
   }
 
+  function fieldLabelCandidates(element, fieldText = '') {
+    const pieces = new Set();
+    const add = (value) => {
+      const text = cleanText(value);
+      if (!text) return;
+      [
+        text,
+        ...text.split(/\s{2,}|\n+/),
+        ...text.split(/\s+/)
+      ].forEach((piece) => {
+        const normalized = cleanText(piece).replace(/^(?:请选择|选择|请输入|请填写|请补充)\s*/i, '');
+        if (normalized && normalized.length <= 40) pieces.add(normalized);
+      });
+    };
+    add(fieldText);
+    add(labelText(element));
+    add(element?.getAttribute?.('aria-label'));
+    add(element?.getAttribute?.('title'));
+    add(element?.getAttribute?.('placeholder'));
+    add(element?.getAttribute?.('data-label'));
+    add(element?.getAttribute?.('data-field'));
+    if (element?.labels) [...element.labels].forEach((label) => add(label.textContent));
+    return [...pieces];
+  }
+
+  function fieldLabelEchoLike(value, element, fieldText = '') {
+    const shown = cleanText(value);
+    if (!shown) return false;
+    const normalizedShown = normalizedExactText(shown);
+    return fieldLabelCandidates(element, fieldText)
+      .some((candidate) => normalizedShown === normalizedExactText(candidate));
+  }
+
+  function fieldDefaultLike(value, element, fieldText = '', key = '') {
+    const shown = cleanText(value);
+    if (!shown || placeholderLike(value)) return true;
+    if (fieldLabelEchoLike(shown, element, fieldText)) return true;
+    if ((key === 'phone' || /手机|电话|mobile|phone/i.test(fieldText))
+      && /^(?:(?:\+|＋)?\d{1,4}){1,3}$/.test(shown.replace(/\s+/g, ''))
+      && shown.replace(/\D/g, '').length < 6) return true;
+    return false;
+  }
+
+  function hasMeaningfulExistingValue(element, trigger = null, fieldText = '', key = '') {
+    if (!(element instanceof Element)) return false;
+    if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
+    if (element instanceof HTMLSelectElement) {
+      if (!nativeSelectHasMeaningfulValue(element)) return false;
+      return !fieldDefaultLike(controlReadback(element, trigger), element, fieldText, key);
+    }
+    const ownRaw = String(element.value ?? (element.isContentEditable ? element.textContent : '')).trim();
+    const own = cleanText(ownRaw);
+    if (ownRaw && !fieldDefaultLike(ownRaw, element, fieldText, key)) {
+      const declaredDefault = cleanText(element.getAttribute('data-default-value') || element.getAttribute('data-default') || '');
+      if (!declaredDefault || normalizedExactText(own) !== normalizedExactText(declaredDefault)) return true;
+    }
+    const liveTrigger = trigger || customSelectTrigger(element);
+    if (!liveTrigger || !customTriggerHasSelection(liveTrigger)) return false;
+    return !fieldDefaultLike(controlReadback(element, liveTrigger), element, fieldText, key);
+  }
+
   function setNativeValue(element, value) {
     if (element instanceof HTMLTextAreaElement) {
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
@@ -459,6 +520,10 @@
   }
 
   function normalizedChoices(value) {
+    // “0 年”在招聘站通常不提供数字 0，而是用学生/应届生语义表示。
+    if (/^\s*0(?:\.0+)?\s*(?:年)?\s*$/.test(String(value ?? ''))) {
+      return ['0', '在读学生', '应届毕业生', '无工作经验', '无经验'];
+    }
     const rankingFraction = String(value || '').match(/^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/);
     if (rankingFraction && Number(rankingFraction[2]) > 0) {
       const percent = Number(rankingFraction[1]) / Number(rankingFraction[2]) * 100;
@@ -711,6 +776,10 @@
     '[class*="main-selector-container"]', '[class*="area-selector-container"]'
   ].join(',');
 
+  function isResumeAuditNode(node) {
+    return node instanceof Element && Boolean(node.closest('.resume-page-audit-overlay,.resume-page-audit-panel,[data-resume-page-audit-ui]'));
+  }
+
   function beginDynamicInteraction(trigger) {
     // 只记录可能成为弹层/候选的节点。对 body * 逐个调用 getComputedStyle/rect 会强制大型表单
     // 反复布局，是复杂控件多时出现分钟级耗时的主要原因之一。
@@ -721,7 +790,7 @@
     const roots = new Set();
     let revision = 0;
     const remember = (node) => {
-      if (!(node instanceof Element) || node === trigger) return;
+      if (!(node instanceof Element) || node === trigger || isResumeAuditNode(node)) return;
       changed.add(node);
       revision += 1;
     };
@@ -773,14 +842,15 @@
 
   function discoverInteractionRoots(session) {
     for (const node of session.added) {
-      if (!(node instanceof Element) || !node.isConnected || !visible(node) || node.contains(session.trigger)) continue;
+      if (!(node instanceof Element) || isResumeAuditNode(node)
+        || !node.isConnected || !visible(node) || node.contains(session.trigger)) continue;
       if (node.matches(OVERLAY_SELECTOR)) session.roots.add(node);
       for (const semantic of node.querySelectorAll(OVERLAY_SELECTOR)) {
         if (visible(semantic) && !semantic.contains(session.trigger)) session.roots.add(semantic);
       }
     }
     for (const node of session.changed) {
-      if (!(node instanceof Element) || !visible(node)
+      if (!(node instanceof Element) || isResumeAuditNode(node) || !visible(node)
         || session.trigger?.contains(node) || node.contains(session.trigger)) continue;
       if (node.matches(OVERLAY_SELECTOR)) session.roots.add(node);
       else if (node !== document.body && node !== document.documentElement) {
@@ -788,7 +858,7 @@
         if (style.position === 'fixed' || style.position === 'absolute') session.roots.add(node);
       }
     }
-    return [...session.roots].filter((root) => root.isConnected && visible(root));
+    return [...session.roots].filter((root) => root.isConnected && !isResumeAuditNode(root) && visible(root));
   }
 
   function interactionOptions(session, value) {
@@ -1081,6 +1151,147 @@
     return confirmed;
   }
 
+  function compactLocationPath(value, key = '') {
+    const raw = CASCADE_LOCATION_KEYS.has(key) ? locationChoicePath(value) : [String(value)];
+    return raw
+      .map((item) => cleanText(item))
+      .filter(Boolean)
+      .filter((item, index, items) => index === 0 || normalizedExactText(item) !== normalizedExactText(items[index - 1]));
+  }
+
+  function tabbedLocationPanel(session) {
+    const roots = discoverInteractionRoots(session);
+    const candidates = [...new Set(roots.flatMap((root) => {
+      const parent = root.closest(
+        '[role="dialog"],[aria-modal="true"],[class*="Dropdown-dropdown"],[class*="dropdown-dropdown"],[class*="cascad"],[class*="Cascad"]'
+      );
+      return [root, parent].filter(Boolean);
+    }))];
+    return candidates.find((panel) => {
+      if (!(panel instanceof Element) || !panel.isConnected || !visible(panel) || panel.contains(session.trigger)) return false;
+      const tabs = [...panel.querySelectorAll('[class*="Tabs-item"],[role="tab"],li')]
+        .filter((node) => visible(node) && /^(?:省份|城市|县区)$/.test(cleanText(node.textContent)));
+      const tags = [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"]')]
+        .filter((node) => visible(node));
+      return tabs.length >= 2 && tags.length >= 3;
+    }) || null;
+  }
+
+  function tabbedLocationSignature(panel) {
+    if (!(panel instanceof Element)) return '';
+    const active = cleanText(
+      panel.querySelector('[class*="Tabs-active"],[aria-selected="true"],[class*="Tabs-item"][class*="active"]')?.textContent || ''
+    );
+    const options = [...new Set(
+      [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"]')]
+        .filter(visible)
+        .map((node) => cleanText(node.textContent))
+        .filter((text) => text && text.length <= 24)
+        .slice(0, 18)
+    )];
+    return `${active}::${options.join('|')}`;
+  }
+
+  function tabbedLocationOptions(panel, value) {
+    const nodes = [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"],button,[role="option"],[tabindex]')]
+      .filter((node) => visible(node) && !node.querySelector('input,textarea,select'))
+      .map((node) => node.closest('[class*="Tag-container"],button,[role="option"],[tabindex]') || node)
+      .filter((node) => panel.contains(node));
+    const unique = [...new Set(nodes)];
+    return unique
+      .map((node) => ({ node, score: choiceMatchScore(node.innerText || node.textContent, value) }))
+      .filter(({ score }) => score >= 60)
+      .sort((left, right) => right.score - left.score || cleanText(left.node.textContent).length - cleanText(right.node.textContent).length)
+      .map(({ node }) => node);
+  }
+
+  async function waitForTabbedLocationAdvance(session, panel, signature, element, trigger, value, key, timeout = 720) {
+    const started = Date.now();
+    const leaf = compactLocationPath(value, key).at(-1) || String(value);
+    while (Date.now() - started < timeout) {
+      const livePanel = tabbedLocationPanel(session) || (panel?.isConnected ? panel : null);
+      if (!livePanel || !visible(livePanel)) return true;
+      if (controlValueSatisfied(element, trigger, value, key)
+        || selectionSatisfied(trigger, element, value)
+        || selectionSatisfied(trigger, element, leaf)) return true;
+      if (tabbedLocationSignature(livePanel) !== signature) return true;
+      await wait(45);
+    }
+    const livePanel = tabbedLocationPanel(session) || (panel?.isConnected ? panel : null);
+    return !livePanel
+      || tabbedLocationSignature(livePanel) !== signature
+      || controlValueSatisfied(element, trigger, value, key)
+      || selectionSatisfied(trigger, element, value)
+      || selectionSatisfied(trigger, element, leaf);
+  }
+
+  async function fillTabbedLocationSelect(session, panel, element, trigger, key, value) {
+    const path = compactLocationPath(value, key);
+    if (!path.length) return false;
+
+    let index = 0;
+    let livePanel = panel;
+    while (index < path.length) {
+      livePanel = tabbedLocationPanel(session) || (livePanel?.isConnected ? livePanel : null);
+      if (!livePanel || !visible(livePanel)) break;
+
+      let option = null;
+      let matchedIndex = index;
+      for (let offset = 0; index + offset < path.length; offset += 1) {
+        const matches = tabbedLocationOptions(livePanel, path[index + offset]);
+        if (matches.length) {
+          option = matches[0];
+          matchedIndex = index + offset;
+          break;
+        }
+      }
+
+      if (!option) break;
+
+      const target = path[matchedIndex];
+      const before = tabbedLocationSignature(livePanel);
+      rememberInteractionRoot(session, option);
+      activateOption(option);
+      let advanced = await waitForTabbedLocationAdvance(session, livePanel, before, element, trigger, value, key);
+      if (!advanced) {
+        const trusted = await trustedClick(option);
+        if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `级联地区选项点击失败：${trusted.error}`);
+        advanced = await waitForTabbedLocationAdvance(session, livePanel, before, element, trigger, value, key, 900);
+      }
+      if (!advanced) break;
+      index = matchedIndex + 1;
+    }
+
+    livePanel = tabbedLocationPanel(session) || (livePanel?.isConnected ? livePanel : null);
+    if (livePanel?.isConnected && visible(livePanel)
+      && !controlValueSatisfied(element, trigger, value, key)
+      && !selectionSatisfied(trigger, element, value)) {
+      const confirm = panelAction(livePanel, /^(?:确定|确认|完成|应用|选择|保存|ok|confirm|done|apply)$/i);
+      if (confirm) {
+        activateOption(confirm);
+        let closed = await waitForInteractionClosed(session, 280);
+        if (!closed && confirm.isConnected && visible(confirm)) {
+          const trusted = await trustedClick(confirm);
+          if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `级联地区确认按钮点击失败：${trusted.error}`);
+          closed = await waitForInteractionClosed(session, 450);
+        }
+      }
+    }
+
+    await commitControl(element, trigger);
+    const closed = await settleDynamicInteraction(session, element, '级联地区弹层');
+    const leaf = path.at(-1);
+    const confirmed = (closed || !tabbedLocationPanel(session))
+      && (controlValueSatisfied(element, trigger, value, key)
+        || selectionSatisfied(trigger, element, value)
+        || (leaf && selectionSatisfied(trigger, element, leaf)));
+    if (confirmed) trigger.classList.add(FILLED_CLASS);
+    if (!confirmed && !fillFailureReasons.get(element)) {
+      fillFailureReasons.set(element, `级联地区弹层已操作，但字段回读仍未匹配：${path.join('/')}`);
+    }
+    return confirmed;
+  }
+
   async function waitForInteractionClosed(session, timeout = INTERACTION_CLOSE_TIMEOUT) {
     const started = Date.now();
     while (Date.now() - started < timeout) {
@@ -1230,7 +1441,10 @@
 
   function clickableAutocompleteTarget(textNode, element, session = null) {
     if (!textNode || element.contains(textNode) || textNode.contains(element)) return null;
-    const explicit = textNode.closest('button,a,label,[role="option"],[role="menuitem"],[role="treeitem"],[role="radio"],[tabindex],[data-value],[data-key],[onclick],[class*="list-item-container"],[class*="Select-common-item"],[class*="select-common-item"],[class*="Select-pointer"],[class*="select-pointer"],[class*="Tag-container"]');
+    // Always click the concrete option row. The previous fallback could climb from
+    // an option label to the entire short list and then click the list's centre,
+    // selecting an unrelated middle item (for example 前30% or 非统招专升本).
+    const explicit = textNode.closest('button,a,label,li,[role="option"],[role="menuitem"],[role="treeitem"],[role="radio"],[tabindex],[data-value],[data-key],[onclick],[class*="Dropdown-item"],[class*="dropdown-item"],[class*="listItem"],[class*="ListItem"],[class*="option-item"],[class*="Option-item"],[class*="list-item-container"],[class*="Select-common-item"],[class*="select-common-item"],[class*="Select-pointer"],[class*="select-pointer"],[class*="Tag-container"]');
     if (explicit && !explicit.contains(element) && (!session || interactionRelated(session, explicit))) return explicit;
     if (session) {
       const root = [...session.roots].find((candidate) => candidate.isConnected && candidate.contains(textNode));
@@ -1238,6 +1452,9 @@
         let row = textNode;
         for (let depth = 0; row.parentElement && row.parentElement !== root && depth < 6; depth += 1) {
           const parent = row.parentElement;
+          // A parent containing multiple option-like descendants is the list,
+          // not the option row. Stop before promoting the click target to it.
+          if (parent.querySelectorAll(OPTION_SELECTORS.join(',')).length > 1) break;
           const parentText = cleanText(parent.innerText || parent.textContent);
           if (parentText.length > 240) break;
           row = parent;
@@ -1408,7 +1625,7 @@
   }
 
   const AI_LIST_FIRST_KEYS = new Set([
-    'highestDegree', 'degree', 'academicDegree', 'studyMode', 'ranking', 'rankingPercent',
+    'highestDegree', 'degree', 'academicDegree',
     'politicalStatus', 'maritalStatus', 'englishLevel', 'languageProficiency'
   ]);
 
@@ -1595,6 +1812,12 @@
         confirmed = true;
         fillFailureReasons.delete(element);
       }
+      if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
+      return confirmed;
+    }
+    const cascaderPanel = CASCADE_LOCATION_KEYS.has(key) ? tabbedLocationPanel(session) : null;
+    if (cascaderPanel) {
+      const confirmed = await fillTabbedLocationSelect(session, cascaderPanel, element, trigger, key, value);
       if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
       return confirmed;
     }
@@ -2401,6 +2624,126 @@
     return part === 'year' ? match[1] : part === 'month' ? String(Number(match[2])) : part === 'day' && match[3] ? String(Number(match[3])) : value;
   }
 
+  function compoundSingleDate(element, key = '') {
+    if (!(element instanceof Element) || !/Date$|Date\b/.test(key)) return null;
+    const container = semanticContainer(element);
+    if (!container) return null;
+    const controls = controlNodes(container)
+      .filter((node) => node.type !== 'hidden' && node.type !== 'checkbox' && node.type !== 'radio')
+      .filter((node) => visible(node))
+      .filter((node) => datePart(node) || node.type === 'date' || node.type === 'month' || Boolean(customSelectTrigger(node)));
+    if (!controls.includes(element) || controls.length < 2 || controls.length > 3) return null;
+    const text = cleanText(`${labelText(element)} ${directSemanticLabels(container, element).join(' ')} ${container.className || ''}`);
+    const hasRangeSignal = /至今|当前|present|currently/i.test(cleanText(container.textContent))
+      || [...container.children].some((child) => /^\s*[-—~至]\s*$/.test(cleanText(child.textContent)))
+      || /range|期间|起止/i.test(String(container.className || ''));
+    if (hasRangeSignal) return null;
+    if (!/日期|时间|年月|date|year|month|day|date_info|month-range-select|picker|calendar/i.test(text)
+      && !controls.every((node) => customSelectTrigger(node))) return null;
+    return { root: container, controls };
+  }
+
+  function compoundSingleDatePart(compound, controlOrIndex) {
+    if (!compound?.controls?.length) return '';
+    const index = typeof controlOrIndex === 'number' ? controlOrIndex : compound.controls.indexOf(controlOrIndex);
+    if (index < 0) return '';
+    const explicit = datePart(compound.controls[index]);
+    if (explicit) return explicit;
+    return ['year', 'month', 'day'][index] || '';
+  }
+
+  function compoundSingleDateReading(compound) {
+    if (!compound?.controls?.length) return '';
+    return compound.controls
+      .map((control, index) => {
+        const shown = rangeControlShownValue(control);
+        if (!shown || placeholderLike(shown)) return '';
+        const part = compoundSingleDatePart(compound, index);
+        const number = shown.match(part === 'year' ? /(?:19|20)\d{2}/ : /\d{1,2}/)?.[0];
+        if (!number) return cleanText(shown);
+        if (part === 'year') return number;
+        return String(Number(number)).padStart(2, '0');
+      })
+      .filter(Boolean)
+      .join('-');
+  }
+
+  function compoundSingleDateMatches(compound, value) {
+    if (!compound?.controls?.length) return false;
+    return compound.controls.every((control, index) => {
+      const part = compoundSingleDatePart(compound, index);
+      return Boolean(part) && rangeControlMatches(control, datePartValue(value, part));
+    });
+  }
+
+  function liveCompoundSingleDate(host, key = '', fallbackRoot = null) {
+    if (fallbackRoot?.isConnected) {
+      const first = fallbackRoot.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])');
+      const compound = first && compoundSingleDate(first, key);
+      if (compound?.root === fallbackRoot || compound?.root?.isConnected) return compound;
+    }
+    if (!(host instanceof Element) || !host.isConnected) return null;
+    for (const input of host.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')) {
+      const compound = compoundSingleDate(input, key);
+      if (compound && host.contains(compound.root)) return compound;
+    }
+    return null;
+  }
+
+  async function fillCompoundSingleDateGroup(host, initialCompound, value, key) {
+    let compound = liveCompoundSingleDate(host, key, initialCompound.root);
+    if (!compound || ![2, 3].includes(compound.controls.length)) {
+      return { ok: false, reason: '单日期控件结构不是两格年/月或三格年/月/日' };
+    }
+    const originalStates = compound.controls.map((control) => captureFillState(control, customSelectTrigger(control) || control));
+    const failures = [];
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      let attempted = false;
+      for (let index = 0; index < compound.controls.length; index += 1) {
+        compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
+        if (!compound || compound.controls.length !== initialCompound.controls.length) {
+          failures.push('填写过程中单日期控件 DOM 已替换且无法重新定位');
+          continue;
+        }
+        const control = compound.controls[index];
+        const part = compoundSingleDatePart(compound, index);
+        const expected = part ? datePartValue(value, part) : '';
+        if (!part || !expected || expected === value) {
+          failures.push(`无法识别第 ${index + 1} 个日期子控件的 ${part || '部分'}`);
+          continue;
+        }
+        if (rangeControlMatches(control, expected)) continue;
+        attempted = true;
+        const filled = await fillElement(control, value, key, part);
+        compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
+        const liveControl = compound?.controls?.[index];
+        if (!filled || !liveControl || !rangeControlMatches(liveControl, expected)) {
+          failures.push(`${part === 'year' ? '年份' : part === 'month' ? '月份' : '日期'}未达到 ${expected}`);
+        }
+      }
+      compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
+      if (compoundSingleDateMatches(compound, value)) break;
+      if (!attempted) break;
+      await wait(80);
+    }
+
+    compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
+    if (!compoundSingleDateMatches(compound, value)) {
+      const actual = compoundSingleDateReading(compound) || '无法回读';
+      for (let index = 0; index < (compound?.controls?.length || 0); index += 1) {
+        const control = compound.controls[index];
+        await rollbackFailedControl(control, customSelectTrigger(control) || control, originalStates[index]);
+      }
+      return {
+        ok: false,
+        reason: `单日期控件没有达到目标值（当前：${actual}${failures.length ? `；尝试：${[...new Set(failures)].slice(-4).join('；')}` : ''}）`
+      };
+    }
+    compound.controls.forEach((control) => control.classList.add(FILLED_CLASS));
+    return { ok: true, compound };
+  }
+
   function auxiliaryControl(element, text) {
     const container = semanticContainer(element);
     if (!container) return false;
@@ -2854,6 +3197,18 @@
         };
       }
     }
+    const compound = compoundSingleDate(element, key);
+    if (compound) {
+      const { root, controls } = compound;
+      const index = controls.indexOf(element);
+      if (index >= 0) {
+        const occurrenceKey = `compound-date:${key}`;
+        if (!groupOccurrences.has(occurrenceKey)) groupOccurrences.set(occurrenceKey, { next: 0, containers: new WeakMap() });
+        const state = groupOccurrences.get(occurrenceKey);
+        if (!state.containers.has(root)) state.containers.set(root, state.next++);
+        return { key, occurrence: state.containers.get(root), part: compoundSingleDatePart(compound, index) };
+      }
+    }
     const container = semanticContainer(element);
     if (!container) return null;
     const isDateControl = (node) => datePart(node)
@@ -2876,7 +3231,10 @@
       const part = explicitPart || (sideControls.length > 1 ? datePart(element, sideControls.indexOf(element)) : '');
       return { key: rangeKinds[key][sideIndex], occurrence, part };
     }
-    if (/Date$|Date\b/.test(key) && controls.length > 1) return { key, occurrence, part: datePart(element) };
+    if (/Date$|Date\b/.test(key) && controls.length > 1) {
+      const explicitPart = datePart(element);
+      return { key, occurrence, part: explicitPart || datePart(element, index) };
+    }
     return null;
   }
 
@@ -2925,7 +3283,7 @@
       const value = profileValue(profile, key, 0, context);
       if (!value) continue;
       const fastValue = CASCADE_LOCATION_KEYS.has(key) ? (locationChoicePath(value).at(-1) || String(value)) : value;
-      if (!overwrite && hasValue(element)) {
+      if (!overwrite && hasMeaningfulExistingValue(element, null, text, key)) {
         markFillResult(element, EXISTING_CLASS);
         stats.existing += 1;
         const field = readableField(text, element);
@@ -3431,14 +3789,18 @@
       profileKey: 'workEntries',
       anchorKey: 'company',
       anchor: /公司名称|单位名称|雇主|employer|company\s*name/i,
-      kind: /实习|工作|任职|职业|社会实践|实践经历|employment|intern(?:ship)?|work\s*experience/i
+      kind: /实习|工作|任职|职业|社会实践|实践经历|employment|intern(?:ship)?|work\s*experience/i,
+      addPattern: /(?:添加|新增|继续添加|增加|新建|再添).{0,16}(?:实习|工作|任职|职业|社会实践|实践经历)|(?:实习|工作|任职|职业|社会实践|实践经历).{0,16}(?:添加|新增|继续添加|增加|新建|再添)|add.{0,24}(?:intern|employment|work)/i,
+      indexPattern: /(?:^|[^a-z])(?:work(?:entries|experiences?|histories?)?|employment(?:entries|experiences?|histories?)?|job(?:entries|experiences?|histories?)?|internships?|internship(?:entries|experiences?|histories?)?|intern(?:entries|experiences?|histories?)?|practice(?:entries|experiences?|histories?)?)\s*(?:\[|\(|\.|_|-)?\s*(\d+)(?:\]|\)|\.|_|-|$)/i
     },
     project: {
       label: '项目经历',
       profileKey: 'projectEntries',
       anchorKey: 'projectName',
       anchor: /项目名称|课题名称|project\s*name/i,
-      kind: /项目|科研|课题|project|research/i
+      kind: /项目|科研|课题|project|research/i,
+      addPattern: /(?:添加|新增|继续添加|增加|新建|再添).{0,16}(?:项目|科研|课题)|(?:项目|科研|课题).{0,16}(?:添加|新增|继续添加|增加|新建|再添)|add.{0,24}(?:project|research)/i,
+      indexPattern: /(?:^|[^a-z])(?:projects?|project(?:entries|experiences?|histories?)?|research(?:projects?|entries|experiences?|histories?)?|subjects?|topics?)\s*(?:\[|\(|\.|_|-)?\s*(\d+)(?:\]|\)|\.|_|-|$)/i
     },
     certificate: {
       label: '证书/奖项',
@@ -3615,8 +3977,17 @@
     // 教育经历优先按数组路径中的唯一索引计数。一段内有学校、学历、日期多个字段，
     // 但 education[1] 只计一次；也能在新段尚未填写时立即观察到 DOM 增长。
     const indexed = indexedRepeatedSectionSignatures(kind);
-    if (indexed.size) return indexed.size;
-    return repeatedAnchorControls(kind).length;
+    const anchors = repeatedAnchorControls(kind).length;
+    return Math.max(indexed.size, anchors);
+  }
+
+  async function sampledRepeatedSectionCount(kind, samples = 3, delay = 70) {
+    let max = 0;
+    for (let index = 0; index < samples; index += 1) {
+      max = Math.max(max, repeatedSectionCount(kind));
+      if (index < samples - 1) await wait(delay);
+    }
+    return max;
   }
 
   function nearbySectionText(button) {
@@ -3686,14 +4057,70 @@
       .sort((left, right) => right.score - left.score)[0]?.button || null;
   }
 
-  async function waitForRepeatedSectionCount(kind, before, timeout = 600) {
+  function repeatedSectionGrowthRegion(kind, button) {
+    const config = REPEATED_SECTION_CONFIG[kind];
+    if (!config || !(button instanceof Element)) return null;
+    let best = null;
+    for (let depth = 0, node = button.parentElement; node && depth < 10; depth += 1, node = node.parentElement) {
+      if (!visible(node)) continue;
+      const controls = controlNodes(node).filter((control) => control.isConnected && visible(control));
+      if (!controls.length || controls.length > 140) continue;
+      const text = cleanText(node.textContent);
+      const kindHit = config.kind.test(text) || config.anchor.test(text);
+      if (!kindHit) continue;
+      const score = (config.kind.test(text) ? 6 : 0)
+        + (config.anchor.test(text) ? 3 : 0)
+        + (controls.length <= 60 ? 4 : 2)
+        + (text.length <= 2200 ? 2 : 0)
+        - depth;
+      if (!best || score > best.score) best = { node, score };
+    }
+    return best?.node || null;
+  }
+
+  function repeatedSectionGrowthMetrics(kind, region) {
+    const config = REPEATED_SECTION_CONFIG[kind];
+    if (!config || !(region instanceof Element)) return { controls: 0, kindControls: 0, removeActions: 0 };
+    const controls = controlNodes(region).filter((control) => control.isConnected && visible(control));
+    const kindControls = controls.filter((control) => {
+      const text = labelText(control);
+      const context = sectionContext(control);
+      return context === kind || config.anchor.test(text) || config.kind.test(text);
+    });
+    const removeActions = [...region.querySelectorAll('button,[role="button"],a,[tabindex],[onclick]')]
+      .filter((node) => visible(node) && /删除|移除|remove|delete/i.test(interactiveDescription(node))).length;
+    return { controls: controls.length, kindControls: kindControls.length, removeActions };
+  }
+
+  function repeatedSectionGrowthDetected(beforeMetrics, afterMetrics) {
+    if (!beforeMetrics || !afterMetrics) return false;
+    return afterMetrics.kindControls >= beforeMetrics.kindControls + 1
+      || afterMetrics.controls >= beforeMetrics.controls + 3
+      || afterMetrics.removeActions > beforeMetrics.removeActions;
+  }
+
+  async function waitForRepeatedSectionCount(kind, before, button = null, timeout = 900) {
+    const initialRegion = repeatedSectionGrowthRegion(kind, button);
+    const initialMetrics = initialRegion ? repeatedSectionGrowthMetrics(kind, initialRegion) : null;
     const started = Date.now();
     while (Date.now() - started < timeout) {
       const count = repeatedSectionCount(kind);
       if (count > before) return count;
+      const liveButton = button?.isConnected ? button : findRepeatedSectionAddButton(kind);
+      const liveRegion = repeatedSectionGrowthRegion(kind, liveButton) || (initialRegion?.isConnected ? initialRegion : null);
+      if (liveRegion && repeatedSectionGrowthDetected(initialMetrics, repeatedSectionGrowthMetrics(kind, liveRegion))) {
+        return before + 1;
+      }
       await wait(40);
     }
-    return repeatedSectionCount(kind);
+    const finalCount = Math.max(repeatedSectionCount(kind), await sampledRepeatedSectionCount(kind, 2, 60));
+    if (finalCount > before) return finalCount;
+    const finalButton = button?.isConnected ? button : findRepeatedSectionAddButton(kind);
+    const finalRegion = repeatedSectionGrowthRegion(kind, finalButton) || (initialRegion?.isConnected ? initialRegion : null);
+    if (finalRegion && repeatedSectionGrowthDetected(initialMetrics, repeatedSectionGrowthMetrics(kind, finalRegion))) {
+      return before + 1;
+    }
+    return finalCount;
   }
 
   async function ensureRepeatedSections(profile, stats) {
@@ -3702,7 +4129,7 @@
       // 资料中有几段，就以几段为目标；不使用固定段数或固定上限。
       // 每次点击仍必须观察到强字段锚点增加，否则立即停止，避免错误按钮导致循环点击。
       const desired = entries.length;
-      let current = repeatedSectionCount(kind);
+      let current = await sampledRepeatedSectionCount(kind);
       if (!desired) continue;
       const plan = {
         kind,
@@ -3715,6 +4142,13 @@
       };
       stats.sectionPlan.push(plan);
       while (current < desired) {
+        const observedCurrent = await sampledRepeatedSectionCount(kind, 2, 60);
+        if (observedCurrent > current) {
+          current = observedCurrent;
+          plan.final = current;
+          plan.needed = Math.max(0, desired - current);
+          if (current >= desired) break;
+        }
         const button = findRepeatedSectionAddButton(kind);
         if (!button) {
           plan.skipped = desired - current;
@@ -3725,10 +4159,10 @@
           break;
         }
         activateOption(button);
-        let next = await waitForRepeatedSectionCount(kind, current);
+        let next = await waitForRepeatedSectionCount(kind, current, button);
         if (next <= current && button.isConnected) {
           const trusted = await trustedClick(button);
-          if (trusted?.ok) next = await waitForRepeatedSectionCount(kind, current, 1400);
+          if (trusted?.ok) next = await waitForRepeatedSectionCount(kind, current, button, 1800);
         }
         if (next <= current) {
           stats.sectionAddFailed += desired - current;
@@ -4384,6 +4818,7 @@
     formObserver.observe(document.documentElement, { childList: true, subtree: true });
     const handledRadioNames = new Set();
     const handledDateRangeHosts = new WeakSet();
+    const handledCompoundDateHosts = new WeakSet();
     const handledCustomSelectTriggers = new WeakSet();
     const countedUnmatchedTriggers = new WeakSet();
     const processedCustomChoiceGroups = new WeakSet();
@@ -4433,7 +4868,7 @@
       if (!matchedKey) {
         if (text && !ignoredText.test(text)) {
           const unmatchedTrigger = customSelectTrigger(element);
-          if (unmatchedTrigger && customTriggerHasSelection(unmatchedTrigger)) {
+          if (unmatchedTrigger && hasMeaningfulExistingValue(element, unmatchedTrigger, text, '')) {
             markFillResult(unmatchedTrigger, EXISTING_CLASS);
             stats.existing += 1;
             const field = readableField(text, element);
@@ -4539,6 +4974,78 @@
         }
         continue;
       }
+      const compoundDate = compoundSingleDate(element, matchedKey);
+      if (compoundDate) {
+        const compoundHost = semanticContainer(element) || compoundDate.root.parentElement || compoundDate.root;
+        if (handledCompoundDateHosts.has(compoundHost)) continue;
+        handledCompoundDateHosts.add(compoundHost);
+        const binding = dateBinding(element, matchedKey, groupOccurrences);
+        const key = binding?.key || matchedKey;
+        const occurrenceKey = `${context || 'global'}:${key}`;
+        const fallbackOccurrence = binding?.occurrence ?? (occurrences.get(occurrenceKey) || 0);
+        const educationResolution = educationMappedKey(key)
+          ? educationEntryResolution(profile, text, fallbackOccurrence)
+          : { explicit: false, index: fallbackOccurrence, label: '' };
+        const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
+        const value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
+        if (!value) {
+          markFillResult(compoundDate.root, MISSING_CLASS);
+          stats.missingData += 1;
+          if (stats.details.missingData.length < 8) stats.details.missingData.push(`${readableField(text, element)} → ${key}`);
+          recordDiagnostic(stats, 'missingData', {
+            field: readableField(text, element), key, stage: '本地资料取值',
+            reason: educationResolution.explicit && occurrence < 0
+              ? `页面字段明确指定${educationResolution.label}，但本地资料中没有对应教育经历；未尝试操作页面`
+              : `页面字段已映射为 ${key}，但本地资料第 ${occurrence + 1} 个对应值为空；未尝试操作页面`
+          });
+          continue;
+        }
+        if (!binding && !educationResolution.explicit) {
+          occurrences.set(occurrenceKey, fallbackOccurrence + 1);
+        }
+        if (!overwrite && compoundSingleDateMatches(compoundDate, value)) {
+          markFillResult(compoundDate.root, EXISTING_CLASS);
+          stats.existing += 1;
+          const field = readableField(text, element);
+          const observed = compoundSingleDateReading(compoundDate);
+          stats.details.existing.push(`${field}（页面日期已匹配资料）`);
+          recordDiagnostic(stats, 'existing', {
+            field, key, target: value, observed, stage: '填写前检查',
+            reason: '页面回读的单日期年月日已与目标资料匹配，且未开启覆盖'
+          });
+          continue;
+        }
+        const compoundResult = await fillCompoundSingleDateGroup(compoundHost, compoundDate, value, key);
+        const compoundElapsed = Math.round(performance.now() - fieldStarted);
+        if (compoundElapsed >= 100) {
+          stats.slowFields.push({
+            field: readableField(text, element),
+            key,
+            ms: compoundElapsed,
+            ok: Boolean(compoundResult.ok)
+          });
+          stats.slowFields.sort((left, right) => right.ms - left.ms);
+          stats.slowFields.length = Math.min(stats.slowFields.length, 8);
+        }
+        if (compoundResult.ok) {
+          markFillResult(compoundDate.root, FILLED_CLASS);
+          stats.filled += 1;
+        } else {
+          const failedElement = compoundResult.element || compoundDate.root || element;
+          markFillResult(failedElement, FAILED_CLASS);
+          stats.unsupported += 1;
+          if (stats.details.unsupported.length < 8) {
+            stats.details.unsupported.push(`${readableField(text, element)} → ${key}（${compoundResult.reason}）`);
+          }
+          recordDiagnostic(stats, 'unsupported', {
+            field: readableField(text, element), key, target: value,
+            observed: compoundSingleDateReading(compoundDate) || '—',
+            stage: '单日期回读验证',
+            reason: compoundResult.reason || '网页未接受目标年月日'
+          });
+        }
+        continue;
+      }
       const logicalTrigger = customSelectTrigger(element);
       if (logicalTrigger && handledCustomSelectTriggers.has(logicalTrigger)) continue;
       if (logicalTrigger) handledCustomSelectTriggers.add(logicalTrigger);
@@ -4594,7 +5101,7 @@
       if (!binding && !educationResolution.explicit && type !== 'radio' && type !== 'checkbox') {
         occurrences.set(occurrenceKey, fallbackOccurrence + 1);
       }
-      if (!overwrite && hasValue(element) && type !== 'radio' && type !== 'checkbox') {
+      if (!overwrite && hasMeaningfulExistingValue(element, logicalTrigger, text, key) && type !== 'radio' && type !== 'checkbox') {
         markFillResult(logicalTrigger || element, EXISTING_CLASS);
         stats.existing += 1;
         const field = readableField(text, element);

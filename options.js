@@ -8,6 +8,7 @@ const resumeDrop = document.querySelector('#resumeDrop');
 import { inferProfile } from './resume-parser.mjs';
 import { migrateLegacyResumeFile, removeResumeFile, saveResumeFile } from './resume-file-store.js';
 import { AI_GATEWAY_URL, clearAIConfig, loadAIConfig, requestAIGatewayPermission, saveAIConfig } from './ai-client.js';
+import { clearGitHubSyncConfig, downloadGitHubProfile, loadGitHubSyncConfig, requestGitHubPermission, saveGitHubSyncConfig, uploadGitHubProfile } from './github-sync.js';
 
 function setState(text, saved = false) {
   state.textContent = text;
@@ -26,10 +27,37 @@ const aiGatewayUrl = document.querySelector('#aiGatewayUrl');
 const aiModel = document.querySelector('#aiModel');
 const aiApiKey = document.querySelector('#aiApiKey');
 const aiConfigState = document.querySelector('#aiConfigState');
+const githubSyncForm = document.querySelector('#githubSyncForm');
+const githubRepoUrl = document.querySelector('#githubRepoUrl');
+const githubBranch = document.querySelector('#githubBranch');
+const githubSyncPath = document.querySelector('#githubSyncPath');
+const githubToken = document.querySelector('#githubToken');
+const githubSyncState = document.querySelector('#githubSyncState');
 
 function setAIConfigState(text, kind = '') {
   aiConfigState.textContent = text;
   aiConfigState.className = `ai-config-state${kind ? ` ${kind}` : ''}`;
+}
+
+function setGitHubSyncState(text, kind = '') {
+  githubSyncState.textContent = text;
+  githubSyncState.className = `github-sync-state${kind ? ` ${kind}` : ''}`;
+}
+
+function githubConfigFromForm() {
+  return {
+    repoUrl: githubRepoUrl.value.trim(),
+    branch: githubBranch.value.trim(),
+    path: githubSyncPath.value.trim(),
+    token: githubToken.value.trim()
+  };
+}
+
+function applyGitHubConfig(config = {}) {
+  githubRepoUrl.value = config.repoUrl || '';
+  githubBranch.value = config.branch || 'main';
+  githubSyncPath.value = config.path || 'sync/resume-profile.jsonl';
+  githubToken.value = config.token || '';
 }
 
 async function loadAISettings() {
@@ -42,6 +70,13 @@ async function loadAISettings() {
 }
 
 const DIRECT_ADMINISTRATIONS = /^(?:北京市|上海市|天津市|重庆市|香港特别行政区|澳门特别行政区)$/;
+
+async function loadGitHubSyncSettings() {
+  const config = await loadGitHubSyncConfig();
+  applyGitHubConfig(config);
+  const complete = Boolean(config.repoUrl && config.token);
+  setGitHubSyncState(complete ? 'GitHub 配置已保存，可手动上传或下载资料' : '尚未完整配置', complete ? 'saved' : '');
+}
 
 function splitLocationPath(value) {
   const raw = String(value || '').replace(/[\s,，/／>]+/g, '').trim();
@@ -443,5 +478,67 @@ document.querySelector('#clearAiConfig').addEventListener('click', async () => {
   setAIConfigState('AI 配置已清除');
 });
 
+githubSyncForm.addEventListener('input', () => setGitHubSyncState('GitHub 配置有未保存的修改'));
+githubSyncForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const permitted = await requestGitHubPermission();
+    const config = await saveGitHubSyncConfig(githubConfigFromForm());
+    applyGitHubConfig(config);
+    setGitHubSyncState(permitted ? 'GitHub 配置已保存，可手动上传或下载资料' : '配置已保存，但未授权访问 GitHub API', permitted ? 'saved' : 'error');
+  } catch (error) {
+    setGitHubSyncState(`保存失败：${error?.message || error}`, 'error');
+  }
+});
+
+document.querySelector('#toggleGithubToken').addEventListener('click', (event) => {
+  const showing = githubToken.type === 'text';
+  githubToken.type = showing ? 'password' : 'text';
+  event.currentTarget.textContent = showing ? '显示' : '隐藏';
+  event.currentTarget.setAttribute('aria-label', showing ? '显示 GitHub Token' : '隐藏 GitHub Token');
+});
+
+document.querySelector('#uploadGithubProfile').addEventListener('click', async () => {
+  try {
+    const permitted = await requestGitHubPermission();
+    if (!permitted) throw new Error('未授权访问 GitHub API');
+    const config = await saveGitHubSyncConfig(githubConfigFromForm());
+    applyGitHubConfig(config);
+    const profile = profileFromForm();
+    await chrome.storage.local.set({ profile });
+    const result = await uploadGitHubProfile(profile, config);
+    setState('资料已保存并上传到 GitHub', true);
+    setGitHubSyncState(result.created ? '已在 GitHub 新建同步文件' : '已将当前资料同步到 GitHub', 'saved');
+  } catch (error) {
+    setGitHubSyncState(`上传失败：${error?.message || error}`, 'error');
+  }
+});
+
+document.querySelector('#downloadGithubProfile').addEventListener('click', async () => {
+  if (!confirm('将使用 GitHub 上的资料覆盖当前表单并保存到本地，是否继续？')) return;
+  try {
+    const permitted = await requestGitHubPermission();
+    if (!permitted) throw new Error('未授权访问 GitHub API');
+    const config = await saveGitHubSyncConfig(githubConfigFromForm());
+    applyGitHubConfig(config);
+    const result = await downloadGitHubProfile(config);
+    populateForm(result.profile);
+    await chrome.storage.local.set({ profile: profileFromForm() });
+    setState('已从 GitHub 下载并保存资料', true);
+    setGitHubSyncState(result.syncedAt ? `已从 GitHub 拉取资料（${result.syncedAt}）` : '已从 GitHub 拉取资料', 'saved');
+  } catch (error) {
+    setGitHubSyncState(`下载失败：${error?.message || error}`, 'error');
+  }
+});
+
+document.querySelector('#clearGithubConfig').addEventListener('click', async () => {
+  if (!confirm('确定清除当前 Chrome 中保存的 GitHub 仓库配置和 Token 吗？')) return;
+  await clearGitHubSyncConfig();
+  applyGitHubConfig({});
+  githubToken.type = 'password';
+  document.querySelector('#toggleGithubToken').textContent = '显示';
+  setGitHubSyncState('GitHub 配置已清除');
+});
+
 textPreview.hidden = true;
-await Promise.all([loadProfile(), updateResumeFileState(), loadAISettings()]);
+await Promise.all([loadProfile(), updateResumeFileState(), loadAISettings(), loadGitHubSyncSettings()]);

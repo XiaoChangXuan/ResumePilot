@@ -194,6 +194,43 @@
       </form>
     </section>
 
+    <section class="github-sync-card" aria-labelledby="githubSyncTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="githubSyncTitle">GitHub 同步</h2>
+          <p class="section-note">手动把当前资料同步到 GitHub 仓库中的一个 JSONL 文件，或从该文件下载最后一条记录回本地。当前只同步 profile 资料，不包含原始简历附件。</p>
+        </div>
+        <span class="github-sync-badge">REPO SYNC</span>
+      </div>
+      <form id="githubSyncForm">
+        <div class="grid">
+          <label class="wide">GitHub 仓库地址
+            <input id="githubRepoUrl" type="url" autocomplete="off" placeholder="https://github.com/owner/repo">
+          </label>
+          <label>分支
+            <input id="githubBranch" autocomplete="off" placeholder="main">
+          </label>
+          <label>同步文件路径
+            <input id="githubSyncPath" autocomplete="off" placeholder="sync/resume-profile.jsonl">
+          </label>
+          <label class="wide">GitHub Token
+            <span class="secret-input">
+              <input id="githubToken" type="password" autocomplete="off" spellcheck="false" placeholder="保存在当前 Chrome 扩展本地存储中">
+              <button id="toggleGithubToken" type="button" aria-label="显示 GitHub Token">显示</button>
+            </span>
+          </label>
+        </div>
+        <p class="github-sync-note">建议使用只授予目标仓库 Contents 读写权限的 Token。首次保存、上传或下载时会请求访问 GitHub API 的权限。</p>
+        <div class="github-sync-actions">
+          <button class="primary" type="submit">保存 GitHub 配置</button>
+          <button id="uploadGithubProfile" type="button">上传当前资料</button>
+          <button id="downloadGithubProfile" type="button">下载远端资料</button>
+          <button id="clearGithubConfig" type="button">清除 GitHub 配置</button>
+          <span id="githubSyncState" class="github-sync-state" aria-live="polite">尚未配置</span>
+        </div>
+      </form>
+    </section>
+
     <template id="familyTemplate">
       <article class="entry" data-kind="family"><div class="entry-head"><strong>家庭成员</strong><button type="button" data-remove>删除</button></div><div class="grid">
         <label>姓名<input data-field="name"></label><label>关系<input data-field="relationship" placeholder="例如：父亲"></label>

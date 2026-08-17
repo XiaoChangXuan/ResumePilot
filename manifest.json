@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "简历一键填表 MVP",
-  "version": "0.6.53",
+  "version": "0.6.57",
   "description": "本地解析并保存简历，将求职资料和简历附件一键写入常见招聘表单；不会自动提交。",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "debugger"],
-  "optional_host_permissions": ["http://llm.api.corp.qunar.com/*"],
+  "optional_host_permissions": ["http://llm.api.corp.qunar.com/*", "https://api.github.com/*"],
   "background": {
     "service_worker": "background.js",
     "type": "module"

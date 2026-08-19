@@ -1,126 +1,210 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.6.57';
-  if (globalThis.__resumeAutofillLoadedVersion === CONTENT_SCRIPT_VERSION) return;
-  globalThis.__resumeAutofillLoadedVersion = CONTENT_SCRIPT_VERSION;
-  globalThis.__resumeAutofillLoaded = true;
+  const VERSION = '0.9.43';
+  const MESSAGE_PROTOCOL = 2;
+  if (globalThis.__resumePageAuditVersion === VERSION) return;
+  globalThis.__resumePageAuditVersion = VERSION;
 
-  const FILLED_CLASS = 'resume-autofill-filled';
-  const UNMATCHED_CLASS = 'resume-autofill-unmatched';
-  const MISSING_CLASS = 'resume-autofill-missing';
-  const FAILED_CLASS = 'resume-autofill-failed';
-  const EXISTING_CLASS = 'resume-autofill-existing';
-  const IGNORED_CLASS = 'resume-autofill-ignored';
-  const INTERACTION_TIMEOUT = 2800;
-  const INTERACTION_CLOSE_TIMEOUT = 1800;
-  let interactionBlocked = '';
-  let interactionWarnings = [];
-  const GENERIC_PLACEHOLDER = /^(?:请输入|请选择|请填写|选择|输入|select|please\s+(?:select|enter)|nope|new_password|年|月|日|yyyy|mm|dd)?$/i;
-  const FIELD_CONTAINER_HINT = /field|form.?item|control.?item|question|row|cell/i;
-  const LABEL_HINT = /label|title|caption|name|prompt/i;
-  let semanticContainerCache = new WeakMap();
-  let labelTextCache = new WeakMap();
-  let sectionContextCache = new WeakMap();
-  let auditElementMap = new Map();
+  const PANEL_SELECTOR = '.resume-page-audit';
+  const AUDIT_UI_SELECTOR = '.resume-page-audit,[data-resume-page-audit-ui]';
+  const TARGET_CLASS = 'resume-page-audit-target';
+  const OVERLAY_CLASS = 'resume-page-audit-overlay';
+  const OVERLAY_TARGET_CLASS = 'resume-page-audit-overlay--target';
+  const MAX_INTERACTIVE = 1200;
+  const MAX_SEMANTIC_TEXTS = 600;
+  const MAX_POINTER_SCAN = 15000;
+  const INTERACTIVE_SELECTOR = [
+    'input', 'textarea', 'select', 'button', 'a', '[contenteditable]:not([contenteditable="false"])',
+    '[role="button"]', '[role="textbox"]', '[role="combobox"]', '[role="radio"]',
+    '[role="checkbox"]', '[role="switch"]', '[role="slider"]', '[tabindex]', '[onclick]'
+  ].join(',');
+  const MODULE_TITLE_RE = /(?:上传|简历|个人|基本|基础|联系|求职|教育|学历|学习|就读|校园|实习|工作|项目|经历|经验|实践|语言|外语|英语|技能|证书|获奖|荣誉|附件|附加|补充|兴趣|爱好|组织|作品|家庭|自我|评价|社交|账号|其他|basic|personal|contact|education|academic|school|work|job|intern|project|experience|language|skill|certificate|award|honou?r|attachment|additional|profile)/i;
+  const MODULE_TITLE_WORDS_RE = /(?:上传|简历|个人|基本|基础|联系|求职|教育|学历|学习|就读|校园|实习|工作|项目|经历|经验|实践|语言|外语|英语|技能|证书|获奖|荣誉|附件|附加|补充|兴趣|爱好|组织|作品|家庭|自我|评价|社交|账号|其他|basic|personal|contact|education|academic|school|work|job|intern|project|experience|language|skill|certificate|award|honou?r|attachment|additional|profile)/ig;
+  let elementMap = new Map();
+  let sourceElementMap = new Map();
+  let semanticModuleTitleByElement = new WeakMap();
+  let semanticZoneByElement = new WeakMap();
+  let semanticZoneRootByElement = new WeakMap();
+  let semanticLandmarkTitleByElement = new WeakMap();
+  let semanticTreeSnapshot = null;
+  let overlaySyncFrame = 0;
 
-  const rules = [
-    { key: 'familyName', patterns: [/家庭成员.*姓名/, /父母.*姓名/, /紧急联系人(?!.*(?:电话|手机))/, /联系人.*姓名/, /family.*name/] },
-    { key: 'relativesEmployed', patterns: [/是否.*(?:亲属|亲戚|家属).*(?:任职|工作|就职)/, /(?:亲属|亲戚|家属).*(?:在本公司|本集团|应聘单位|公司内).*(?:任职|工作|就职)/, /relative.*(?:employ|work).*(?:company|organi[sz]ation)?/i] },
-    { key: 'familyRelationship', patterns: [/家庭成员.*关系/, /与本人关系/, /亲属关系/, /relationship/] },
-    { key: 'familyPhone', patterns: [/家庭成员.*(?:电话|手机)/, /父母.*(?:电话|手机)/, /紧急联系(?:电话|手机)/, /联系人.*(?:电话|手机)/, /emergency.*phone/] },
-    { key: 'familyWorkplace', patterns: [/家庭成员.*工作单位/, /父母.*工作单位/, /联系人.*工作单位/] },
-    { key: 'familyOccupation', patterns: [/家庭成员.*职业/, /父母.*职业/, /联系人.*职业/] },
-    { key: 'email', patterns: [/邮箱/, /电子邮件/, /e[- ]?mail/] },
-    { key: 'phone', patterns: [/手机/, /手机号/, /联系电话/, /电话号码/, /phone/, /mobile/, /telephone/] },
-    { key: 'firstName', patterns: [/名(?:字)?\s*first/, /first\s*name/, /given\s*name/] },
-    { key: 'lastName', patterns: [/姓\s*last/, /last\s*name/, /family\s*name/, /surname/] },
-    { key: 'englishName', patterns: [/英文名/, /英文姓名/, /拼音姓名/, /english\s*name/, /name\s*in\s*english/] },
-    { key: 'fullName', patterns: [/姓名/, /真实姓名/, /候选人姓名/, /应聘者姓名/, /申请人姓名/, /中文名/, /full\s*name/, /candidate\s*name/, /applicant\s*name/, /^name$/] },
-    { key: 'gender', patterns: [/性别/, /gender/, /^sex$/] },
-    { key: 'birthDate', patterns: [/出生日期/, /出生年月/, /生日/, /date\s*of\s*birth/, /birth\s*date/, /birthday/] },
-    { key: 'countryRegion', patterns: [/^国家\s*[/／-]?\s*地区$/, /^国家$/, /^国籍$/, /country\s*[/／-]?\s*region/, /country\s*(?:of\s*)?(?:residence|citizenship)?/] },
-    { key: 'desiredCity', patterns: [/期望城市/, /意向(?:工作)?城市/, /意向工作地点/, /期望工作地点/, /desired\s*(city|location)/, /preferred\s*location/] },
-    { key: 'currentResidence', patterns: [/现居地/, /现居住地/, /当前居住地/, /current.*residence/] },
-    { key: 'ethnicity', patterns: [/民族/, /\bethnicity\b/] },
-    { key: 'city', patterns: [/所在城市/, /当前城市/, /居住城市/, /城市/, /\bcity\b/, /current\s*location/] },
-    { key: 'address', patterns: [/详细地址/, /居住地址/, /联系地址/, /street\s*address/, /^address/] },
-    { key: 'postalCode', patterns: [/邮编/, /邮政编码/, /postal\s*code/, /zip\s*code/] },
-    { key: 'height', patterns: [/身高/, /height/] },
-    { key: 'weight', patterns: [/体重/, /weight/] },
-    { key: 'studentOrigin', patterns: [/生源地/, /student.*origin/] },
-    { key: 'nativePlaceProvince', patterns: [/(?:籍贯|祖籍).*(?:省(?:份|级)?(?:\s|$|[)）\]】/／-])|省\s*[/／-]\s*直辖市)/, /(?:省份|省级|省\s*[/／-]\s*直辖市).*(?:籍贯|祖籍)/, /native\s*place.*province/] },
-    { key: 'nativePlaceDistrict', patterns: [/(?:籍贯|祖籍).*(?:区(?:\s*[/／-]?\s*县)?(?:\s|$|[)）\]】/／-])|县区)/, /(?:区县|县区|区\s*[/／-]\s*县).*(?:籍贯|祖籍)/, /native\s*place.*(?:district|county)/] },
-    { key: 'nativePlaceCity', patterns: [/(?:籍贯|祖籍).*(?:市(?:\s*[/／-]?\s*地区)?(?:\s|$|[)）\]】/／-])|城市)/, /(?:城市|市级|市\s*[/／-]\s*地区).*(?:籍贯|祖籍)/, /native\s*place.*city/] },
-    { key: 'nativePlace', patterns: [/籍贯/, /祖籍/, /native\s*place/] },
-    { key: 'householdRegistration', patterns: [/户籍所在地/, /户口所在地/, /^户籍$/, /household.*registration/, /hukou/] },
-    { key: 'politicalStatus', patterns: [/政治面貌/, /political.*status/] },
-    { key: 'maritalStatus', patterns: [/婚姻状况/, /婚姻状态/, /^婚否$/, /marital.*status/] },
-    { key: 'wechat', patterns: [/微信号/, /^微信$/, /wechat/] },
-    { key: 'qq', patterns: [/qq(?:号|号码)?/i, /腾讯qq/i] },
-    { key: 'identityDocumentType', patterns: [/证件类别/, /证件类型/, /身份证件类型/, /document.*type/, /id.*type/] },
-    { key: 'identityDocumentNumber', patterns: [/证件号码/, /证件编号/, /身份证号(?:码)?/, /护照号(?:码)?/, /document.*number/, /id.*number/, /passport.*number/] },
-    { key: 'targetRole', patterns: [/目标职位/, /期望职位/, /意向职位/, /申请职位/, /desired\s*(role|position)/, /target\s*(role|position)/] },
-    { key: 'expectedSalary', patterns: [/期望薪资/, /期望月薪/, /薪资要求/, /expected\s*salary/, /salary\s*expectation/] },
-    { key: 'yearsExperience', patterns: [/工作年限/, /工作经验年限/, /years?\s*of\s*experience/] },
-    { key: 'availableDate', patterns: [/到岗日期/, /预计可到岗时间/, /可入职日期/, /最早入职/, /available\s*(date|from)/, /start\s*date/] },
-    { key: 'jobStatus', patterns: [/求职状态/, /当前状态/, /在职状态/, /employment\s*status/] },
-    { key: 'school', patterns: [/毕业院校/, /学校名称/, /学校/, /院校/, /university/, /college/, /school/] },
-    { key: 'college', patterns: [/学院名称/, /院系名称/, /^学院$/, /^院系$/, /faculty/] },
-    { key: 'isHighestEducation', patterns: [/是否最高学历/, /最高学历.*(?:是|否)/, /is.*highest.*education/] },
-    { key: 'highestDegree', patterns: [/^最高学历$/, /最高教育程度/, /highest\s*education(?:\s*level)?/] },
-    { key: 'degree', patterns: [/最高学历/, /学历/, /education\s*level/] },
-    { key: 'academicDegree', patterns: [/所获学位/, /学位名称/, /^学位$/, /academic\s*degree/, /^degree$/] },
-    { key: 'major', patterns: [/所学专业/, /专业名称/, /专业/, /field\s*of\s*study/, /major/] },
-    { key: 'educationStartDate', patterns: [/教育.*开始时间/, /入学时间/, /education.*start/] },
-    { key: 'highestGraduationDate', patterns: [/最高学历.*毕业(?:日期|时间)/, /最高学历.*毕业年份/, /highest.*graduation/] },
-    { key: 'graduationDate', patterns: [/毕业日期/, /毕业时间/, /graduation\s*(date|year)/] },
-    { key: 'gpa', patterns: [/绩点/, /\bgpa\b/] },
-    { key: 'rankingPercent', patterns: [/排名占比/, /排名百分比/, /专业排名比例/, /成绩排名比例/, /rank.*percent/, /percentile/] },
-    { key: 'ranking', patterns: [/专业排名/, /成绩排名/, /class.*rank/, /major.*rank/] },
-    { key: 'studyMode', patterns: [/学习形式/, /培养方式/, /就读形式/, /study.*mode/] },
-    { key: 'company', patterns: [/当前公司/, /最近公司/, /公司名称/, /单位名称/, /雇主/, /employer/, /company\s*name/] },
-    { key: 'currentTitle', patterns: [/当前职位/, /最近职位/, /职位名称/, /职务/, /job\s*title/, /position\s*title/] },
-    { key: 'department', patterns: [/部门名称/, /^部门$/, /工作部门/, /实习部门/, /department/] },
-    { key: 'workType', patterns: [/经历类型/, /工作性质/, /实习类型/, /employment.*type/] },
-    { key: 'workStartDate', patterns: [/工作开始时间/, /入职时间/, /入职日期/, /employment\s*start/, /work\s*start/] },
-    { key: 'workEndDate', patterns: [/工作结束时间/, /离职时间/, /离职日期/, /employment\s*end/, /work\s*end/] },
-    { key: 'workDescription', patterns: [/工作内容/, /实习内容/, /工作描述/, /职责描述/, /工作职责/, /responsibilities/, /job\s*description/] },
-    { key: 'projectName', patterns: [/项目名称/, /project.*name/] },
-    { key: 'projectRole', patterns: [/项目角色/, /项目职责/, /项目中职责/, /project.*role/] },
-    { key: 'projectStartDate', patterns: [/项目.*开始时间/, /project.*start/] },
-    { key: 'projectEndDate', patterns: [/项目.*结束时间/, /project.*end/] },
-    { key: 'projectDescription', patterns: [/项目描述/, /项目内容/, /project.*description/] },
-    { key: 'certificateName', patterns: [/证书名称/, /技能证书/, /资格证书/, /奖项名称/, /荣誉名称/, /资质名称/, /certificate.*(?:name|title)/, /award.*(?:name|title)/, /honou?r.*(?:name|title)/] },
-    { key: 'certificateDate', patterns: [/证书.*获得时间/, /获证时间/, /发证日期/, /颁发日期/, /获奖时间/, /奖项时间/, /certificate.*date/, /award.*date/] },
-    { key: 'certificateNumber', patterns: [/证书编号/, /证书号码/, /资格证编号/, /certificate.*(?:number|no\.?)/] },
-    { key: 'certificateIssuer', patterns: [/证书.*颁发机构/, /颁发单位/, /发证机构/, /发证单位/, /颁奖单位/, /issuing.*organization/, /award.*organization/] },
-    { key: 'certificateLevel', patterns: [/奖项级别/, /获奖级别/, /证书级别/, /荣誉级别/, /award.*level/, /certificate.*level/] },
-    { key: 'certificateDescription', patterns: [/证书描述/, /certificate.*description/] },
-    { key: 'languageName', patterns: [/语言名称/, /语言类型/, /^语言$/, /language/] },
-    { key: 'englishLevel', patterns: [/英语水平/, /英语等级/, /英文水平/, /英文等级/, /大学英语等级/, /english.*(?:level|proficiency)/] },
-    { key: 'englishListeningSpeaking', patterns: [/英语.*(?:听说|听力.*口语|口语.*听力)/, /英文.*(?:听说|听力.*口语|口语.*听力)/, /english.*(?:listening.*speaking|speaking.*listening|oral)/] },
-    { key: 'englishReadingWriting', patterns: [/英语.*(?:读写|阅读.*写作|写作.*阅读)/, /英文.*(?:读写|阅读.*写作|写作.*阅读)/, /english.*(?:reading.*writing|writing.*reading)/] },
-    { key: 'languageProficiency', patterns: [/语言.*熟练程度/, /语言能力/, /外语水平/, /language.*proficiency/] },
-    { key: 'languageCertificate', patterns: [/语言.*证书/, /语言考试/, /language.*certificate/] },
-    { key: 'languageScore', patterns: [/语言.*成绩/, /语言.*分数/, /language.*score/] },
-    { key: 'computerLevel', patterns: [/计算机等级/, /计算机证书/, /computer.*level/, /computer.*certificate/] },
-    { key: 'computerProficiency', patterns: [/计算机.*熟练程度/, /computer.*proficiency/] },
-    { key: 'computerSkills', patterns: [/计算机技能/, /计算机能力/, /软件技能/, /computer.*skills?/] },
-    { key: 'linkedin', patterns: [/linkedin/] },
-    { key: 'github', patterns: [/github/] },
-    { key: 'portfolio', patterns: [/个人网站/, /作品集/, /个人主页/, /portfolio/, /personal\s*(site|website)/, /website/] },
-    { key: 'whyCompany', patterns: [/为何.*(?:加入|选择|应聘).*(?:本公司|公司|企业)/, /为什么.*(?:加入|选择|应聘)/, /加入.*(?:本公司|公司).*(?:原因|理由)/, /应聘.*(?:原因|理由|动机)/, /求职动机/, /why.*(?:join|company)/, /motivation/] },
-    { key: 'summary', patterns: [/个人介绍/, /自我介绍/, /个人优势/, /自我评价/, /自我描述/, /个人简介/, /summary/, /about\s*you/, /bio/] },
-    { key: 'needsSponsorship', patterns: [/签证担保/, /visa\s*sponsorship/, /require.*sponsorship/] },
-    { key: 'workAuthorized', patterns: [/合法工作资格/, /工作授权/, /authorized\s*to\s*work/, /work\s*authorization/] },
-    { key: 'remoteOk', patterns: [/接受远程/, /远程办公/, /willing.*remote/, /remote\s*work/] },
-    { key: 'relocateOk', patterns: [/接受搬迁/, /接受调动/, /willing.*relocat/, /relocation/] }
-    , { key: 'healthStatus', patterns: [/^健康状况$/, /^身体状况$/, /身体健康情况/, /health\s*(?:status|condition)/] }
-    , { key: 'mentalIllness', patterns: [/是否.*(?:精神疾病|精神病史|精神障碍)/, /有无.*(?:精神疾病|精神病史|精神障碍)/, /mental.*(?:illness|disease|disorder|history)/] }
-    , { key: 'acceptsAdjustment', patterns: [/是否.*服从.*(?:调剂|调配|分配)/, /服从调剂/, /服从调配/, /接受.*(?:岗位)?调配/, /accept.*(?:adjustment|reassignment)/] }
-    , { key: 'acceptsRotation', patterns: [/是否.*(?:接受|服从).*(?:轮岗|岗位轮换)/, /是否轮岗/, /接受轮岗/, /job\s*rotation|rotational\s*(?:role|program)/] }
+  const MARK_CLASSES = [
+    'resume-page-audit-match',
+    'resume-page-audit-kind--field',
+    'resume-page-audit-kind--action',
+    'resume-page-audit-kind--container',
+    'resume-page-audit-adaptation--partial',
+    'resume-page-audit-adaptation--unadapted',
+    'resume-page-audit-safety--guarded',
+    TARGET_CLASS
   ];
 
-  const ignoredText = /搜索|search|职位关键字|请输入[^ ]*关键字|keyword|验证码|captcha|密码|password|确认密码|用户名|username|优惠码|coupon|推荐码|referral\s*code|^至今(?:\s|$)|同步更新在线简历|^授权文本$|隐私政策|用户协议/i;
+  const FIELD_RULES = [
+    ['acceptsAdjustment', /\u662f\u5426.*(?:\u53ef)?(?:\u63a5\u53d7|\u670d\u4ece).*(?:\u5de5\u4f5c\u57ce\u5e02|\u5c97\u4f4d|\u804c\u4f4d)?.*(?:\u8c03\u5242|\u8c03\u914d)|(?:\u5de5\u4f5c\u57ce\u5e02|\u5c97\u4f4d|\u804c\u4f4d).*(?:\u8c03\u5242|\u8c03\u914d)|accept.*(?:adjustment|reassignment)/i],
+    ['recruitmentSource', /(?:\u6700\u521d|\u4f55\u5904|\u54ea\u91cc|\u4ece\u4f55\u5904).*(?:\u4e86\u89e3|\u5f97\u77e5).*(?:\u6821\u62db|\u62db\u8058|\u804c\u4f4d|\u4fe1\u606f)|recruit(?:ment)?\s*source/i],
+    ['englishName', /英文名|英文姓名|拼音姓名|english\s*name|name\s*in\s*english/i],
+    ['firstName', /名字|first\s*name|given\s*name/i],
+    ['lastName', /姓氏|last\s*name|family\s*name|surname/i],
+    ['fullName', /姓名|真实姓名|候选人姓名|申请人姓名|中文名|full\s*name|candidate\s*name|applicant\s*name/i],
+    ['gender', /性别|gender|^sex$/i],
+    ['birthDate', /出生日期|出生年月|生日|date\s*of\s*birth|birth\s*date|birthday/i],
+    ['phone', /手机|联系电话|电话号码|phone|mobile|telephone/i],
+    ['email', /邮箱|电子邮件|e-?mail/i],
+    ['wechat', /微信号|微信|wechat/i],
+    ['qq', /qq(?:号|号码)?/i],
+    ['countryRegion', /国家|地区|国籍|country|region|citizenship/i],
+    ['city', /城市|工作地点|居住地|location|city|residence/i],
+    ['address', /详细地址|居住地址|联系地址|street\s*address|^address/i],
+    ['postalCode', /邮编|邮政编码|postal\s*code|zip\s*code/i],
+    ['nativePlace', /籍贯|祖籍|native\s*place/i],
+    ['householdRegistration', /户籍|户口|household\s*registration|hukou/i],
+    ['ethnicity', /民族|ethnicity/i],
+    ['politicalStatus', /政治面貌|political\s*status/i],
+    ['maritalStatus', /婚姻状况|婚姻状态|婚否|marital\s*status/i],
+    ['identityDocumentType', /证件类别|证件类型|document\s*type|id\s*type/i],
+    ['identityDocumentNumber', /证件号码|身份证号|护照号|document\s*number|id\s*number|passport\s*number/i],
+    ['familyRelationship', /\u4e0e\u672c\u4eba\u5173\u7cfb|\u4e0e\u7533\u8bf7\u4eba\u5173\u7cfb|\u5173\u7cfb|relationship/i],
+    ['familyWorkUnit', /\u5de5\u4f5c\u5355\u4f4d|\u5de5\u4f5c\u673a\u6784|\u5355\u4f4d\u540d\u79f0/i],
+    ['targetRole', /职位关键词|目标职位|期望职位|申请职位|desired\s*(?:role|position)|target\s*(?:role|position)/i],
+    ['desiredCity', /\u671f\u671b\u5de5\u4f5c\u57ce\u5e02|\u610f\u5411\u57ce\u5e02|\u671f\u671b\u57ce\u5e02|desired\s*(?:city|location)/i],
+    ['expectedSalary', /期望薪资|期望月薪|薪资要求|expected\s*salary|salary\s*expectation/i],
+    ['yearsExperience', /工作年限|工作经验年限|工作经验|years?\s*of\s*experience|work\s*experience/i],
+    ['availableDate', /到岗日期|可入职日期|最早入职|available\s*date|start\s*date/i],
+    ['educationStartDate', /最高学历入学时间|入学时间|入学日期|enrollment\s*date|matriculation\s*date/i],
+    ['graduationDate', /最高学历毕业时间|毕业时间|毕业日期|graduation\s*date/i],
+    ['school', /毕业院校|学校名称|学校|院校|university|college|school/i],
+    ['college', /学院名称|院系名称|学院|院系|faculty/i],
+    ['degree', /最高学历|学历|education\s*level/i],
+    ['academicDegree', /所获学位|学位名称|学位|academic\s*degree/i],
+    ['rankingPercent', /(?:专业|成绩|班级|年级)?排名(?:百分比|占比|比例)|排名.*(?:前|%)|top\s*\d+\s*%|rank(?:ing)?\s*(?:percent|percentage|ratio)/i],
+    ['ranking', /专业排名|成绩排名|class\s*rank|major\s*rank/i],
+    ['major', /所学专业|专业名称|专业|field\s*of\s*study|major/i],
+    ['gpa', /绩点|gpa/i],
+    ['studyMode', /学习形式|培养方式|就读形式|study\s*mode/i],
+    ['company', /公司名称|单位名称|雇主|employer|company\s*name/i],
+    ['department', /部门名称|工作部门|实习部门|department/i],
+    ['campusPosition', /校内任职(?:位)?|校内职务|在校职务|学生干部|campus\s*(?:position|role)/i],
+    ['workDescription', /工作内容|实习内容|工作描述|职责描述|responsibilities|job\s*description/i],
+    ['campusDescription', /职务描述|校园经历信息|campus\s*description/i],
+    ['currentTitle', /当前职位|职位名称|职务|job\s*title|position\s*title/i],
+    ['projectName', /项目名称|project\s*name/i],
+    ['projectRole', /项目角色|项目职责|project\s*role/i],
+    ['projectDescription', /项目描述|项目内容|project\s*description/i],
+    ['awardLevel', /奖项级别|获奖级别|award\s*level/i],
+    ['awardingOrganization', /颁奖单位|授予单位|颁发机构|发证机构|awarding\s*(?:body|organization)|issuer/i],
+    ['awardName', /奖项名称|获奖名称|荣誉名称|award\s*name|honou?r\s*name/i],
+    ['certificateName', /职称及职业资格证书|职业资格证书|资格证书|职称|证书名称|certificate\s*name/i],
+    ['certificateNumber', /证书编号|证书号码|资格证编号|certificate\s*(?:number|no\.?)/i],
+    ['languageName', /语言名称|语言类型|语言|language/i],
+    ['languageProficiency', /\u638c\u63e1\u7a0b\u5ea6|\u719f\u7ec3\u7a0b\u5ea6|精通程度|proficiency/i],
+    ['languageScore', /\u7b49\u7ea7\u6210\u7ee9|\u8003\u8bd5\u6210\u7ee9|score/i],
+    ['englishLevel', /英语水平|英语等级|英文水平|english\s*(?:level|proficiency)/i],
+    ['certificateLevel', /\u8bc1\u4e66\u7ea7\u522b|\u8d44\u683c\u7ea7\u522b|certificate\s*level/i],
+    ['certificateDate', /\u83b7\u5f97\u65f6\u95f4|\u53d1\u8bc1\u65e5\u671f|\u53d1\u8bc1\u65f6\u95f4|certificate\s*date/i],
+    ['awardDate', /\u83b7\u5956\u65f6\u95f4|\u83b7\u5956\u65e5\u671f|award\s*date/i],
+    ['computerSkills', /计算机技能|软件技能|computer\s*skills?/i],
+    ['github', /github/i],
+    ['linkedin', /linkedin/i],
+    ['portfolio', /个人网站|作品集|个人主页|portfolio|personal\s*(?:site|website)/i],
+    ['summary', /个人介绍|自我介绍|个人优势|自我评价|个人简介|summary|about\s*you|bio/i]
+  ];
+
+  const DATE_KEYS = /(?:Date|Start|End|Graduation)$/;
+  const OPEN_TEXT_KEYS = new Set([
+    'fullName', 'firstName', 'lastName', 'englishName', 'phone', 'email', 'wechat', 'qq',
+    'address', 'postalCode', 'identityDocumentNumber', 'company', 'companyName', 'currentTitle', 'campusPosition',
+    'projectName', 'projectRole',
+    'awardingOrganization', 'awardName', 'certificateName', 'certificateNumber',
+    'github', 'linkedin', 'portfolio', 'summary'
+  ]);
+  const OPEN_TEXT_HINT = /姓名|英文名|英文姓名|拼音姓名|证件(?:号码|编号)|身份证号|护照号|手机|电话|邮箱|地址|邮编|微信|qq|github|linkedin|作品集|个人网站|公司名称|单位名称|项目名称/i;
+  const ADD_PATTERN = /添加|新增|继续添加|add\s+(?:another|new)?|create\s+new|(?:^|\s)[+＋](?:\s|$)/i;
+  const ADD_NEGATIVE_PATTERN = /添加附件|添加文件|添加到收藏|add\s+file|bookmark/i;
+
+  const FIELD_LABEL_BY_KEY = {
+    acceptsAdjustment: '\u662f\u5426\u63a5\u53d7\u8c03\u5242', recruitmentSource: '\u62db\u8058\u4fe1\u606f\u6765\u6e90',
+    fullName: '姓名', firstName: '名', lastName: '姓', englishName: '英文名', gender: '性别',
+    birthDate: '出生日期', phone: '手机号码', phoneCountryRegion: '\u624b\u673a\u53f7\u7801\u5730\u533a', email: '邮箱', wechat: '微信号', qq: 'QQ号',
+    countryRegion: '国家/地区', city: '城市', address: '详细地址', postalCode: '邮政编码',
+    nativePlace: '籍贯', householdRegistration: '户籍', ethnicity: '民族', politicalStatus: '政治面貌',
+    maritalStatus: '婚姻状况', identityDocumentType: '证件类型', identityDocumentNumber: '证件号码',
+    targetRole: '目标职位', expectedSalary: '期望薪资', yearsExperience: '工作年限', availableDate: '到岗日期',
+    educationStartDate: '入学时间', graduationDate: '毕业时间', school: '学校名称', college: '学院名称',
+    degree: '学历', academicDegree: '学位', major: '专业名称', gpa: 'GPA', ranking: '专业排名', studyMode: '学习形式',
+    company: '公司名称', department: '部门名称', campusPosition: '校内任职', currentTitle: '职位名称',
+    workStartDate: '工作开始时间', workEndDate: '工作结束时间', workDescription: '工作内容',
+    projectName: '项目名称', projectRole: '项目角色', projectStartDate: '项目开始时间',
+    projectEndDate: '项目结束时间', projectDescription: '项目描述',
+    periodStartDate: '开始时间', periodEndDate: '结束时间',
+    awardLevel: '奖项级别', awardingOrganization: '颁奖单位', awardName: '奖项名称',
+    certificateName: '证书名称', certificateNumber: '证书编号', languageName: '语言类型',
+    englishLevel: '英语水平', computerSkills: '计算机技能', github: 'GitHub', linkedin: 'LinkedIn',
+    portfolio: '个人网站/作品集', summary: '个人介绍'
+  };
+
+  function cleanText(value) {
+    return String(value || '').replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isNoReliableText(value) {
+    const text = cleanText(value);
+    return !text || /无可靠语[义议]?(?:文字)?/i.test(text) || /鏃犲彲闈犺/i.test(text);
+  }
+
+  function removeValidationText(value) {
+    return cleanText(value)
+      .replace(/(?:必填项?未填写|此项为必填|该项为必填|不能为空|不得为空|必填字段|required|invalid|validation\s*error)/ig, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function looksLikeValidationText(value) {
+    const text = cleanText(value);
+    return !text || /^(?:必填项?未填写|此项为必填|该项为必填|不能为空|不得为空|必填字段|required|invalid|validation\s*error)$/i.test(text);
+  }
+
+  function rawClassName(element) {
+    const value = element?.className;
+    return typeof value === 'string' ? value : String(value?.baseVal || '');
+  }
+
+  function classSummary(element) {
+    return rawClassName(element).split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
+  }
+
+  function classTokens(element) {
+    return rawClassName(element).split(/\s+/).filter(Boolean);
+  }
+
+  function isApplyFieldContainer(element) {
+    return classTokens(element).some((token) => /^apply-field-/i.test(token))
+      && !classTokens(element).some((token) => /^apply-fields-/i.test(token));
+  }
+
+  function isFieldContainerExcluded(element) {
+    return /(?:^|\s)(?:el-)?form-item__(?:content|control|children)(?:\s|$)|form-item-(?:content|control|children)|FormItem(?:Content|Control|Children)|ant-form-item-control|rocket-form-field-item-control|(?:^|\s)input_box(?:\s|$)|(?:^|\s)apply-fields-/i
+      .test(rawClassName(element));
+  }
+
+  function isFieldContainerElement(element) {
+    if (!(element instanceof Element) || isFieldContainerExcluded(element)) return false;
+    if (element.matches('.ud-formily-item')
+      && (element.getAttribute('data-form-field-i18n-name') || element.getAttribute('data-form-field-name'))) {
+      return true;
+    }
+    if (isApplyFieldContainer(element)) return true;
+    if (classTokens(element).includes('info_box')) return true;
+    return element.matches('.atsx-form-item,[class*="form-item"],[class*="FormItem"],[class*="field-item"],[class*="FieldItem"]');
+  }
+
+  function closestFieldContainer(element, maxDepth = 10) {
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < maxDepth; depth += 1, node = node.parentElement) {
+      if (isFieldContainerElement(node)) return node;
+      if (node.matches('form,main,body,html')) break;
+    }
+    return null;
+  }
 
   function visible(element) {
     if (!(element instanceof Element) || !element.isConnected) return false;
@@ -131,4214 +215,1369 @@
       && rect.width > 0 && rect.height > 0;
   }
 
-  function interactiveDescription(element) {
-    return cleanText([
-      element?.getAttribute?.('aria-label'), element?.getAttribute?.('title'),
-      element?.getAttribute?.('name'), element?.getAttribute?.('data-action'),
-      element?.getAttribute?.('data-testid'), element?.textContent
+  function interactiveDescendants(element) {
+    if (!(element instanceof Element)) return [];
+    return [...element.querySelectorAll(INTERACTIVE_SELECTOR)]
+      .filter((candidate) => visible(candidate) && !candidate.closest(AUDIT_UI_SELECTOR));
+  }
+
+  function ownText(element) {
+    if (!(element instanceof Element)) return '';
+    return cleanText([...element.childNodes]
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent || '')
+      .join(' '));
+  }
+
+  function directGenericTitleText(element, maxLength = 120) {
+    if (!(element instanceof Element)) return '';
+    const attrText = normalizeFieldLabel([
+      element.getAttribute('data-form-field-i18n-name'),
+      element.getAttribute('data-form-field-title'),
+      element.getAttribute('data-form-field-label'),
+      element.getAttribute('aria-label')
     ].filter(Boolean).join(' '));
-  }
-
-  function interactionHint(element) {
-    if (!(element instanceof Element) || !visible(element)) return false;
-    if (element.matches('button,a,input,select,textarea,summary,label,[role="button"],[role="option"],[role="menuitem"],[role="gridcell"],[role="treeitem"],[role="radio"],[role="checkbox"],[tabindex],[onclick],[data-value],[data-key]')) return true;
-    const style = getComputedStyle(element);
-    return style.cursor === 'pointer' || style.cursor === 'text';
-  }
-
-  function cleanText(value) {
-    return String(value || '')
-      .replace(/\*/g, ' ')
-      .replace(/必填项?未填写|此项必填|不能为空|校验失败|格式错误|请输入|请选择|nope|new_password/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  function meaningfulHint(value) {
-    const text = cleanText(value);
-    return text && !GENERIC_PLACEHOLDER.test(text) ? text : '';
-  }
-
-  function controlNodes(root) {
-    return [...root.querySelectorAll('input:not([type="hidden"]), textarea, select, [contenteditable="true"], [role="combobox"]')]
-      .filter((node, index, list) => list.indexOf(node) === index);
-  }
-
-  function directSemanticLabels(container, element) {
-    const candidates = [];
-    for (const node of container.querySelectorAll('label, legend, dt, th, [role="heading"], [class]')) {
-      if (node === element || node.contains(element)) continue;
-      const className = String(node.className || '');
-      const explicit = /^(LABEL|LEGEND|DT|TH)$/.test(node.tagName) || node.getAttribute('role') === 'heading' || LABEL_HINT.test(className);
-      if (!explicit) continue;
-      const text = cleanText(node.textContent);
-      if (text && text.length <= 100 && !GENERIC_PLACEHOLDER.test(text) && !/^(?:至今|当前|present|currently)$/i.test(text)) candidates.push(text);
+    if (attrText) return attrText.slice(0, maxLength);
+    const own = normalizeFieldLabel(ownText(element));
+    if (own) return own.slice(0, maxLength);
+    for (const child of [...element.children]) {
+      if (!(child instanceof Element) || !visible(child) || hasInteractiveDescendant(child)) continue;
+      const identity = `${child.tagName.toLowerCase()} ${rawClassName(child)} ${child.getAttribute('role') || ''}`;
+      if (!/^(label|legend|dt|th|h[1-6])\b|label|title|fieldName|heading/i.test(identity)) continue;
+      const text = normalizeFieldLabel(child.innerText || child.textContent || '');
+      if (text) return text.slice(0, maxLength);
     }
-    return candidates;
-  }
-
-  function semanticContainer(element) {
-    if (semanticContainerCache.has(element)) return semanticContainerCache.get(element);
-    let fallback = element.parentElement;
-    let ancestor = element.parentElement;
-    for (let depth = 0; ancestor && depth < 16; depth += 1, ancestor = ancestor.parentElement) {
-      const controls = controlNodes(ancestor);
-      if (!controls.includes(element) && !ancestor.contains(element)) continue;
-      const labels = directSemanticLabels(ancestor, element);
-      const hinted = FIELD_CONTAINER_HINT.test(String(ancestor.className || ''));
-      if (labels.length && (hinted || controls.length <= 6)) {
-        semanticContainerCache.set(element, ancestor);
-        return ancestor;
-      }
-      if (controls.length <= 6) fallback = ancestor;
-      if (controls.length > 16) break;
-    }
-    semanticContainerCache.set(element, fallback);
-    return fallback;
-  }
-
-  function labelText(element) {
-    if (labelTextCache.has(element)) return labelTextCache.get(element);
-    const pieces = [
-      meaningfulHint(element.getAttribute('aria-label')),
-      meaningfulHint(element.getAttribute('aria-placeholder')),
-      meaningfulHint(element.getAttribute('data-label')),
-      meaningfulHint(element.getAttribute('data-field')),
-      meaningfulHint(element.getAttribute('data-name')),
-      meaningfulHint(element.placeholder),
-      meaningfulHint(element.name),
-      meaningfulHint(element.id)
-    ];
-    const labelledBy = element.getAttribute('aria-labelledby');
-    if (labelledBy) {
-      for (const id of labelledBy.split(/\s+/)) pieces.push(document.getElementById(id)?.innerText);
-    }
-    if (element.id) {
-      try { pieces.push(document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.innerText); } catch {}
-    }
-    pieces.push(cleanText(element.closest('label')?.innerText));
-    const container = semanticContainer(element);
-    if (container) pieces.push(...directSemanticLabels(container, element));
-    const previous = element.previousElementSibling;
-    if (previous?.matches('label, legend, span, [class*="label"], [class*="Label"]') && previous.innerText?.length < 80) pieces.push(previous.innerText);
-    const result = [...new Set(pieces.map(cleanText).filter(Boolean))].join(' ').toLowerCase().slice(0, 500);
-    labelTextCache.set(element, result);
-    return result;
-  }
-
-  function semanticSectionKind(value) {
-    const text = cleanText(value);
-    return /education|educational|academic|schooling|教育|学习经历/i.test(text) ? 'education'
-      : /employment|intern(?:ship)?|work(?:experience)?|career|实习|工作经历|职业经历/i.test(text) ? 'work'
-        : /project|research|项目|科研/i.test(text) ? 'project'
-          : /certificate|award|honou?r|证书|奖项|表彰|奖励|荣誉/i.test(text) ? 'certificate'
-            : /language|语言|外语/i.test(text) ? 'language'
-              : /family|relative|emergency.?contact|家庭|父母|紧急联系人/i.test(text) ? 'family'
-                : /basic|personal|个人信息|基本信息/i.test(text) ? 'basic' : '';
-  }
-
-  function peerFieldSectionKind(element) {
-    const anchors = {
-      project: [/项目名称|课题名称|研究项目/i, /项目角色|项目职责|项目描述|项目内容/i],
-      work: [/公司名称|单位名称|雇主名称/i, /职位名称|工作职位|实习职位|工作内容|实习内容/i],
-      education: [/学校名称|毕业院校|就读院校/i, /专业名称|所学专业|学历|所获学位|学习形式/i],
-      certificate: [/证书名称|奖项名称|荣誉名称/i, /颁发机构|发证机构|获奖时间/i],
-      language: [/语言名称|语言类型|外语名称/i, /语言能力|熟练程度|听说|读写/i],
-      family: [/家庭成员.*姓名|联系人.*姓名/i, /与本人关系|亲属关系|工作单位/i]
-    };
-    let ancestor = semanticContainer(element)?.parentElement || element.parentElement;
-    for (let depth = 0; ancestor instanceof Element && depth < 8; depth += 1, ancestor = ancestor.parentElement) {
-      const controls = controlNodes(ancestor).filter((control) => control === element || visible(control));
-      // 到达整页表单后停止，避免用另一个区块的字段推断当前日期。
-      if (controls.length > 28) break;
-      if (controls.length < 2) continue;
-      const peerText = controls
-        .filter((control) => control !== element)
-        .slice(0, 20)
-        .map((control) => labelText(control))
-        .filter(Boolean)
-        .join(' ');
-      const ranked = Object.entries(anchors)
-        .map(([kind, patterns]) => ({ kind, score: patterns.reduce((score, pattern) => score + (pattern.test(peerText) ? 1 : 0), 0) }))
-        .filter((item) => item.score > 0)
-        .sort((left, right) => right.score - left.score);
-      if (ranked[0] && (!ranked[1] || ranked[0].score > ranked[1].score)) return ranked[0].kind;
+    for (const child of [...element.children]) {
+      if (!(child instanceof Element) || !visible(child) || hasInteractiveDescendant(child)) continue;
+      const text = normalizeFieldLabel(child.innerText || child.textContent || '');
+      if (text && text.length <= maxLength) return text;
     }
     return '';
+  }
+
+  function looksLikeAddActionElement(element) {
+    if (!(element instanceof Element)) return false;
+    const identity = `${element.id || ''} ${rawClassName(element)} ${element.getAttribute('name') || ''}`;
+    const text = cleanText(element.innerText || element.textContent || '');
+    return /add|addMore|addBtn|addButton|_addButton|apply-form-array-card-add|createFormSection-addBtn/i.test(identity)
+      || /^(?:添加|新增|增加|add)$/i.test(text);
+  }
+
+  function labelledInteractiveChildCount(element) {
+    return [...element.children].filter((child) => child instanceof Element
+      && interactiveDescendants(child).length > 0
+      && directGenericTitleText(child)).length;
+  }
+
+  function isGenericFieldContainerElement(element) {
+    if (!(element instanceof Element) || !visible(element)) return false;
+    if (element.matches('html,body,main,form,fieldset,section')) return false;
+    if (pageBlockPriority(element) > 0 && pageBlockTitle(element)) return false;
+    const controls = interactiveDescendants(element);
+    if (!controls.length || controls.length > 24) return false;
+    if (controls.every(looksLikeAddActionElement)) return false;
+    if (!directGenericTitleText(element)) return false;
+    if (labelledInteractiveChildCount(element) >= 2) return false;
+    return true;
+  }
+
+  function closestGenericFieldRoot(element, block, maxDepth = 10) {
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < maxDepth; depth += 1, node = node.parentElement) {
+      if (node === block || node.matches('form,main,body,html')) break;
+      if (isGenericFieldContainerElement(node) && block.contains(node)) return node;
+    }
+    return null;
+  }
+
+  function labelledByText(element) {
+    const root = element.getRootNode?.();
+    return (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map((id) => root?.getElementById?.(id)?.textContent || document.getElementById(id)?.textContent || '').join(' ');
+  }
+
+  function directLabelText(element) {
+    const labels = element.labels ? [...element.labels].map((label) => label.textContent || '').join(' ') : '';
+    const wrappingLabel = element.closest('label')?.textContent || '';
+    const parentLabel = element.parentElement?.querySelector(':scope > label,:scope > legend,:scope > dt,:scope > th')?.textContent || '';
+    const definitionTitle = element.closest('dl')?.querySelector(':scope > dt')?.textContent || '';
+    let fieldTitle = '';
+    let fieldNode = element;
+    for (let depth = 0; fieldNode instanceof Element && depth < 7; depth += 1, fieldNode = fieldNode.parentElement) {
+      fieldTitle = fieldRootTitle(fieldNode);
+      if (fieldTitle) {
+        break;
+      }
+    }
+    return cleanText([
+      labels,
+      labelledByText(element),
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('placeholder'),
+      wrappingLabel,
+      parentLabel,
+      definitionTitle,
+      fieldTitle,
+      element.getAttribute('data-form-field-i18n-name'),
+      element.getAttribute('data-form-field-title'),
+      element.getAttribute('data-form-field-label'),
+      element.getAttribute('cname'),
+      element.getAttribute('ename'),
+      element.getAttribute('data-form-field-name'),
+      element.getAttribute('inputcolname'),
+      element.getAttribute('name'),
+      element.id
+    ].filter(Boolean).join(' ')).slice(0, 260);
+  }
+
+  function normalizeFieldLabel(value) {
+    let text = removeValidationText(value)
+      .replace(/^[*＊·•]+\s*/, '')
+      .replace(/\s*[*＊]+\s*$/, '')
+      .replace(/^(?:请输入|请填写|请录入|请选择|选择|搜索)\s*/i, '')
+      .replace(/^[：:]+|[：:]+$/g, '')
+      .replace(/\s*\((?:必填|required)\)\s*$/i, '')
+      .trim();
+    if (/^(?:请输入|请填写|请录入|请选择|选择|搜索|YYYY|MM|DD|YYYY[-/.]MM(?:[-/.]DD)?)$/i.test(text)) return '';
+    if (/^(?:\(无可靠语义文字\)|无可靠语义文字)$/i.test(text)) return '';
+    if (looksLikeValidationText(text)) return '';
+    if (text.length > 80) text = text.slice(0, 80);
+    return text;
+  }
+
+  function fieldLabelDetails(element, matchedKey) {
+    const candidates = [];
+    const push = (value, source) => {
+      const label = normalizeFieldLabel(value);
+      if (label) candidates.push({ label, source });
+    };
+
+    const definitionTitle = element.closest('dl')?.querySelector(':scope > dt');
+    if (definitionTitle) push(definitionTitle.textContent, 'definition-title');
+    for (let node = element; node instanceof Element; node = node.parentElement) {
+      push(node.getAttribute('data-form-field-i18n-name'), 'formily-i18n-name');
+      push(node.getAttribute('data-form-field-title'), 'formily-title');
+      push(node.getAttribute('data-form-field-label'), 'formily-label');
+      if (isFieldContainerElement(node)) break;
+    }
+    if (element.labels) [...element.labels].forEach((label) => push(label.textContent, 'associated-label'));
+    push(labelledByText(element), 'aria-labelledby');
+
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < 8; depth += 1, node = node.parentElement) {
+      if (node.matches('dd') && node.previousElementSibling?.matches('dt')) {
+        push(node.previousElementSibling.textContent, 'definition-title');
+      }
+      const title = node.querySelector([
+        ':scope > legend', ':scope > [class*="form-item__title"]', ':scope > [class*="title-"]',
+        ':scope > [class*="Title-"]', ':scope > [class$="__title"]', ':scope > [class$="-label"]'
+      ].join(','));
+      if (title && !title.contains(element)) push(cleanFieldTitleNodeText(title), 'field-title');
+    }
+
+    push(element.getAttribute('aria-label'), 'aria-label');
+    push(element.getAttribute('cname'), 'cname');
+    push(element.getAttribute('ename'), 'ename');
+    if (matchedKey && FIELD_LABEL_BY_KEY[matchedKey]) push(FIELD_LABEL_BY_KEY[matchedKey], 'semantic-mapping');
+    push(element.getAttribute('placeholder'), 'placeholder');
+
+    return candidates[0] || { label: '', source: 'unknown' };
+  }
+
+  function phoenixButtonText(element) {
+    if (phoenixButtonSelectRoot(element) !== element) return '';
+    return cleanText(element.querySelector('.phoenix-button__content')?.textContent || element.textContent);
+  }
+
+  function compoundSubControlSemantic(element, parentLabel, parentKey, kind) {
+    if (kind !== 'select-trigger') return null;
+    const valueText = phoenixButtonText(element);
+    if (!valueText) return null;
+    const evidence = `${parentLabel || ''} ${parentKey || ''} ${valueText}`;
+    if (/(?:identityDocumentNumber|\u8bc1\u4ef6\u53f7\u7801|\u8eab\u4efd\u8bc1\u53f7|document\s*number|id\s*number)/i.test(evidence)
+      && /(?:\u8eab\u4efd\u8bc1|\u62a4\u7167|\u901a\u884c\u8bc1|\u519b\u4eba\u8bc1|\u8b66\u5b98\u8bc1|passport|id)/i.test(valueText)) {
+      return {
+        key: 'identityDocumentType',
+        label: '\u8bc1\u4ef6\u7c7b\u578b',
+        source: 'compound-prefix-select',
+        role: 'identity-document-type',
+        valueText,
+        subControlOf: parentLabel || FIELD_LABEL_BY_KEY.identityDocumentNumber || ''
+      };
+    }
+    if (/(?:phone|mobile|telephone|\u624b\u673a|\u7535\u8bdd)/i.test(evidence)
+      && /(?:\u4e2d\u56fd\u5927\u9646|\u4e2d\u56fd\u6e2f\u6fb3\u53f0|\u56fd\u5916|\u5927\u9646|\u6e2f\u6fb3\u53f0|\u6d77\u5916|\u5883\u5916)/i.test(valueText)) {
+      return {
+        key: 'phoneCountryRegion',
+        label: FIELD_LABEL_BY_KEY.phoneCountryRegion,
+        source: 'compound-prefix-select',
+        role: 'phone-country-region',
+        valueText,
+        subControlOf: parentLabel || FIELD_LABEL_BY_KEY.phone || ''
+      };
+    }
+    return null;
+  }
+
+  function stripGeneratedOrdinal(label) {
+    return cleanText(label).replace(/\s*[（(]?\d+[）)]?\s*$/, '').trim() || cleanText(label);
+  }
+
+  function compareItemsByDom(left, right) {
+    const leftElement = elementMap.get(left.ref);
+    const rightElement = elementMap.get(right.ref);
+    if (!(leftElement instanceof Element) || !(rightElement instanceof Element) || leftElement === rightElement) return 0;
+    const position = leftElement.compareDocumentPosition(rightElement);
+    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  }
+
+  function assignFieldBindings(items) {
+    const datePartSuffix = (item) => {
+      if (item.datePart === 'year') return '年';
+      if (item.datePart === 'month') return '月';
+      if (item.datePart === 'day') return '日';
+      return '';
+    };
+    const rangeRoleSuffix = (item) => {
+      if (item.dateMechanism !== 'compound-year-month-select') return '';
+      if (item.rangeRole === 'start') return '开始';
+      if (item.rangeRole === 'end') return '结束';
+      return '';
+    };
+    const groups = new Map();
+    for (const item of items.filter((entry) => entry.elementKind === 'field')) {
+      const baseLabel = stripGeneratedOrdinal(item.fieldLabel || FIELD_LABEL_BY_KEY[item.matchedKey] || '未命名字段');
+      item.fieldLabel = baseLabel;
+      const identity = item.matchedKey || baseLabel.toLowerCase();
+      const scope = item.moduleTitle || item.blockTitle || item.context || 'page';
+      const groupKey = `${scope}::${identity}::${baseLabel}`;
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(item);
+    }
+    for (const group of groups.values()) {
+      const units = [];
+      const unitByKey = new Map();
+      group.sort(compareItemsByDom);
+      for (const item of group) {
+        const unitKey = item.dateMechanism === 'compound-year-month-select' && item.rangeGroup
+          ? `compound-date:${item.rangeGroup}:${item.rangeRole || 'single'}:${item.matchedKey || ''}`
+          : `control:${item.ref}`;
+        if (!unitByKey.has(unitKey)) {
+          const unit = { key: unitKey, anchor: item, items: [] };
+          unitByKey.set(unitKey, unit);
+          units.push(unit);
+        }
+        unitByKey.get(unitKey).items.push(item);
+      }
+      units.sort((left, right) => compareItemsByDom(left.anchor, right.anchor));
+      units.forEach((unit, index) => {
+        const ordinal = index + 1;
+        unit.items.sort(compareItemsByDom).forEach((item) => {
+          const suffix = datePartSuffix(item);
+          const roleSuffix = rangeRoleSuffix(item);
+          const repeated = units.length > 1 && !roleSuffix;
+          item.fieldIndex = ordinal;
+          item.fieldCount = units.length;
+          item.displayName = `${repeated ? `${item.fieldLabel}${ordinal}` : item.fieldLabel}${roleSuffix}${suffix}`;
+          item.bindingKey = item.matchedKey
+            ? `${item.matchedKey}${repeated ? ordinal : ''}${suffix ? suffix === '年' ? 'Year' : suffix === '月' ? 'Month' : 'Day' : ''}`
+            : item.displayName;
+        });
+      });
+    }
+  }
+
+  function resolveProfileMapping(fieldLabel, matchedKey, context = '', moduleTitle = '') {
+    const profileSchema = globalThis.ResumeProfileSchema;
+    if (!profileSchema) return { path: '', candidates: [] };
+    const normalized = profileSchema.normalizeAlias(fieldLabel);
+    let candidates = normalized ? profileSchema.aliasIndex
+      .filter((item) => item.normalized === normalized)
+      .map((item) => item.path) : [];
+    candidates = [...new Set(candidates)];
+    const moduleSection = profileSchema.moduleSectionForTitle?.(moduleTitle) || '';
+    const highestEducationDerived = {
+      degree: 'educationExperiences[highest].degree',
+      graduationDate: 'educationExperiences[highest].endDate',
+      studyMode: 'educationExperiences[highest].studyMode'
+    };
+    const derivedPath = highestEducationDerived[matchedKey] || '';
+    if (moduleSection === 'basic' && derivedPath) {
+      return { path: derivedPath, candidates: [derivedPath] };
+    }
+    const moduleAgnosticPaths = {
+      acceptsAdjustment: 'jobPreferences.acceptsAdjustment',
+      recruitmentSource: 'jobPreferences.recruitmentSource'
+    };
+    const moduleAgnosticPath = moduleAgnosticPaths[matchedKey] || '';
+    if (moduleAgnosticPath) return { path: moduleAgnosticPath, candidates: [moduleAgnosticPath] };
+    const moduleOverride = moduleSection && matchedKey
+      ? profileSchema.moduleFieldOverrides?.[moduleSection]?.[matchedKey] || ''
+      : '';
+    if (moduleOverride) return { path: moduleOverride, candidates: [moduleOverride] };
+    if (moduleSection) {
+      const contextual = candidates.filter((path) => profileSchema.profilePathInSection?.(path, moduleSection));
+      if (contextual.length === 1) return { path: contextual[0], candidates: contextual };
+      if (contextual.length) candidates = contextual;
+    }
+    const sectionByContext = {
+      education: 'educationExperiences[]', work: 'workExperiences[]', project: 'projectExperiences[]',
+      campus: 'campusExperiences[]', practice: 'practiceExperiences[]', certificate: 'certificates[]',
+      award: 'awards[]', language: 'languageSkills[]', family: 'familyMembers[]',
+      publication: 'publications[]', patent: 'patents[]', skill: 'skills[]', highSchool: 'highSchool',
+      attachments: 'attachments'
+    };
+    const contextPrefix = sectionByContext[context];
+    const contextual = contextPrefix ? candidates.filter((path) => path.startsWith(contextPrefix)) : [];
+    if (contextual.length === 1) return { path: contextual[0], candidates: contextual };
+    if (contextual.length) candidates = contextual;
+    const legacyPath = profileSchema.legacyKeyToPath?.[matchedKey] || '';
+    if (legacyPath && (!moduleSection || profileSchema.profilePathInSection?.(legacyPath, moduleSection))) {
+      return { path: legacyPath, candidates: [legacyPath] };
+    }
+    const patternPath = profileSchema.patternRules?.find((rule) => rule.pattern.test(fieldLabel))?.path || '';
+    if (patternPath && (!moduleSection || profileSchema.profilePathInSection?.(patternPath, moduleSection))) {
+      return { path: patternPath, candidates: [patternPath] };
+    }
+    return { path: candidates.length === 1 ? candidates[0] : '', candidates };
+  }
+
+  function moduleContextForTitle(moduleTitle) {
+    const section = globalThis.ResumeProfileSchema?.moduleSectionForTitle?.(moduleTitle) || '';
+    return {
+      educationExperiences: 'education',
+      workExperiences: 'work',
+      projectExperiences: 'project',
+      campusExperiences: 'campus',
+      practiceExperiences: 'practice',
+      certificates: 'certificate',
+      awards: 'award',
+      languageSkills: 'language',
+      familyMembers: 'family',
+      publications: 'publication',
+      patents: 'patent',
+      skills: 'skill',
+      highSchool: 'highSchool',
+      attachments: 'attachments'
+    }[section] || '';
+  }
+
+  function remapFieldProfiles(items) {
+    for (const item of items.filter((entry) => entry.elementKind === 'field')) {
+      const element = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
+      const moduleContext = moduleContextForTitle(item.moduleTitle);
+      const context = moduleContext || item.context || '';
+      const nearestField = element instanceof Element ? closestFieldContainer(element, 12) : null;
+      const nearestLabel = nearestField instanceof Element ? stripGeneratedOrdinal(fieldRootTitle(nearestField)) : '';
+      const label = item.compoundRole
+        ? item.fieldLabel || item.displayName || item.text || ''
+        : nearestLabel || item.fieldBlockLabel || item.fieldLabel || item.displayName || item.text || '';
+      const isRangeDateEndpoint = item.dateMechanism === 'compound-year-month-select' && Boolean(item.rangeRole);
+      const key = item.compoundRole
+        ? item.matchedKey || ''
+        : isRangeDateEndpoint && item.matchedKey
+          ? item.matchedKey
+          : matchKey(label, context) || item.matchedKey || '';
+      const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '');
+      const repeatBinding = element instanceof Element
+        ? repeatBindingDetails(element, profileMapping.path, context)
+        : { repeatSection: '', repeatIndex: 0, repeatGroup: '' };
+      item.context = context || item.context;
+      item.matchedKey = key;
+      if (!item.compoundRole && label) item.fieldLabel = stripGeneratedOrdinal(label);
+      if (!item.compoundRole && nearestLabel) item.fieldBlockLabel = nearestLabel;
+      item.profilePath = profileMapping.path;
+      item.profilePathCandidates = profileMapping.candidates;
+      item.mappingStatus = profileMapping.path ? 'mapped' : profileMapping.candidates.length ? 'ambiguous' : 'unmapped';
+      item.repeatSection = repeatBinding.repeatSection;
+      item.repeatIndex = repeatBinding.repeatIndex || item.recordIndex || (profileMapping.path.includes('[]') ? Number(item.fieldIndex || 0) : 0);
+      item.repeatGroup = repeatBinding.repeatGroup || (item.repeatSection && item.repeatIndex ? `${item.repeatSection}[${item.repeatIndex - 1}]` : '') || item.repeatGroup || '';
+    }
+  }
+
+  function actionDescription(element) {
+    return cleanText([
+      element.getAttribute('aria-label'),
+      labelledByText(element),
+      element.getAttribute('title'),
+      element.getAttribute('name'),
+      element.id,
+      element.innerText || element.textContent
+    ].filter(Boolean).join(' ')).slice(0, 260);
   }
 
   function sectionContext(element) {
-    if (sectionContextCache.has(element)) return sectionContextCache.get(element);
-    // 动态表单经常没有可见区块标题，但 name/data-cy/id 会保留
-    // project[0].startDate、education.1.school 等结构语义。优先使用这些属性。
-    let cueNode = element;
-    for (let depth = 0; cueNode instanceof Element && depth < 9; depth += 1, cueNode = cueNode.parentElement) {
-      const cue = ['name', 'id', 'data-cy', 'data-testid', 'data-field', 'data-name', 'aria-label']
-        .map((attribute) => cueNode.getAttribute(attribute) || '').join(' ');
-      const context = semanticSectionKind(cue);
-      if (context && context !== 'basic') {
-        sectionContextCache.set(element, context);
-        return context;
-      }
+    const evidence = [];
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < 6; depth += 1, node = node.parentElement) {
+      evidence.push(node.id || '', node.getAttribute('name') || '', node.getAttribute('data-testid') || '', classSummary(node));
+      const heading = node.querySelector(':scope > legend,:scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > [role="heading"],:scope > [class*="title"],:scope > [class*="Title"]');
+      if (heading) evidence.push(heading.textContent || '');
     }
-    let ancestor = semanticContainer(element)?.parentElement || element.parentElement;
-    for (let depth = 0; ancestor && depth < 10; depth += 1, ancestor = ancestor.parentElement) {
-      const children = [...ancestor.children];
-      const containingIndex = children.findIndex((child) => child.contains(element));
-      const candidates = children.flatMap((child, childIndex) => {
-        if (child.contains(element)) return [];
-        const shortStructuralTitle = childIndex < containingIndex && controlNodes(child).length === 0 && cleanText(child.textContent).length <= 60;
-        if (shortStructuralTitle || /^H[1-6]$/.test(child.tagName) || child.getAttribute('role') === 'heading' || /block.?title|section.?title|heading/i.test(String(child.className || ''))) return [child];
-        return [...child.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],[class*="blockTitle"],[class*="block-title"],[class*="sectionTitle"],[class*="section-title"]')];
-      });
-      for (const candidate of candidates) {
-        const text = cleanText(candidate.textContent).slice(0, 100);
-        const context = semanticSectionKind(text);
-        if (context) {
-          sectionContextCache.set(element, context);
-          return context;
-        }
-      }
-    }
-    // 有些 Phoenix 控件的 input 完全没有 name/id，只有“开始时间”这类通用标签。
-    // 此时用同一重复卡片内的“项目名称/公司名称/学校名称”等强锚点归属区块。
-    const peerContext = peerFieldSectionKind(element);
-    if (peerContext) {
-      sectionContextCache.set(element, peerContext);
-      return peerContext;
-    }
-    sectionContextCache.set(element, '');
-    return '';
-  }
-
-  function contextualKey(text, context) {
-    const exact = cleanText(text).toLowerCase();
-    if (/排名占比|排名百分比|排名比例|rank.*percent|percentile/i.test(exact)) return 'rankingPercent';
-    if (/专业排名|成绩排名|排名（?%?）?|major\s*rank|class\s*rank/i.test(exact)) return 'ranking';
-    if (/gpa|绩点/i.test(exact)) return 'gpa';
-    if (/学院名称|院系名称|^学院$|^院系$|faculty|school\s*faculty/i.test(exact)) return 'college';
-    const start = /^(?:开始时间|开始日期|起始时间|入学时间)$/i.test(exact);
-    const end = /^(?:结束时间|结束日期|截止时间|毕业时间|毕业日期)$/i.test(exact);
-    if (context === 'education') {
-      if (/是否最高学历/.test(exact)) return 'isHighestEducation';
-      if (/(?:^|\s)学位$|所获学位|学位名称/.test(exact)) return 'academicDegree';
-      if (/(?:^|\s)学历$|最高学历/.test(exact)) return 'degree';
-      if (start) return 'educationStartDate';
-      if (end) return 'graduationDate';
-      if (/^(?:就读时间|起止时间|在校时间|学习时间)$/i.test(exact)) return 'educationDateRange';
-    }
-    if (context === 'work') {
-      if (start) return 'workStartDate';
-      if (end) return 'workEndDate';
-      if (/^(?:起止时间|任职时间|工作时间|实习时间)$/i.test(exact)) return 'workDateRange';
-      if (/^(?:职责|工作内容|实习内容)$/i.test(exact)) return 'workDescription';
-    }
-    if (context === 'project') {
-      if (start) return 'projectStartDate';
-      if (end) return 'projectEndDate';
-      if (/^(?:起止时间|项目时间)$/i.test(exact)) return 'projectDateRange';
-      if (/^(?:职责|角色)$/i.test(exact)) return 'projectRole';
-      if (/^描述$/i.test(exact)) return 'projectDescription';
-    }
-    if (context === 'certificate') {
-      if (/^(?:证书名称|奖项名称|荣誉名称|奖项)$/i.test(exact)) return 'certificateName';
-      if (/^(?:获得时间|获奖时间|证书时间|奖项时间|发证日期|颁发日期)$/i.test(exact)) return 'certificateDate';
-      if (/^(?:证书编号|证书号码|资格证编号)$/i.test(exact)) return 'certificateNumber';
-      if (/^(?:发证机构|发证单位|颁发机构|颁发单位|颁奖单位)$/i.test(exact)) return 'certificateIssuer';
-      if (/^(?:奖项级别|获奖级别|证书级别|荣誉级别)$/i.test(exact)) return 'certificateLevel';
-      if (/^(?:简述|描述|证书描述|奖项描述)$/i.test(exact)) return 'certificateDescription';
-    }
-    if (context === 'family') {
-      if (/^(?:姓名|成员姓名|联系人姓名|亲属姓名)$/i.test(exact)) return 'familyName';
-      if (/^(?:关系|与本人关系|亲属关系)$/i.test(exact)) return 'familyRelationship';
-      if (/^(?:电话|手机|联系电话|手机号码)$/i.test(exact)) return 'familyPhone';
-      if (/^(?:工作单位|所在单位)$/i.test(exact)) return 'familyWorkplace';
-      if (/^(?:职业|职务)$/i.test(exact)) return 'familyOccupation';
-    }
-    if (context === 'language') {
-      if (/^(?:语言|语言名称|语言类型)$/i.test(exact)) return 'languageName';
-      if (/听说|听力.*口语|口语.*听力/i.test(exact)) return 'languageListeningSpeaking';
-      if (/读写|阅读.*写作|写作.*阅读/i.test(exact)) return 'languageReadingWriting';
-      if (/熟练|能力|等级/i.test(exact)) return 'languageProficiency';
-      if (/分数|成绩/i.test(exact)) return 'languageScore';
-    }
+    const text = cleanText(evidence.join(' '));
+    if (/教育|学历|学校|院校|education|academic|school/i.test(text)) return 'education';
+    if (/校园|校内|社团|学生会|campus/i.test(text)) return 'campus';
+    if (/高中|高考|文理科|gaokao|high.?school/i.test(text)) return 'highSchool';
+    if (/社会实践|实践经历|social.?practice/i.test(text)) return 'practice';
+    if (/论文|期刊|发表|publication|journal/i.test(text)) return 'publication';
+    if (/专利|patent/i.test(text)) return 'patent';
+    if (/技能|特长|skill/i.test(text)) return 'skill';
+    if (/附件|上传|成绩单|证件照|attachment|upload|transcript/i.test(text)) return 'attachments';
+    if (/工作|实习|任职|employment|experience|intern|work/i.test(text)) return 'work';
+    if (/项目|project/i.test(text)) return 'project';
+    if (/奖项|奖励|荣誉|award|honou?r/i.test(text)) return 'award';
+    if (/证书|职业资格|certificate/i.test(text)) return 'certificate';
+    if (/语言|英语|language|english/i.test(text)) return 'language';
+    if (/家庭|亲属|联系人|family|relative|emergency/i.test(text)) return 'family';
     return '';
   }
 
   function matchKey(text, context = '') {
-    if (!text || ignoredText.test(text)) return null;
-    return contextualKey(text, context) || rules.find((rule) => rule.patterns.some((pattern) => pattern.test(text)))?.key || null;
-  }
-
-  function placeholderLike(value) {
-    const text = String(value || '').replace(/\*/g, ' ').replace(/\s+/g, ' ').trim();
-    if (!text || GENERIC_PLACEHOLDER.test(text)) return true;
-    const compact = text.replace(/[\s_—–:：|()（）\[\]【】<>《》]+/g, '').replace(/^-+|-+$/g, '');
-    if (/^(?:请输入|请选择|请填写|请选择后填写|选择|输入|未选择|未设置|暂无|待选择|select|choose|please(?:select|enter)|none|null)$/i.test(compact)) return true;
-    if (/^(?:请输入|请选择|请填写|选择)(?:[^，。；;]{0,24})$/i.test(compact)) return true;
-    if (/^(?:yyyy|yy|mm|dd|年|月|日)(?:[-/.](?:yyyy|yy|mm|dd|年|月|日)){0,2}$/i.test(compact)) return true;
-    return false;
-  }
-
-  function nativeSelectHasMeaningfulValue(element) {
-    const option = element.selectedOptions?.[0] || element.options?.[element.selectedIndex];
-    if (!option || element.selectedIndex < 0) return false;
-    const shown = `${option.value || ''} ${option.textContent || ''}`.trim();
-    if (!option.value || option.disabled || ['-1', 'null', 'undefined'].includes(String(option.value).toLowerCase())
-      || placeholderLike(option.value) || placeholderLike(option.textContent) || placeholderLike(shown)) return false;
-    // 浏览器会在页面初始化时自动选中第一个 option。没有 selected
-    // 属性的这种值是组件默认值，不是用户或网站已保存的内容。
-    if (element.selectedIndex === 0 && !option.defaultSelected) return false;
-    return true;
-  }
-
-  function controlReadback(element, trigger = null) {
-    if (!(element instanceof Element)) return '';
-    if (element instanceof HTMLSelectElement) {
-      const option = element.selectedOptions?.[0];
-      return cleanText(option ? `${option.textContent || ''}${option.value && option.value !== option.textContent ? ` [${option.value}]` : ''}` : '');
+    const normalized = cleanText(text);
+    if (!normalized) return '';
+    const direct = FIELD_RULES.find(([, pattern]) => pattern.test(normalized));
+    if (direct) return direct[0];
+    if (/^(?:经历)?(?:描述|说明|内容|职责)(?:\d+)?$|^description$/i.test(normalized)) {
+      const descriptionKeys = {
+        work: 'workDescription',
+        project: 'projectDescription',
+        campus: 'campusDescription',
+        practice: 'practiceDescription',
+        certificate: 'certificateDescription',
+        award: 'awardDescription'
+      };
+      return descriptionKeys[context] || '';
     }
-    if (element.type === 'radio' || element.type === 'checkbox') {
-      if (!element.checked) return '未选中';
-      return cleanText(element.closest('label')?.textContent || element.value || '已选中');
+    if (/开始时间|开始日期|start\s*date/i.test(normalized)) {
+      const startKeys = {
+        education: 'educationStartDate',
+        work: 'workStartDate',
+        project: 'projectStartDate',
+        campus: 'campusStartDate',
+        practice: 'practiceStartDate',
+        certificate: 'certificateDate',
+        award: 'awardDate'
+      };
+      return startKeys[context] || 'periodStartDate';
     }
-    const ownRaw = String(element.value ?? (element.isContentEditable ? element.textContent : '')).trim();
-    if (ownRaw && !placeholderLike(ownRaw)) return cleanText(ownRaw).slice(0, 120);
-    const selected = trigger?.querySelector?.('[aria-selected="true"],[aria-checked="true"],[class*="selected-value"],[class*="SelectedValue"],[class*="singleValue"],[class*="SingleValue"]');
-    const shownRaw = String(selected?.textContent || trigger?.textContent || '').trim();
-    return placeholderLike(shownRaw) ? '' : cleanText(shownRaw).slice(0, 120);
-  }
-
-  function hasValue(element) {
-    if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
-    const trigger = customSelectTrigger(element);
-    if (element instanceof HTMLSelectElement) return nativeSelectHasMeaningfulValue(element);
-    const ownRaw = String(element.value ?? (element.isContentEditable ? element.textContent : '')).trim();
-    const own = cleanText(ownRaw);
-    if (ownRaw && !placeholderLike(ownRaw)) {
-      const declaredDefault = cleanText(element.getAttribute('data-default-value') || element.getAttribute('data-default') || '');
-      if (!declaredDefault || normalizedExactText(own) !== normalizedExactText(declaredDefault)) return true;
+    if (/结束时间|结束日期|毕业时间|end\s*date|graduation\s*date/i.test(normalized)) {
+      const endKeys = {
+        education: 'graduationDate',
+        work: 'workEndDate',
+        project: 'projectEndDate',
+        campus: 'campusEndDate',
+        practice: 'practiceEndDate'
+      };
+      return endKeys[context] || 'periodEndDate';
     }
-    if (!trigger) return false;
-    return customTriggerHasSelection(trigger);
+    return '';
   }
 
-  function customTriggerHasSelection(trigger) {
-    if (!(trigger instanceof Element)) return false;
-    const selected = trigger.querySelector(
-      '[aria-selected="true"], [class*="display-value"], [class*="DisplayValue"], [class*="selected-value"], [class*="SelectedValue"], [class*="singleValue"], [class*="SingleValue"], [class*="calcEle"], [class*="selected-item"], [class*="selection-item"]'
-    );
-    const shownRaw = String(selected?.textContent || '').trim();
-    const shown = cleanText(shownRaw);
-    const declaredDefault = cleanText(
-      selected?.getAttribute?.('data-default-value') || selected?.getAttribute?.('data-default')
-      || trigger.getAttribute('data-default-value') || trigger.getAttribute('data-default') || ''
-    );
-    if (shown && !placeholderLike(shownRaw)
-      && (!declaredDefault || normalizedExactText(shown) !== normalizedExactText(declaredDefault))) return true;
-    const visiblePlaceholder = [...trigger.querySelectorAll('[class*="placeholder" i],[data-placeholder]')]
-      .some((node) => visible(node) && placeholderLike(node.textContent || node.getAttribute('data-placeholder')));
-    if (visiblePlaceholder) return false;
-    const fallbackRaw = String(trigger.textContent || '').trim();
-    const fallback = cleanText(fallbackRaw);
-    return Boolean(fallback && !placeholderLike(fallbackRaw) && !/^[+＋]\d{1,4}$/.test(fallback)
-      && (!declaredDefault || normalizedExactText(fallback) !== normalizedExactText(declaredDefault)));
-  }
-
-  function fieldLabelCandidates(element, fieldText = '') {
-    const pieces = new Set();
-    const add = (value) => {
-      const text = cleanText(value);
-      if (!text) return;
-      [
-        text,
-        ...text.split(/\s{2,}|\n+/),
-        ...text.split(/\s+/)
-      ].forEach((piece) => {
-        const normalized = cleanText(piece).replace(/^(?:请选择|选择|请输入|请填写|请补充)\s*/i, '');
-        if (normalized && normalized.length <= 40) pieces.add(normalized);
-      });
-    };
-    add(fieldText);
-    add(labelText(element));
-    add(element?.getAttribute?.('aria-label'));
-    add(element?.getAttribute?.('title'));
-    add(element?.getAttribute?.('placeholder'));
-    add(element?.getAttribute?.('data-label'));
-    add(element?.getAttribute?.('data-field'));
-    if (element?.labels) [...element.labels].forEach((label) => add(label.textContent));
-    return [...pieces];
-  }
-
-  function fieldLabelEchoLike(value, element, fieldText = '') {
-    const shown = cleanText(value);
-    if (!shown) return false;
-    const normalizedShown = normalizedExactText(shown);
-    return fieldLabelCandidates(element, fieldText)
-      .some((candidate) => normalizedShown === normalizedExactText(candidate));
-  }
-
-  function fieldDefaultLike(value, element, fieldText = '', key = '') {
-    const shown = cleanText(value);
-    if (!shown || placeholderLike(value)) return true;
-    if (fieldLabelEchoLike(shown, element, fieldText)) return true;
-    if ((key === 'phone' || /手机|电话|mobile|phone/i.test(fieldText))
-      && /^(?:(?:\+|＋)?\d{1,4}){1,3}$/.test(shown.replace(/\s+/g, ''))
-      && shown.replace(/\D/g, '').length < 6) return true;
-    return false;
-  }
-
-  function hasMeaningfulExistingValue(element, trigger = null, fieldText = '', key = '') {
-    if (!(element instanceof Element)) return false;
-    if (element.type === 'checkbox' || element.type === 'radio') return element.checked;
-    if (element instanceof HTMLSelectElement) {
-      if (!nativeSelectHasMeaningfulValue(element)) return false;
-      return !fieldDefaultLike(controlReadback(element, trigger), element, fieldText, key);
-    }
-    const ownRaw = String(element.value ?? (element.isContentEditable ? element.textContent : '')).trim();
-    const own = cleanText(ownRaw);
-    if (ownRaw && !fieldDefaultLike(ownRaw, element, fieldText, key)) {
-      const declaredDefault = cleanText(element.getAttribute('data-default-value') || element.getAttribute('data-default') || '');
-      if (!declaredDefault || normalizedExactText(own) !== normalizedExactText(declaredDefault)) return true;
-    }
-    const liveTrigger = trigger || customSelectTrigger(element);
-    if (!liveTrigger || !customTriggerHasSelection(liveTrigger)) return false;
-    return !fieldDefaultLike(controlReadback(element, liveTrigger), element, fieldText, key);
-  }
-
-  function setNativeValue(element, value) {
-    if (element instanceof HTMLTextAreaElement) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      setter ? setter.call(element, value) : (element.value = value);
-    } else if (element instanceof HTMLInputElement) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      setter ? setter.call(element, value) : (element.value = value);
-    } else {
-      element.value = value;
-    }
-    for (const type of ['input', 'change', 'blur']) element.dispatchEvent(new Event(type, { bubbles: true }));
-  }
-
-  function normalizedChoices(value) {
-    // “0 年”在招聘站通常不提供数字 0，而是用学生/应届生语义表示。
-    if (/^\s*0(?:\.0+)?\s*(?:年)?\s*$/.test(String(value ?? ''))) {
-      return ['0', '在读学生', '应届毕业生', '无工作经验', '无经验'];
-    }
-    const rankingFraction = String(value || '').match(/^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/);
-    if (rankingFraction && Number(rankingFraction[2]) > 0) {
-      const percent = Number(rankingFraction[1]) / Number(rankingFraction[2]) * 100;
-      const bucket = [5, 10, 20, 30, 50].find((limit) => percent <= limit);
-      if (bucket) return [String(value), `前${bucket}%`, `top ${bucket}%`, `${bucket}%`];
-      return [String(value), '其他', 'other'];
-    }
-    if (value === 'yes' || value === '是') return ['是', 'yes', 'true', '同意', '接受', '可以', '已授权'];
-    if (value === 'no' || value === '否') return ['否', 'no', 'false', '不同意', '不接受', '不可以', '不需要'];
-    if (value === '男') return ['男', 'male', 'man'];
-    if (value === '女') return ['女', 'female', 'woman'];
-    if (value === '不披露') return ['不披露', 'prefer not', 'decline', '不愿透露'];
-    if (value === '无') return ['无', '否', '没有', '无此情况', '不存在', 'none', 'no'];
-    if (value === '有') return ['有', '是', '存在', 'yes'];
-    if (value === '健康') return ['健康', '身体健康', '良好', 'healthy', 'good'];
-    if (/^(?:身份证|居民身份证|中华人民共和国居民身份证)$/.test(value)) return ['身份证', '居民身份证', '中华人民共和国居民身份证'];
-    if (/^(?:护照|中国护照)$/.test(value)) return ['护照', '中国护照'];
-    if (/^(?:港澳内地通行证|港澳居民来往内地通行证)$/.test(value)) return ['港澳内地通行证', '港澳居民来往内地通行证'];
-    if (/^(?:台湾大陆通行证|台湾居民来往大陆通行证)$/.test(value)) return ['台湾大陆通行证', '台湾居民来往大陆通行证', '台胞证'];
-    if (/^(?:外国人永居|外国人永久居留身份证|外国人永久居留证)$/.test(value)) return ['外国人永居', '外国人永久居留身份证', '外国人永久居留证'];
-    if (value === '全国普通高等院校全日制') return ['全国普通高等院校全日制', '普通高等院校全日制', '统招全日制'];
-    if (value === '全国普通高等院校非全日制') return ['全国普通高等院校非全日制', '普通高等院校非全日制', '非全日制'];
-    if (value === '本科') return ['本科', '大学本科', 'bachelor', "bachelor's degree"];
-    if (/^(?:硕士|硕士研究生|研究生硕士)$/.test(value)) return ['硕士', '硕士研究生', '研究生', 'master', "master's degree"];
-    if (value === '博士') return ['博士', 'phd', 'doctorate', 'doctoral'];
-    if (value === '大专') return ['大专', '专科', 'associate'];
-    if (value === '学士') return ['学士', '学士学位', 'bachelor', "bachelor's degree"];
-    if (value === '双学士') return ['双学士', '双学士学位', '双学位', 'double bachelor'];
-    if (value === 'MBA') return ['MBA', '工商管理硕士'];
-    if (value === '高中') return ['高中', '普通高中', 'high school'];
-    if (value === '中专') return ['中专', '中等专业学校', 'secondary vocational'];
-    if (value === '初中及以下') return ['初中及以下', '初中', '初级中学', 'junior high'];
-    if (/^(?:中国|中华人民共和国|china|chinese)$/i.test(value)) return ['中国', '中华人民共和国', '中国大陆', 'China', 'Chinese'];
-    if (/非全日制|在职|part.?time/i.test(value)) return [String(value), '非全日制', '在职', '非统招'];
-    if (/全日制|统招|full.?time/i.test(value)) return [String(value), '全日制', '统招', '普通全日制', '全国普通高等院校全日制'];
-    if (/(?:cet|cte)\s*[-－]?\s*6|大学英语六级|英语六级|^六级$/i.test(value)) return ['CET-6', 'CET6', 'CTE6', '大学英语六级', '英语六级', '六级'];
-    if (/(?:cet|cte)\s*[-－]?\s*4|大学英语四级|英语四级|^四级$/i.test(value)) return ['CET-4', 'CET4', 'CTE4', '大学英语四级', '英语四级', '四级'];
-    if (/tem\s*[-－]?\s*8|英语专业八级|专八/i.test(value)) return ['TEM-8', 'TEM8', '英语专业八级', '专八'];
-    if (/tem\s*[-－]?\s*4|英语专业四级|专四/i.test(value)) return ['TEM-4', 'TEM4', '英语专业四级', '专四'];
-    return [String(value)];
-  }
-
-  function choiceConflict(text, value) {
-    const option = cleanText(text).toLowerCase();
-    const target = cleanText(value).toLowerCase();
-    if (/硕士|master/.test(target) && /博士|doctor|ph\.?d|本科|bachelor|专科|大专|associate/.test(option)) return true;
-    if (/博士|doctor|ph\.?d/.test(target) && /硕士|master|本科|bachelor|专科|大专|associate/.test(option)) return true;
-    if (/本科|bachelor/.test(target) && /博士|doctor|ph\.?d|硕士|master|专科|大专|associate/.test(option)) return true;
-    if (/专科|大专|associate/.test(target) && /博士|doctor|ph\.?d|硕士|master|本科|bachelor/.test(option)) return true;
-    const targetNonFullTime = /非全日制|part.?time|在职/.test(target);
-    const optionNonFullTime = /非全日制|part.?time|在职/.test(option);
-    if (targetNonFullTime !== optionNonFullTime && /全日制|full.?time/.test(`${target} ${option}`)) return true;
-    const targetNonUnified = /非统招/.test(target);
-    const optionNonUnified = /非统招/.test(option);
-    if (targetNonUnified !== optionNonUnified && /统招/.test(`${target} ${option}`)) return true;
-    return false;
-  }
-
-  function choiceMatchScore(text, value) {
-    const optionText = String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!optionText || choiceConflict(optionText, value)) return 0;
-    let best = 0;
-    const rawTarget = cleanText(value).toLowerCase();
-    if (/硕士|master/.test(rawTarget) && /硕士|master|研究生/.test(optionText)) best = Math.max(best, 94);
-    if (/博士|doctor|ph\.?d/.test(rawTarget) && /博士|doctor|ph\.?d/.test(optionText)) best = Math.max(best, 94);
-    if (/非全日制|part.?time|在职/.test(rawTarget) && /非全日制|part.?time|在职/.test(optionText)) best = Math.max(best, 94);
-    if (!/非全日制|part.?time|在职/.test(rawTarget) && /全日制|full.?time|统招/.test(rawTarget)
-      && !/非全日制|part.?time|在职|非统招/.test(optionText) && /全日制|full.?time|统招/.test(optionText)) best = Math.max(best, 92);
-    for (const candidate of normalizedChoices(value)) {
-      const normalized = candidate.toLowerCase();
-      if (/^\d+$/.test(normalized)) {
-        const numberMatch = optionText.match(/^0*(\d+)(?:\s*[年月日号])?$/);
-        if (numberMatch && Number(numberMatch[1]) === Number(normalized)) best = Math.max(best, 100);
-        continue;
-      }
-      const simplify = (item) => item
-        .replace(/[·•\s_-]/g, '')
-        .replace(/(?:壮族|回族|满族|汉族|民族)$/i, (matched) => matched)
-        .replace(/(?:省|市|地区|特别行政区)$/i, '');
-      const left = simplify(optionText);
-      const right = simplify(normalized);
-      if (left.includes('非全日制') !== right.includes('非全日制') && left.includes('全日制') && right.includes('全日制')) continue;
-      if (left.includes('非统招专升本') !== right.includes('非统招专升本') && left.includes('统招专升本') && right.includes('统招专升本')) continue;
-      if (left.includes('外国护照') !== right.includes('外国护照') && left.includes('护照') && right.includes('护照')) continue;
-      if (optionText === normalized) best = Math.max(best, 100);
-      else if (left === right) best = Math.max(best, 98);
-      else if (left.startsWith(right) || left.endsWith(right)) best = Math.max(best, 92 - Math.min(12, left.length - right.length));
-      else if (left.includes(right)) best = Math.max(best, 84 - Math.min(14, left.length - right.length));
-      else if (right.includes(left) && left.length >= 2) best = Math.max(best, 72 - Math.min(12, right.length - left.length));
-    }
-    return Math.max(0, best);
-  }
-
-  function choiceMatches(text, value) {
-    return choiceMatchScore(text, value) >= 60;
-  }
-
-  function wait(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  function activateOption(option) {
-    if (!(option instanceof Element) || !option.isConnected) return false;
-    // 候选面板有时被渲染在包裹输入框的 <label> 内。点击候选会先触发组件事件，
-    // 随后 label 的默认动作又点击一次输入框，把刚关闭的面板重新打开。
-    // 仅阻止这种默认动作，不停止事件冒泡，React/Vue 的委托监听仍可收到 click。
-    const ownerLabel = option.closest('label');
-    const labelControl = ownerLabel?.querySelector('input,textarea,select,[contenteditable="true"],[role="combobox"]');
-    if (ownerLabel && ownerLabel !== option && labelControl && !option.contains(labelControl)) {
-      ownerLabel.addEventListener('click', (event) => event.preventDefault(), { capture: true, once: true });
-    }
-    if (typeof PointerEvent === 'function') {
-      option.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', button: 0 }));
-    }
-    option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
-    if (typeof PointerEvent === 'function') {
-      option.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', button: 0 }));
-    }
-    option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));
-    // HTML、SVG 和自定义元素统一派发冒泡 click，避免页面环境中缺少 click() 方法。
-    option.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, view: window }));
-    return true;
-  }
-
-  async function trustedClick(option) {
-    if (!(option instanceof Element) || !option.isConnected || !visible(option)) return { ok: false, error: '候选不可见' };
-    try { option.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch { option.scrollIntoView(); }
-    await wait(30);
-    if (!option.isConnected || !visible(option)) return { ok: false, error: '滚动后候选已失效' };
-    const rect = option.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return { ok: false, error: '候选无法滚动到视口内' };
-    const hit = document.elementFromPoint(x, y);
-    if (!hit || !(option === hit || option.contains(hit) || hit.contains(option))) {
-      const blocker = hit ? `${hit.tagName.toLowerCase()}${hit.id ? `#${hit.id}` : ''}` : '未知元素';
-      return { ok: false, error: `候选中心被 ${blocker} 遮挡` };
-    }
-    try {
-      return await chrome.runtime.sendMessage({ type: 'RESUME_AUTOFILL_TRUSTED_CLICK', point: { x, y } });
-    } catch (error) {
-      return { ok: false, error: error?.message || String(error) };
-    }
-  }
-
-  function clickOutsideControl(trigger) {
-    const target = trigger?.closest('form,[role="form"]')
-      || document.querySelector('main,#root,#app,[class*="application"],[class*="Application"]')
-      || document.body;
-    activateOption(target);
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-      const EventType = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
-      document.dispatchEvent(new EventType(type, { bubbles: true, button: 0, pointerType: 'mouse' }));
-    }
-  }
-
-  async function commitControl(element, trigger) {
-    await wait(15);
-    clickOutsideControl(trigger);
-    await wait(10);
-    for (const target of [...new Set([element, trigger].filter((node) => node?.isConnected))]) {
-      target.dispatchEvent(new Event('input', { bubbles: true }));
-      target.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    if (element?.isConnected && typeof element.focus === 'function') {
-      try { element.focus({ preventScroll: true }); } catch { element.focus(); }
-      await wait(10);
-      element.blur();
-    } else if (trigger?.isConnected && typeof trigger.blur === 'function') {
-      trigger.blur();
-    }
-    await wait(15);
-  }
-
-  async function commitAutocomplete(element) {
-    await wait(10);
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    if (element.isConnected && typeof element.blur === 'function') element.blur();
-    await wait(10);
-    clickOutsideControl(element);
-    await wait(10);
-  }
-
-  function fillSelect(element, value) {
-    const option = [...element.options]
-      .map((item) => ({ item, score: choiceMatchScore(`${item.text} ${item.value}`.trim(), value) }))
-      .filter(({ score }) => score >= 60)
-      .sort((left, right) => right.score - left.score)[0]?.item;
-    if (!option) return false;
-    element.value = option.value;
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    element.dispatchEvent(new Event('blur', { bubbles: true }));
-    return true;
-  }
-
-  function fillChoice(element, value) {
-    const candidates = normalizedChoices(value).map((item) => item.toLowerCase());
-    const text = labelText(element);
-    const ownValue = `${element.value || ''} ${element.closest('label')?.innerText || ''}`.toLowerCase();
-    if (!candidates.some((candidate) => ownValue === candidate || ownValue.includes(candidate))) return false;
-    if (!element.checked) element.click();
-    return true;
-  }
-
-  function customSelectTrigger(element) {
-    if (element instanceof HTMLSelectElement) return null;
-    const roleTrigger = element.closest('[role="combobox"]');
-    if (roleTrigger) return roleTrigger;
-    const candidates = [];
-    let ancestor = element.parentElement;
-    for (let depth = 0; ancestor && depth < 5; depth += 1, ancestor = ancestor.parentElement) {
-      const semantics = `${ancestor.getAttribute('aria-haspopup') || ''} ${ancestor.getAttribute('role') || ''} ${ancestor.className || ''}`;
-      if (/listbox|combobox|select|dropdown|picker/i.test(semantics) && controlNodes(ancestor).length <= 2) candidates.push(ancestor);
-    }
-    if (candidates.length) return candidates[candidates.length - 1];
-    if (element.getAttribute('aria-haspopup') === 'listbox' || element.readOnly && /请选择|select|年|月|日/i.test(element.placeholder || '')) return element;
-    return null;
-  }
-
-  function fillResultTarget(element) {
-    if (!(element instanceof Element)) return element;
-    return element.closest('.phoenix-select') || customSelectTrigger(element) || element;
-  }
-
-  function markFillResult(element, className) {
-    const target = fillResultTarget(element);
-    if (target instanceof Element) target.classList.add(className);
-    return target;
-  }
-
-  const OPTION_SELECTORS = [
-    '[role="option"]', '[aria-selected]', '[role="listbox"] li', '[role="menu"] li',
-    '[class*="option"]', '[class*="Option"]', '[class*="dropdown"] li', '[class*="Dropdown"] li',
-    '[class*="menu"] li', '[class*="Menu"] li', '[class*="item"]', '[class*="Item"]',
-    '[class*="Select-common-item"]', '[class*="select-common-item"]',
-    '[class*="list-item-container"]', '[class*="item-text-label"]',
-    '[class*="area-item-container"]', '[class*="area-text-label"]',
-    '[class*="Tag-container"]', '[class*="Tag-text"]',
-    '[class*="Select-pointer"]', '[class*="select-pointer"]', '[role="gridcell"]', '[role="treeitem"]'
-  ];
-
-  const OVERLAY_SELECTOR = [
-    '[role="listbox"]', '[role="dialog"]', '[role="menu"]', '[role="tree"]', '[role="grid"]',
-    '[aria-modal="true"]', '[class*="dropdown"]', '[class*="Dropdown"]', '[class*="popup"]',
-    '[class*="Popup"]', '[class*="popover"]', '[class*="Popover"]', '[class*="calendar"]',
-    '[class*="Calendar"]', '[class*="picker"]', '[class*="Picker"]', '[class*="cascad"]',
-    '[class*="Cascad"]', '[class*="overlay"]', '[class*="Overlay"]',
-    '[class*="common-unmodeled-layer"]', '[class*="phoenix-date-picker"]',
-    '[class*="main-selector-container"]', '[class*="area-selector-container"]'
-  ].join(',');
-
-  function isResumeAuditNode(node) {
-    return node instanceof Element && Boolean(node.closest('.resume-page-audit-overlay,.resume-page-audit-panel,[data-resume-page-audit-ui]'));
-  }
-
-  function beginDynamicInteraction(trigger) {
-    // 只记录可能成为弹层/候选的节点。对 body * 逐个调用 getComputedStyle/rect 会强制大型表单
-    // 反复布局，是复杂控件多时出现分钟级耗时的主要原因之一。
-    const snapshotSelector = `${OVERLAY_SELECTOR},${OPTION_SELECTORS.join(',')},button,li,[tabindex],[data-value],[data-key]`;
-    const beforeVisible = new WeakSet([...document.querySelectorAll(snapshotSelector)].filter(visible));
-    const changed = new Set();
-    const added = new Set();
-    const roots = new Set();
-    let revision = 0;
-    const remember = (node) => {
-      if (!(node instanceof Element) || node === trigger || isResumeAuditNode(node)) return;
-      changed.add(node);
-      revision += 1;
-    };
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        mutation.addedNodes.forEach((node) => {
-          if (node instanceof Element) added.add(node);
-          remember(node);
-        });
-        if (mutation.type === 'childList') remember(mutation.target);
-        if (mutation.type === 'attributes') remember(mutation.target);
-        if (mutation.removedNodes.length) revision += 1;
-      }
-    });
-    observer.observe(document.documentElement, {
-      childList: true, subtree: true, attributes: true,
-      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'aria-expanded', 'aria-selected', 'aria-checked']
-    });
+  function startDateKeyForContext(context = '') {
     return {
-      trigger, beforeVisible, changed, added, roots, observer,
-      get revision() { return revision; },
-      stop() { observer.disconnect(); }
+      education: 'educationStartDate',
+      work: 'workStartDate',
+      project: 'projectStartDate',
+      campus: 'campusStartDate',
+      practice: 'practiceStartDate',
+      certificate: 'certificateDate',
+      award: 'awardDate'
+    }[context] || 'periodStartDate';
+  }
+
+  function endDateKeyForContext(context = '') {
+    return {
+      education: 'graduationDate',
+      work: 'workEndDate',
+      project: 'projectEndDate',
+      campus: 'campusEndDate',
+      practice: 'practiceEndDate'
+    }[context] || 'periodEndDate';
+  }
+
+  function rangeDateKeyForContext(role, context = '') {
+    return role === 'end' ? endDateKeyForContext(context) : startDateKeyForContext(context);
+  }
+
+  function dateRangeLabelBase(item) {
+    return stripGeneratedOrdinal(item.fieldBlockLabel || item.fieldLabel || item.displayName || item.text || '');
+  }
+
+  function dateRangeEvidence(item) {
+    const element = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
+    const values = [
+      item.fieldBlockLabel,
+      item.fieldLabel,
+      item.displayName,
+      item.text,
+      item.placeholder,
+      item.ariaLabel,
+      item.name,
+      item.id,
+      item.class,
+      item.domPath
+    ];
+    if (element instanceof Element) {
+      values.push(
+        element.getAttribute('placeholder'),
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.getAttribute('name'),
+        element.id,
+        rawClassName(element)
+      );
+    }
+    return cleanText(values.filter(Boolean).join(' '));
+  }
+
+  function hasDateRangeHint(text) {
+    return /(?:\u8d77\u6b62|\u5f00\u59cb.*\u7ed3\u675f|\u7ed3\u675f.*\u5f00\u59cb|\u65f6\u95f4\u6bb5|\u65e5\u671f\u8303\u56f4|\u533a\u95f4|range|period|duration|from.*to|start.*end)/i.test(text);
+  }
+
+  function hasDateLikeHint(text) {
+    return /(?:\u65f6\u95f4|\u65e5\u671f|\u5e74\u6708|\u8d77\u6b62|\u5165\u5b66|\u6bd5\u4e1a|\u5c31\u8bfb(?:\u65f6\u95f4|\u65e5\u671f)?|\u4efb\u804c(?:\u65f6\u95f4|\u65e5\u671f)?|\u5728\u804c(?:\u65f6\u95f4|\u65e5\u671f)?|\u5b9e\u4e60(?:\u65f6\u95f4|\u65e5\u671f)|\u9879\u76ee(?:\u65f6\u95f4|\u65e5\u671f)|\u5de5\u4f5c(?:\u65f6\u95f4|\u65e5\u671f)|\u5b66\u4e60(?:\u65f6\u95f4|\u65e5\u671f)|\u5728\u6821(?:\u65f6\u95f4|\u65e5\u671f)|date|time|period|year|month)/i.test(text);
+  }
+
+  function isDateSelectableControl(item) {
+    if (item.elementKind !== 'field') return false;
+    if (item.rangeRole || item.datePart || item.datePrecision || item.dateMechanism) return true;
+    if (DATE_KEYS.test(item.matchedKey || '')) return true;
+    if (/date|month|picker/i.test(item.controlKind || '')) return true;
+    if (/select|autocomplete|combobox|input|write/i.test(`${item.actionType || ''} ${item.operationGroup || ''} ${item.controlKind || ''}`)) return true;
+    const evidence = dateRangeEvidence(item);
+    return hasDateLikeHint(evidence);
+  }
+
+  function dateRangeRecordScope(item) {
+    return item.repeatGroup || item.recordGroup || (item.recordIndex ? `record:${item.recordIndex}` : 'record:0');
+  }
+
+  function dateRangeGroupKey(item) {
+    const label = dateRangeLabelBase(item).toLowerCase();
+    const context = item.context || moduleContextForTitle(item.moduleTitle) || '';
+    return [
+      item.blockRef || '',
+      item.moduleTitle || item.blockTitle || context || 'page',
+      item.fieldBlockLabel ? stripGeneratedOrdinal(item.fieldBlockLabel).toLowerCase() : label,
+      dateRangeRecordScope(item),
+      label
+    ].join('::');
+  }
+
+  function setInferredDateEndpoint(item, role, datePart, groupKey, precision) {
+    const context = item.context || moduleContextForTitle(item.moduleTitle) || sectionContext(sourceElementMap.get(item.ref) || elementMap.get(item.ref)) || '';
+    const key = rangeDateKeyForContext(role, context);
+    const label = dateRangeLabelBase(item) || FIELD_LABEL_BY_KEY[key] || (role === 'start' ? FIELD_LABEL_BY_KEY.periodStartDate : FIELD_LABEL_BY_KEY.periodEndDate);
+    const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '');
+    const element = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
+    const repeatBinding = element instanceof Element
+      ? repeatBindingDetails(element, profileMapping.path, context)
+      : { repeatSection: '', repeatIndex: 0, repeatGroup: '' };
+    item.context = context || item.context;
+    item.fieldLabel = label;
+    item.fieldLabelSource = item.fieldLabelSource || 'inferred-date-range';
+    item.matchedKey = key;
+    item.profilePath = profileMapping.path;
+    item.profilePathCandidates = profileMapping.candidates;
+    item.mappingStatus = profileMapping.path ? 'mapped' : profileMapping.candidates.length ? 'ambiguous' : 'unmapped';
+    item.repeatSection = repeatBinding.repeatSection || item.repeatSection || '';
+    item.repeatIndex = repeatBinding.repeatIndex || item.repeatIndex || item.recordIndex || 0;
+    item.repeatGroup = repeatBinding.repeatGroup || item.repeatGroup || '';
+    item.rangeRole = role;
+    item.rangeGroup = groupKey;
+    item.rangeIndex = item.recordIndex || item.rangeIndex || 1;
+    item.datePart = datePart;
+    item.datePrecision = precision;
+    item.dateMechanism = 'compound-year-month-select';
+    item.semanticType = 'date';
+    if (item.actionType === 'write') {
+      item.actionType = 'select-search';
+      item.operationGroup = operationGroup(item.actionType);
+      item.valueDomain = item.valueDomain === 'open' ? 'closed-local' : item.valueDomain;
+      item.interaction = {
+        ...item.interaction,
+        searchable: true,
+        confirmationRequired: true
+      };
+    }
+  }
+
+  function inferCommonDateRanges(items) {
+    const fields = items.filter((item) => item.elementKind === 'field' && isDateSelectableControl(item));
+    const groups = new Map();
+    for (const item of fields) {
+      const baseLabel = dateRangeLabelBase(item);
+      const evidence = dateRangeEvidence(item);
+      if (!baseLabel && !hasDateLikeHint(evidence)) continue;
+      const key = dateRangeGroupKey(item);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    }
+
+    for (const group of groups.values()) {
+      group.sort(compareItemsByDom);
+      const evidence = cleanText(group.map(dateRangeEvidence).join(' '));
+      const baseLabel = dateRangeLabelBase(group[0]);
+      const dateLike = hasDateLikeHint(`${baseLabel} ${evidence}`);
+      if (!dateLike) continue;
+
+      const applyTuple = (tuple, parts, precision, rangeKeySuffix) => {
+        const anchor = tuple[0] || group[0];
+        const groupKey = [
+          'inferred-date-range',
+          anchor.blockRef || '',
+          anchor.moduleTitle || anchor.blockTitle || anchor.context || 'page',
+          dateRangeRecordScope(anchor),
+          baseLabel || rangeKeySuffix,
+          rangeKeySuffix
+        ].join(':');
+        tuple.forEach((item, index) => {
+          const part = parts[index];
+          setInferredDateEndpoint(item, part.role, part.datePart, groupKey, precision);
+        });
+      };
+
+      if (group.length === 4) {
+        applyTuple(group, [
+          { role: 'start', datePart: 'year' },
+          { role: 'start', datePart: 'month' },
+          { role: 'end', datePart: 'year' },
+          { role: 'end', datePart: 'month' }
+        ], 'year-month', 'ym4');
+      } else if (group.length > 4 && group.length % 4 === 0) {
+        for (let index = 0; index < group.length; index += 4) {
+          applyTuple(group.slice(index, index + 4), [
+            { role: 'start', datePart: 'year' },
+            { role: 'start', datePart: 'month' },
+            { role: 'end', datePart: 'year' },
+            { role: 'end', datePart: 'month' }
+          ], 'year-month', `ym4-${index / 4 + 1}`);
+        }
+      } else if (group.length === 6) {
+        applyTuple(group, [
+          { role: 'start', datePart: 'year' },
+          { role: 'start', datePart: 'month' },
+          { role: 'start', datePart: 'day' },
+          { role: 'end', datePart: 'year' },
+          { role: 'end', datePart: 'month' },
+          { role: 'end', datePart: 'day' }
+        ], 'date', 'ymd6');
+      } else if (group.length > 6 && group.length % 6 === 0) {
+        for (let index = 0; index < group.length; index += 6) {
+          applyTuple(group.slice(index, index + 6), [
+            { role: 'start', datePart: 'year' },
+            { role: 'start', datePart: 'month' },
+            { role: 'start', datePart: 'day' },
+            { role: 'end', datePart: 'year' },
+            { role: 'end', datePart: 'month' },
+            { role: 'end', datePart: 'day' }
+          ], 'date', `ymd6-${index / 6 + 1}`);
+        }
+      } else if (group.length === 2 && hasDateRangeHint(`${baseLabel} ${evidence}`)) {
+        applyTuple(group, [
+          { role: 'start', datePart: '' },
+          { role: 'end', datePart: '' }
+        ], 'year-month', 'ym2');
+      }
+    }
+  }
+
+  function queryAllDeep(selector) {
+    const results = [];
+    const roots = [document];
+    const visited = new Set();
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      for (const element of root.querySelectorAll(selector)) results.push(element);
+      for (const host of root.querySelectorAll('*')) {
+        if (host.shadowRoot) roots.push(host.shadowRoot);
+      }
+    }
+    return [...new Set(results)];
+  }
+
+  function isOpenTextField(element, matchedKey, text) {
+    if (!element.matches('input,textarea,[contenteditable]:not([contenteditable="false"])')) return false;
+    if (element.disabled || element.readOnly || element.getAttribute('aria-disabled') === 'true'
+      || element.getAttribute('aria-readonly') === 'true') return false;
+    const type = String(element.type || '').toLowerCase();
+    if (element.hasAttribute('list')) return true;
+    if (['email', 'tel', 'url', 'text', 'search', 'number', 'password', ''].includes(type)
+      && (OPEN_TEXT_KEYS.has(matchedKey) || OPEN_TEXT_HINT.test(text))
+      && closedValueEvidence(element).length === 0) return true;
+    return false;
+  }
+
+  function currentFieldContainer(element) {
+    const field = closestFieldContainer(element, 8);
+    if (field) return field;
+    return element.closest('label') || null;
+  }
+
+  function declaredFieldMode(element) {
+    const boundary = currentFieldContainer(element);
+    let node = element;
+    let stringField = false;
+    for (let depth = 0; node instanceof Element && depth < 8; depth += 1, node = node.parentElement) {
+      const classes = rawClassName(node);
+      if (/(?:^|\s)select_info(?:\s|$|-)|sd-Select-container/i.test(classes)) return 'select';
+      if (/(?:^|\s)string_info(?:\s|$|-)/i.test(classes)) stringField = true;
+      if (node === boundary) break;
+    }
+    return stringField ? 'string' : '';
+  }
+
+  function isPlainEditableTextField(element) {
+    if (!element.matches('input,textarea')) return false;
+    if (element.disabled || element.readOnly || element.getAttribute('aria-disabled') === 'true'
+      || element.getAttribute('aria-readonly') === 'true') return false;
+    const type = String(element.type || '').toLowerCase();
+    return element instanceof HTMLTextAreaElement
+      || ['email', 'tel', 'url', 'text', 'search', 'number', 'password', ''].includes(type);
+  }
+
+  function closedValueEvidence(element) {
+    const evidence = [];
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    if (radioGroupRoot(element) === element) evidence.push('radio-group-options');
+    if (element instanceof HTMLSelectElement) evidence.push('native-select');
+    if (element.getAttribute('aria-haspopup') === 'listbox'
+      && (element.hasAttribute('aria-expanded') || element.getAttribute('aria-controls') || element.getAttribute('aria-owns'))) {
+      evidence.push('aria-listbox-popup');
+    }
+    if (role === 'combobox'
+      && (element.getAttribute('aria-controls') || element.getAttribute('aria-owns') || element.hasAttribute('aria-expanded'))) {
+      evidence.push('aria-combobox-popup');
+    }
+    if (declaredFieldMode(element) === 'select') evidence.push('select-info-wrapper');
+    const activationHandler = `${element.getAttribute('onfocus') || ''} ${element.getAttribute('onclick') || ''} ${element.getAttribute('onmousedown') || ''}`;
+    if ((element.readOnly || element.getAttribute('aria-readonly') === 'true') && cleanText(activationHandler)) {
+      evidence.push('readonly-activation-handler');
+    }
+    const root = selectRoot(element);
+    if (root && /select|cascader|dropdown|picker/i.test(rawClassName(root))) {
+      evidence.push(root === element ? 'select-component-root' : 'select-component-wrapper');
+    }
+    return evidence;
+  }
+
+  function searchableEvidence(element) {
+    const ariaAutocomplete = String(element.getAttribute('aria-autocomplete') || '').toLowerCase();
+    const root = selectRoot(element) || element;
+    return ariaAutocomplete === 'list' || ariaAutocomplete === 'both'
+      || /(?:^|\s)phoenix-select--editable(?:\s|$)/i.test(rawClassName(root))
+      || declaredFieldMode(element) === 'select' && isPlainEditableTextField(element)
+      || /autocomplete|auto-complete|searchable|filterable|typeahead/i.test(rawClassName(root));
+  }
+
+  function radioGroupRoot(element) {
+    const group = element.closest('.phoenix-radio-group,.ud__radio-group,[role="radiogroup"],fieldset');
+    if (!group || !visible(group)) return null;
+    const nativeOption = element.matches('input[type="radio"],[role="radio"]')
+      || Boolean(element.closest('label')?.querySelector('input[type="radio"],[role="radio"]'));
+    if (group.matches('fieldset') && element !== group && !nativeOption) return null;
+    const nativeOptions = group.querySelectorAll('input[type="radio"],[role="radio"]');
+    const phoenixOptions = group.querySelectorAll('.phoenix-radio-group__radioItem');
+    return nativeOptions.length >= 2 || phoenixOptions.length >= 2 ? group : null;
+  }
+
+  function radioGroupOptions(element) {
+    const group = radioGroupRoot(element);
+    if (!group) return [];
+    const phoenixItems = [...group.querySelectorAll('.phoenix-radio-group__radioItem')];
+    const optionNodes = phoenixItems.length
+      ? phoenixItems
+      : [...group.querySelectorAll('input[type="radio"],[role="radio"]')];
+    return [...new Set(optionNodes.map((option) => {
+      const phoenixText = option.querySelector?.('.phoenix-radio__radio-text')?.textContent || '';
+      const udText = option.querySelector?.('.ud__radio__label-content')?.textContent || '';
+      const labels = option.labels ? [...option.labels].map((label) => label.textContent || '').join(' ') : '';
+      const wrappingLabel = option.closest('label')?.textContent || '';
+      return cleanText(phoenixText || udText || labels || wrappingLabel || option.getAttribute('aria-label') || option.textContent);
+    }).filter(Boolean))];
+  }
+
+  function atsxPeriodEndpoint(element, fallbackContext = '') {
+    const trigger = element.closest('.atsx-date-picker-period-month-label');
+    if (!trigger) return null;
+    const dataCy = trigger.getAttribute('data-cy') || '';
+    const role = /InputBegin$/i.test(dataCy) ? 'start' : /InputEnd$/i.test(dataCy) ? 'end' : '';
+    if (!role) return null;
+    const rangeGroup = dataCy.replace(/Input(?:Begin|End)$/i, '');
+    const structuralContext = /^education(?:\[|\.|$)/i.test(rangeGroup) ? 'education'
+      : /^work(?:\[|\.|$)|^experience(?:\[|\.|$)/i.test(rangeGroup) ? 'work'
+      : /^project(?:\[|\.|$)/i.test(rangeGroup) ? 'project' : '';
+    const context = structuralContext || fallbackContext;
+    const indexMatch = rangeGroup.match(/\[(\d+)\]/);
+    return {
+      trigger,
+      role,
+      label: role === 'start' ? '开始时间' : '结束时间',
+      key: rangeDateKeyForContext(role, context),
+      context,
+      rangeGroup,
+      rangeIndex: indexMatch ? Number(indexMatch[1]) + 1 : 1,
+      datePrecision: 'year-month',
+      dateMechanism: 'compound-year-month-select'
     };
   }
 
-  function interactionRelated(session, node) {
-    if (!(node instanceof Element) || !visible(node) || node.contains(session.trigger)) return false;
-    if ([...session.roots].some((root) => root === node || root.contains(node))) return true;
-    if (!session.beforeVisible.has(node)) return true;
-    return [...session.changed].some((changed) => changed === node || changed.contains(node) || node.contains(changed));
+  function isAtsxPeriodInternalNoise(element) {
+    const period = element.closest('.atsx-date-picker-period-month');
+    return Boolean(period && !element.closest('.atsx-date-picker-period-month-label'));
   }
 
-  function rememberInteractionRoot(session, node) {
-    if (!(node instanceof Element)) return null;
-    let root = node.closest(OVERLAY_SELECTOR);
-    const dynamicInsideTrigger = root && session.trigger?.contains(root)
-      && (!session.beforeVisible.has(root) || [...session.added].some((added) => added === root || added.contains(root)));
-    if (!root || root.contains(session.trigger) || (session.trigger?.contains(root) && !dynamicInsideTrigger)) {
-      const containingChanges = [...session.changed].filter((changed) => changed === node || changed.contains(node));
-      root = containingChanges.find((candidate) => candidate.parentElement === document.body)
-        || containingChanges.find((candidate) => candidate !== node)
-        || containingChanges[0]
-        || node;
+  function yearMonthToken(element) {
+    const text = cleanText([
+      element.getAttribute?.('placeholder'),
+      element.getAttribute?.('aria-label'),
+      element.getAttribute?.('title'),
+      element.getAttribute?.('data-placeholder')
+    ].filter(Boolean).join(' '));
+    if (/^(?:年|yyyy|year)$/i.test(text)) return 'year';
+    if (/^(?:月|mm|month)$/i.test(text)) return 'month';
+    return '';
+  }
+
+  function isMokaYearMonthSelect(element) {
+    if (!(element instanceof HTMLInputElement) || !visible(element)) return false;
+    if (!yearMonthToken(element)) return false;
+    const root = selectRoot(element) || element.closest('label,[class*="sd-Input"],[class*="sd-Select"]');
+    const classes = `${rawClassName(root)} ${rawClassName(element.closest('label'))} ${rawClassName(element.parentElement)}`;
+    return /sd-(?:Input|Select)|select_info|no-adaptive-tooltip/i.test(classes);
+  }
+
+  function yearMonthTokenV2(element) {
+    const text = cleanText([
+      element.getAttribute?.('placeholder'),
+      element.getAttribute?.('aria-label'),
+      element.getAttribute?.('title'),
+      element.getAttribute?.('data-placeholder'),
+      element.getAttribute?.('value'),
+      element.innerText || element.textContent
+    ].filter(Boolean).join(' '));
+    if (/^(?:\u5e74|yyyy|year)$/i.test(text)) return 'year';
+    if (/^(?:\u6708|mm|month)$/i.test(text)) return 'month';
+    return '';
+  }
+
+  function isYearMonthControl(element) {
+    if (!(element instanceof Element) || !visible(element)) return false;
+    if (!yearMonthTokenV2(element)) return false;
+    const root = selectRoot(element) || element.closest('label,[class*="sd-Input"],[class*="sd-Select"]') || element;
+    const classes = `${rawClassName(root)} ${rawClassName(element.closest('label'))} ${rawClassName(element.parentElement)}`;
+    return /sd-(?:Input|Select)|select_info|no-adaptive-tooltip|month|date|picker|select|button/i.test(classes)
+      || element.matches('button,[role="button"],[role="combobox"],input');
+  }
+
+  function visualRect(element) {
+    const target = selectRoot(element) || element;
+    return target.getBoundingClientRect();
+  }
+
+  function sameVisualRow(left, right) {
+    const leftRect = visualRect(left);
+    const rightRect = visualRect(right);
+    const leftCenter = leftRect.top + leftRect.height / 2;
+    const rightCenter = rightRect.top + rightRect.height / 2;
+    return Math.abs(leftCenter - rightCenter) <= Math.max(12, Math.min(leftRect.height || 0, rightRect.height || 0) * 0.75);
+  }
+
+  function yearMonthInputsOnRow(root, anchor) {
+    return [...root.querySelectorAll('input:not([type="hidden"]),button,[role="button"],[role="combobox"]')]
+      .filter((input) => input === anchor || isYearMonthControl(input))
+      .filter((input) => isYearMonthControl(input) && sameVisualRow(input, anchor))
+      .sort((left, right) => visualRect(left).left - visualRect(right).left);
+  }
+
+  function mokaYearMonthRow(element) {
+    if (!isYearMonthControl(element)) return [];
+    let fallback = [];
+    for (let node = element.parentElement, depth = 0; node instanceof Element && depth < 10; depth += 1, node = node.parentElement) {
+      const row = yearMonthInputsOnRow(node, element);
+      if (row.length >= 4) {
+        const anchorIndex = Math.max(0, row.indexOf(element));
+        const pairStart = anchorIndex % 2 === 0 ? anchorIndex : anchorIndex - 1;
+        const start = Math.max(0, Math.min(pairStart, row.length - 4));
+        return row.slice(start, start + 4);
+      }
+      if (row.length >= 2 && !fallback.length) fallback = row.slice(0, 2);
+      if (node.matches('form,main,body,html')) break;
     }
-    if (root !== document.body && root !== document.documentElement && !root.contains(session.trigger)
-      && (!session.trigger?.contains(root) || dynamicInsideTrigger)) session.roots.add(root);
+    return fallback;
+  }
+
+  function mokaYearMonthPairs(row) {
+    const pairs = [];
+    for (let index = 0; index < row.length - 1; index += 1) {
+      if (yearMonthTokenV2(row[index]) !== 'year' || yearMonthTokenV2(row[index + 1]) !== 'month') continue;
+      pairs.push({ year: row[index], month: row[index + 1], startIndex: index });
+      index += 1;
+    }
+    return pairs;
+  }
+
+  function mokaFieldContainerLabel(element) {
+    const field = closestFieldContainer(element, 10) || element.closest('label');
+    return field instanceof Element ? stripGeneratedOrdinal(fieldRootTitle(field)) : '';
+  }
+
+  function mokaYearMonthLabel(row) {
+    const labels = [
+      ...row.map(mokaFieldContainerLabel),
+      ...row.map((input) => fieldLabelDetails(input, '').label)
+    ]
+      .map((label) => stripGeneratedOrdinal(label))
+      .filter((label) => label && !/^(?:年|月|请选择|选择|YYYY|MM)$/i.test(label));
+    return labels.find((label) => /时间|日期|起止|就读|任职|实习|项目|证书|获奖|date|time|period/i.test(label))
+      || labels[0] || '';
+  }
+
+  function mokaYearMonthRangeGroup(row, context, label) {
+    const first = visualRect(row[0]);
+    return `moka-year-month:${context || 'date'}:${label || 'range'}:${Math.round(first.top)}:${Math.round(first.left)}`;
+  }
+
+  function mokaYearMonthEndpoint(element, fallbackContext = '') {
+    const row = mokaYearMonthRow(element);
+    if (row.length < 2) return null;
+    const pairs = mokaYearMonthPairs(row);
+    if (!pairs.length) return null;
+    const pairIndex = pairs.findIndex((pair) => pair.year === element || pair.month === element);
+    if (pairIndex < 0) return null;
+    const datePart = pairs[pairIndex].year === element ? 'year' : 'month';
+    const context = fallbackContext || sectionContext(element);
+    const label = mokaYearMonthLabel(row);
+    const isRange = pairs.length >= 2;
+    const role = isRange && pairIndex > 0 ? 'end' : 'start';
+    const labelKey = matchKey(label, context);
+    const singleDateKey = labelKey || (context === 'certificate' ? 'certificateDate'
+      : context === 'award' ? 'awardDate'
+        : rangeDateKeyForContext(role, context));
+    return {
+      trigger: selectRoot(element) || element,
+      role: isRange ? role : '',
+      label: isRange
+        ? label || FIELD_LABEL_BY_KEY[rangeDateKeyForContext(role, context)] || (role === 'start' ? '开始时间' : '结束时间')
+        : label || FIELD_LABEL_BY_KEY[singleDateKey] || '时间',
+      key: isRange ? rangeDateKeyForContext(role, context) : singleDateKey,
+      context,
+      rangeGroup: mokaYearMonthRangeGroup(row, context, label),
+      rangeIndex: 1,
+      datePart,
+      datePrecision: 'year-month',
+      dateMechanism: 'compound-year-month-select'
+    };
+  }
+
+  function isMokaYearMonthInternalNoise(element) {
+    return false;
+  }
+
+  function preciseAddTarget(element) {
+    const description = cleanText([
+      element.getAttribute('aria-label'), element.getAttribute('title'),
+      element.innerText || element.textContent
+    ].filter(Boolean).join(' '));
+    if (!ADD_PATTERN.test(description) || ADD_NEGATIVE_PATTERN.test(description)) return null;
+    const candidates = [element, ...element.querySelectorAll('button,a,[role="button"],[onclick],[tabindex],[aria-label],[title],i,span,svg')]
+      .filter((candidate) => {
+        if (!visible(candidate)) return false;
+        const text = cleanText([
+          candidate.getAttribute('aria-label'), candidate.getAttribute('title'),
+          candidate.innerText || candidate.textContent
+        ].filter(Boolean).join(' '));
+        if (!ADD_PATTERN.test(text) || ADD_NEGATIVE_PATTERN.test(text) || text.length > 36) return false;
+        const preciseAddClass = /createFormSection-addBtn|addMore-(?:plus|add)|(?:add|plus)[_-]?(?:icon|text|label)/i.test(rawClassName(candidate));
+        return preciseAddClass || candidate.matches('button,a,[role="button"],[onclick],[tabindex]')
+          || getComputedStyle(candidate).cursor === 'pointer';
+      });
+    if (!candidates.length) return element;
+    return candidates.sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      return leftRect.width * leftRect.height - rightRect.width * rightRect.height;
+    })[0];
+  }
+
+  function phoenixButtonSelectRoot(element) {
+    const wrapper = element.closest('.phoenix-button__wraper')
+      || (element.matches('.phoenix-button') ? element.querySelector(':scope > .phoenix-button__wraper') : null);
+    if (!wrapper || !visible(wrapper) || !wrapper.querySelector('.phoenix-button__suffixIcon')) return null;
+    const outer = wrapper.closest('.phoenix-button');
+    return outer && visible(outer) ? outer : wrapper;
+  }
+
+  function phoenixOptionPanelRoot(element) {
+    const layer = element.closest('.common-unmodeled-layer');
+    if (layer && visible(layer) && layer.querySelector('.phoenix-selectList')) return layer;
+    const content = element.closest('.common-unmodeled-layer__layerContent');
+    if (content && visible(content) && content.querySelector('.phoenix-selectList')) return content;
+    const list = element.closest('.phoenix-selectList');
+    return list && visible(list) ? list : null;
+  }
+
+  function canonicalInteractiveElement(element) {
+    const radioGroup = radioGroupRoot(element);
+    if (radioGroup) return radioGroup;
+    const phoenixOptionPanel = phoenixOptionPanelRoot(element);
+    if (phoenixOptionPanel) return phoenixOptionPanel;
+    const phoenixButtonSelect = phoenixButtonSelectRoot(element);
+    if (phoenixButtonSelect) return phoenixButtonSelect;
+    const atsxDropdown = element.closest('.atsx-date-picker-dropdown');
+    if (atsxDropdown && visible(atsxDropdown)) return atsxDropdown;
+    const atsxMonthLabel = element.closest('.atsx-date-picker-period-month-label');
+    if (atsxMonthLabel && visible(atsxMonthLabel)) return atsxMonthLabel;
+    const phoenixDatePicker = element.closest('.phoenix-date-picker');
+    if (phoenixDatePicker && visible(phoenixDatePicker)) return phoenixDatePicker;
+    const sdMonthPanel = element.closest('[class*="sd-panal-menu-wrapper"]');
+    if (sdMonthPanel && visible(sdMonthPanel)
+      && sdMonthPanel.querySelector('[class*="sd-basic-year-container"],[class*="sd-basic-year-item"]')) return sdMonthPanel;
+    const fieldSelector = [
+      'input', 'textarea', 'select', '[contenteditable]:not([contenteditable="false"])',
+      '[role="textbox"]', '[role="combobox"]', '[role="radio"]', '[role="checkbox"]',
+      '[role="switch"]', '[role="slider"]', '[role="spinbutton"]'
+    ].join(',');
+    if (element.matches(fieldSelector)) return element;
+
+    const explicitSelector = [
+      'button', 'a', 'summary', '[role="button"]', '[role="link"]', '[role="menuitem"]',
+      '[role="tab"]', '[onclick]', '[data-action]'
+    ].join(',');
+    const explicit = element.closest(explicitSelector);
+    if (explicit && visible(explicit) && !explicit.closest(AUDIT_UI_SELECTOR)) return explicit;
+    if (getComputedStyle(element).cursor !== 'pointer') return element;
+
+    // cursor 会被后代继承。沿连续 pointer 链向上合并，得到一次点击真正对应的卡片/控件根节点。
+    let root = element;
+    for (let depth = 0; depth < 8; depth += 1) {
+      const parent = root.parentElement;
+      if (!parent || parent.matches('html,body,main,form') || parent.closest(AUDIT_UI_SELECTOR)) break;
+      if (!visible(parent) || getComputedStyle(parent).cursor !== 'pointer') break;
+      const explicitChildren = parent.querySelectorAll(explicitSelector);
+      if (explicitChildren.length > 1 && !parent.matches(explicitSelector)) break;
+      if (cleanText(parent.innerText || parent.textContent).length > 300) break;
+      root = parent;
+    }
     return root;
   }
 
-  function discoverInteractionRoots(session) {
-    for (const node of session.added) {
-      if (!(node instanceof Element) || isResumeAuditNode(node)
-        || !node.isConnected || !visible(node) || node.contains(session.trigger)) continue;
-      if (node.matches(OVERLAY_SELECTOR)) session.roots.add(node);
-      for (const semantic of node.querySelectorAll(OVERLAY_SELECTOR)) {
-        if (visible(semantic) && !semantic.contains(session.trigger)) session.roots.add(semantic);
-      }
+  function selectRoot(element) {
+    const selector = [
+      '.phoenix-select', '.ud__select', '.ud__picker', '[class*="select-container"]', '[class*="Select-container"]',
+      '[class*="select-wrapper"]', '[class*="Select-wrapper"]', '[class*="cascader"]',
+      '[class*="Cascader"]', '[role="combobox"]'
+    ].join(',');
+    const boundary = currentFieldContainer(element);
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < 8; depth += 1, node = node.parentElement) {
+      if (node.matches(selector) && visible(node)) return node;
+      if (boundary && node === boundary) break;
     }
-    for (const node of session.changed) {
-      if (!(node instanceof Element) || isResumeAuditNode(node) || !visible(node)
-        || session.trigger?.contains(node) || node.contains(session.trigger)) continue;
-      if (node.matches(OVERLAY_SELECTOR)) session.roots.add(node);
-      else if (node !== document.body && node !== document.documentElement) {
-        const style = getComputedStyle(node);
-        if (style.position === 'fixed' || style.position === 'absolute') session.roots.add(node);
-      }
-    }
-    return [...session.roots].filter((root) => root.isConnected && !isResumeAuditNode(root) && visible(root));
-  }
-
-  function interactionOptions(session, value) {
-    const roots = discoverInteractionRoots(session);
-    const rootNodes = roots.flatMap((root) => [
-      ...root.querySelectorAll(`${OPTION_SELECTORS.join(',')},button,li,[tabindex],[data-value],[data-key],*`)
-    ]);
-    // 已定位弹层时只扫描弹层内部。全页扫描会在大型招聘表单上重复遍历数千节点。
-    const fallbackRoots = roots.length ? roots : [...session.added, ...session.changed]
-      // 内嵌式下拉经常让“触发器 + 候选面板”共享同一个动态祖先。
-      // 祖先包含 trigger 并不代表它不能承载本次新增的候选项。
-      .filter((node) => node instanceof Element && node !== session.trigger && node.isConnected && visible(node))
-      .slice(-12);
-    const semantic = roots.length ? [] : fallbackRoots.flatMap((root) => [
-      ...(root.matches?.(`${OPTION_SELECTORS.join(',')},button,li,[tabindex],[data-value],[data-key]`) ? [root] : []),
-      ...root.querySelectorAll(`${OPTION_SELECTORS.join(',')},button,li,[tabindex],[data-value],[data-key]`)
-    ]);
-    const exactText = fallbackRoots.flatMap((root) => [root, ...root.querySelectorAll('*')]).filter((node) => {
-      const text = cleanText(node.innerText || node.textContent);
-      return text && text.length <= 100 && choiceMatches(text, value);
-    });
-    const candidates = [...new Set([...rootNodes, ...semantic, ...exactText])]
-      .map(optionTextNode)
-      .filter((node) => node && (roots.some((root) => root.contains(node)) || interactionRelated(session, node)))
-      .filter((node) => choiceMatches(node.innerText || node.textContent, value))
-      .filter((node) => !/menu.?header|group.?keyword|group.?title/i.test(String(node.className || '')))
-      .filter((node) => !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-    const leaves = candidates.filter((candidate) => !candidates.some((other) => {
-      return other !== candidate && candidate.contains(other) && cleanText(candidate.textContent) === cleanText(other.textContent);
-    }));
-    const optionObjects = [...new Set(leaves.map((node) => clickableAutocompleteTarget(node, session.trigger, session) || node))]
-      .filter((node) => !/menu.?header|group.?keyword|group.?title/i.test(String(node.className || '')));
-    for (const option of optionObjects) rememberInteractionRoot(session, option);
-    return optionObjects.sort((left, right) =>
-      choiceMatchScore(right.innerText || right.textContent, value) - choiceMatchScore(left.innerText || left.textContent, value)
-    );
-  }
-
-  async function waitForInteractionOption(session, value, timeout = 1400) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const option = interactionOptions(session, value)[0];
-      if (option) return option;
-      discoverInteractionRoots(session);
-      await wait(30);
-    }
+    if (element.getAttribute('role') === 'combobox' || element.getAttribute('aria-haspopup') === 'listbox') return element;
     return null;
   }
 
-  async function waitForInteractionChange(session, previousRevision, timeout = 1200) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      if (session.revision !== previousRevision) return true;
-      await wait(40);
-    }
-    return false;
-  }
-
-  async function waitForCandidateOutcome(session, option, element, expectedValue, timeout = 900) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      if (selectionSatisfied(session.trigger, element, expectedValue)
-        || candidateSelected(option)
-        || !option.isConnected
-        || !visible(option)) return true;
-      await wait(25);
-    }
-    return selectionSatisfied(session.trigger, element, expectedValue)
-      || candidateSelected(option)
-      || !option.isConnected
-      || !visible(option);
-  }
-
-  function candidateSelected(node) {
-    let current = node;
-    for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
-      if (current.getAttribute('aria-selected') === 'true' || current.getAttribute('aria-checked') === 'true') return true;
-      if (/selected|checked|active|chosen/i.test(String(current.className || ''))) return true;
-      if (current.querySelector?.('[class*="RadioChecked"]:not([class*="RadioUnchecked"]),[class*="radio-checked"]')) return true;
-    }
-    return false;
-  }
-
-  async function activateInteractionCandidate(session, option, element, expectedValue) {
-    const targets = [...new Set([
-      option,
-      option.querySelector('[class*="Menu-content-item"],[class*="menu-content-item"],[class*="Menu-content"],[class*="menu-content"]'),
-      [...option.querySelectorAll('[class*="option-label"],[class*="Option-label"],[class*="optionLabel"],[class*="OptionLabel"]')]
-        .find((node) => choiceMatches(node.textContent, expectedValue))
-    ].filter(Boolean))];
-    for (const target of targets) {
-      activateOption(target);
-      if (await waitForCandidateOutcome(session, option, element, expectedValue)) return true;
-    }
-    const trusted = await trustedClick(option);
-    if (trusted?.ok) {
-      if (await waitForCandidateOutcome(session, option, element, expectedValue, 450)) return true;
-    }
-    if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `浏览器级点击失败：${trusted.error}`);
-    return false;
-  }
-
-  function openInteractionRoots(session) {
-    return discoverInteractionRoots(session).filter((root) => root.isConnected && visible(root));
-  }
-
-  function confirmationButton(session) {
-    const roots = openInteractionRoots(session);
-    for (const root of roots) {
-      const button = panelAction(root, /^(?:确定|确认|完成|应用|选择|保存|ok|confirm|done|apply)$/i);
-      if (button) return button;
-    }
-    return null;
-  }
-
-  function panelAction(panel, pattern) {
-    if (!(panel instanceof Element)) return null;
-    const candidates = [...panel.querySelectorAll('button,[role="button"],a,[tabindex],[class*="button__content"],[class*="button-content"]')]
-      .filter(visible)
-      .filter((node) => pattern.test(cleanText(node.textContent)));
-    const leaf = candidates.find((node) => ![...node.children].some((child) => pattern.test(cleanText(child.textContent))))
-      || candidates[0];
-    if (!leaf) return null;
-    const clickable = leaf.closest('button,[role="button"],a,[tabindex],[class*="button__wraper"],[class*="button-wrapper"],[class~="phoenix-button"]');
-    return clickable && panel.contains(clickable) ? clickable : leaf;
-  }
-
-  function explicitConfirmationPanel(session) {
-    const roots = discoverInteractionRoots(session);
-    const candidates = [...new Set(roots.flatMap((root) => {
-      const parent = root.closest('[role="dialog"],[aria-modal="true"],[class*="main-selector-container"],[class*="area-selector-container"],[class*="common-unmodeled-layer__layerContent"]');
-      return [root, parent].filter(Boolean);
-    }))];
-    return candidates.find((panel) => {
-      if (!panel.isConnected || !visible(panel) || panel.contains(session.trigger)) return false;
-      const search = panel.querySelector('input[type="search"],input[placeholder*="搜索" i],input[placeholder*="search" i],[class*="search"] input');
-      const rows = panel.querySelector('[role="option"],[role="radio"],[class*="list-item-container"],[class*="item-text-label"],[class*="area-item-container"],[class*="area-text-label"]');
-      const confirm = panelAction(panel, /^(?:确定|确认|完成|应用|选择|ok|confirm|done|apply)$/i);
-      return Boolean(search && rows && confirm);
-    }) || null;
-  }
-
-  async function waitForExplicitConfirmationPanel(session, timeout = 260) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const panel = explicitConfirmationPanel(session);
-      if (panel) return panel;
-      await wait(30);
-    }
-    return explicitConfirmationPanel(session);
-  }
-
-  function explicitPanelRows(panel, value) {
-    const nodes = [...panel.querySelectorAll('[role="option"],[role="radio"],[class*="list-item-container"],[class*="item-text-label"],[class*="area-item-container"],[class*="area-text-label"]')]
-      .filter(visible)
-      .filter((node) => !node.closest('[class*="resize-triggers"],[class*="expand-trigger"],[class*="contract-trigger"]'))
-      .filter((node) => choiceMatches(node.innerText || node.textContent, value));
-    const rows = [...new Set(nodes.map((node) => {
-      return node.closest('[role="option"],[role="radio"],[class*="list-item-container"],[class*="area-item-container"]') || node;
-    }))].filter((node) => panel.contains(node));
-    return rows.sort((left, right) =>
-      choiceMatchScore(right.innerText || right.textContent, value) - choiceMatchScore(left.innerText || left.textContent, value)
-    );
-  }
-
-  function explicitPanelSelectedCount(panel) {
-    const text = cleanText(panel.querySelector('[class*="select-data-num"],[class*="selected-count"],[class*="selection-count"]')?.textContent);
-    const match = text.match(/(\d+)\s*\/\s*(\d+)/) || text.match(/(?:已选|selected)\D*(\d+)/i);
-    return match ? Number(match[1]) : null;
-  }
-
-  function currentExplicitPanelRow(panel, value, fallback = null) {
-    return explicitPanelRows(panel, value)[0]
-      || (fallback?.isConnected && panel.contains(fallback) ? fallback : null);
-  }
-
-  function explicitPanelRadio(row) {
-    return row?.querySelector('svg[class*="RadioChecked"],svg[class*="RadioUnchecked"],[class*="radio-checked"],[class*="radio-unchecked"],[role="radio"],input[type="radio"]') || null;
-  }
-
-  function explicitPanelRadioChecked(row) {
-    if (!row) return false;
-    return Boolean(row.querySelector('svg[class*="RadioChecked"]:not([class*="RadioUnchecked"]),[class*="radio-checked"]:not([class*="radio-unchecked"]),[role="radio"][aria-checked="true"],input[type="radio"]:checked'));
-  }
-
-  function explicitPanelSelected(panel, row, value, countBefore = null) {
-    const liveRow = currentExplicitPanelRow(panel, value, row);
-    const radio = explicitPanelRadio(liveRow);
-    // 面板明确提供 RadioUnchecked/RadioChecked 时，只认真实勾选图标。
-    // 搜索文字、右侧摘要或已选计数都不能替代这一状态。
-    if (radio) return explicitPanelRadioChecked(liveRow);
-    if (candidateSelected(liveRow)) return true;
-    const selectedSummary = panel.querySelector('[class*="select-data-container"],[class*="selected-data-container"],[class*="selection-summary"]');
-    if (selectedSummary && choiceMatches(selectedSummary.innerText || selectedSummary.textContent, value)) return true;
-    const currentCount = explicitPanelSelectedCount(panel);
-    return countBefore !== null && currentCount !== null && currentCount > countBefore;
-  }
-
-  async function waitForExplicitPanelSelection(panel, row, value, countBefore, timeout = 360) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      if (!panel.isConnected) return false;
-      if (explicitPanelSelected(panel, row, value, countBefore)) return true;
-      await wait(35);
-    }
-    return explicitPanelSelected(panel, row, value, countBefore);
-  }
-
-  async function chooseExplicitPanelRow(session, panel, row, element, value) {
-    rememberInteractionRoot(session, row);
-    const countBefore = explicitPanelSelectedCount(panel);
-    const clickTargets = () => {
-      const liveRow = currentExplicitPanelRow(panel, value, row);
-      if (!liveRow) return [];
-      const text = [...liveRow.querySelectorAll('[class*="item-text-label"],[class*="area-text-label"],label,span,div')]
-        .find((node) => normalizedChoices(value).map(normalizedExactText).includes(normalizedExactText(node.textContent)));
-      const radio = explicitPanelRadio(liveRow);
-      const radioContainer = radio?.closest('[class*="icon-container"],[class*="radio"],[role="radio"],label');
-      return [...new Set([radio, radioContainer, liveRow, text].filter(Boolean))];
-    };
-    for (const target of clickTargets()) {
-      activateOption(target);
-      if (await waitForExplicitPanelSelection(panel, row, value, countBefore)) return true;
-    }
-    // 合成事件无效时，依次对当前的圆圈、圆圈容器、整行和文字执行浏览器级点击。
-    for (const target of clickTargets()) {
-      const trusted = await trustedClick(target);
-      if (trusted?.ok && await waitForExplicitPanelSelection(panel, row, value, countBefore, 800)) return true;
-      if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `浏览器级点击失败：${trusted.error}`);
-    }
-    return false;
-  }
-
-  async function fillExplicitConfirmationSelect(session, panel, element, trigger, value, searchValue = value) {
-    // 搜索确认式选择器统一先搜索。虚拟列表只渲染视口附近的行，直接扫描初始 DOM
-    // 会把“目标尚未渲染”误判为“没有该选项”。
-    const search = panel.querySelector('input[type="search"],input[placeholder*="搜索" i],input[placeholder*="search" i],[class*="search"] input');
-    if (search instanceof HTMLInputElement || search instanceof HTMLTextAreaElement) {
-      setFocusedInputValue(search, String(searchValue));
-      search.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    let row = null;
-    const started = Date.now();
-    while (!row && Date.now() - started < INTERACTION_TIMEOUT) {
-      row = explicitPanelRows(panel, value)[0] || null;
-      if (!row) await wait(55);
-    }
-    // 少数组件没有可写搜索框；仅在这种情况下回退到当前已渲染列表。
-    if (!row && !(search instanceof HTMLInputElement || search instanceof HTMLTextAreaElement)) {
-      row = explicitPanelRows(panel, value)[0] || null;
-    }
-    if (!row) {
-      fillFailureReasons.set(element, `确认式选择弹层中没有找到“${value}”`);
-      await settleDynamicInteraction(session, element, '确认式选择弹层', false);
-      return false;
-    }
-
-    const selected = explicitPanelSelected(panel, row, value)
-      || await chooseExplicitPanelRow(session, panel, row, element, value);
-    if (!selected) {
-      if (!fillFailureReasons.get(element)) fillFailureReasons.set(element, `找到了“${value}”候选行，但 RadioUnchecked 没有变成 RadioChecked`);
-      await settleDynamicInteraction(session, element, '确认式选择弹层', false);
-      return false;
-    }
-
-    const confirm = panelAction(panel, /^(?:确定|确认|完成|应用|选择|ok|confirm|done|apply)$/i);
-    if (!confirm) {
-      fillFailureReasons.set(element, '候选项已经选中，但没有找到确认按钮');
-      await settleDynamicInteraction(session, element, '确认式选择弹层', false);
-      return false;
-    }
-    activateOption(confirm);
-    let closed = await waitForInteractionClosed(session, 280);
-    if (!closed && confirm.isConnected && visible(confirm)) {
-      const trusted = await trustedClick(confirm);
-      if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `确认按钮的浏览器级点击失败：${trusted.error}`);
-      closed = await waitForInteractionClosed(session, 450);
-    }
-    if (!closed) {
-      fillFailureReasons.set(element, '候选项已经选中，但点击确认后弹层仍未关闭');
-      await settleDynamicInteraction(session, element, '确认式选择弹层', false);
-      return false;
-    }
-
-    session.stop();
-    await commitControl(element, trigger);
-    const confirmed = selectionSatisfied(trigger, element, value);
-    if (!confirmed) fillFailureReasons.set(element, '确认弹层已关闭，但字段回读值与目标值不一致');
-    if (confirmed) trigger.classList.add(FILLED_CLASS);
-    return confirmed;
-  }
-
-  function compactLocationPath(value, key = '') {
-    const raw = CASCADE_LOCATION_KEYS.has(key) ? locationChoicePath(value) : [String(value)];
-    return raw
-      .map((item) => cleanText(item))
-      .filter(Boolean)
-      .filter((item, index, items) => index === 0 || normalizedExactText(item) !== normalizedExactText(items[index - 1]));
-  }
-
-  function tabbedLocationPanel(session) {
-    const roots = discoverInteractionRoots(session);
-    const candidates = [...new Set(roots.flatMap((root) => {
-      const parent = root.closest(
-        '[role="dialog"],[aria-modal="true"],[class*="Dropdown-dropdown"],[class*="dropdown-dropdown"],[class*="cascad"],[class*="Cascad"]'
-      );
-      return [root, parent].filter(Boolean);
-    }))];
-    return candidates.find((panel) => {
-      if (!(panel instanceof Element) || !panel.isConnected || !visible(panel) || panel.contains(session.trigger)) return false;
-      const tabs = [...panel.querySelectorAll('[class*="Tabs-item"],[role="tab"],li')]
-        .filter((node) => visible(node) && /^(?:省份|城市|县区)$/.test(cleanText(node.textContent)));
-      const tags = [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"]')]
-        .filter((node) => visible(node));
-      return tabs.length >= 2 && tags.length >= 3;
-    }) || null;
-  }
-
-  function tabbedLocationSignature(panel) {
-    if (!(panel instanceof Element)) return '';
-    const active = cleanText(
-      panel.querySelector('[class*="Tabs-active"],[aria-selected="true"],[class*="Tabs-item"][class*="active"]')?.textContent || ''
-    );
-    const options = [...new Set(
-      [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"]')]
-        .filter(visible)
-        .map((node) => cleanText(node.textContent))
-        .filter((text) => text && text.length <= 24)
-        .slice(0, 18)
-    )];
-    return `${active}::${options.join('|')}`;
-  }
-
-  function tabbedLocationOptions(panel, value) {
-    const nodes = [...panel.querySelectorAll('[class*="Tag-container"],[class*="Tag-text"],button,[role="option"],[tabindex]')]
-      .filter((node) => visible(node) && !node.querySelector('input,textarea,select'))
-      .map((node) => node.closest('[class*="Tag-container"],button,[role="option"],[tabindex]') || node)
-      .filter((node) => panel.contains(node));
-    const unique = [...new Set(nodes)];
-    return unique
-      .map((node) => ({ node, score: choiceMatchScore(node.innerText || node.textContent, value) }))
-      .filter(({ score }) => score >= 60)
-      .sort((left, right) => right.score - left.score || cleanText(left.node.textContent).length - cleanText(right.node.textContent).length)
-      .map(({ node }) => node);
-  }
-
-  async function waitForTabbedLocationAdvance(session, panel, signature, element, trigger, value, key, timeout = 720) {
-    const started = Date.now();
-    const leaf = compactLocationPath(value, key).at(-1) || String(value);
-    while (Date.now() - started < timeout) {
-      const livePanel = tabbedLocationPanel(session) || (panel?.isConnected ? panel : null);
-      if (!livePanel || !visible(livePanel)) return true;
-      if (controlValueSatisfied(element, trigger, value, key)
-        || selectionSatisfied(trigger, element, value)
-        || selectionSatisfied(trigger, element, leaf)) return true;
-      if (tabbedLocationSignature(livePanel) !== signature) return true;
-      await wait(45);
-    }
-    const livePanel = tabbedLocationPanel(session) || (panel?.isConnected ? panel : null);
-    return !livePanel
-      || tabbedLocationSignature(livePanel) !== signature
-      || controlValueSatisfied(element, trigger, value, key)
-      || selectionSatisfied(trigger, element, value)
-      || selectionSatisfied(trigger, element, leaf);
-  }
-
-  async function fillTabbedLocationSelect(session, panel, element, trigger, key, value) {
-    const path = compactLocationPath(value, key);
-    if (!path.length) return false;
-
-    let index = 0;
-    let livePanel = panel;
-    while (index < path.length) {
-      livePanel = tabbedLocationPanel(session) || (livePanel?.isConnected ? livePanel : null);
-      if (!livePanel || !visible(livePanel)) break;
-
-      let option = null;
-      let matchedIndex = index;
-      for (let offset = 0; index + offset < path.length; offset += 1) {
-        const matches = tabbedLocationOptions(livePanel, path[index + offset]);
-        if (matches.length) {
-          option = matches[0];
-          matchedIndex = index + offset;
-          break;
-        }
-      }
-
-      if (!option) break;
-
-      const target = path[matchedIndex];
-      const before = tabbedLocationSignature(livePanel);
-      rememberInteractionRoot(session, option);
-      activateOption(option);
-      let advanced = await waitForTabbedLocationAdvance(session, livePanel, before, element, trigger, value, key);
-      if (!advanced) {
-        const trusted = await trustedClick(option);
-        if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `级联地区选项点击失败：${trusted.error}`);
-        advanced = await waitForTabbedLocationAdvance(session, livePanel, before, element, trigger, value, key, 900);
-      }
-      if (!advanced) break;
-      index = matchedIndex + 1;
-    }
-
-    livePanel = tabbedLocationPanel(session) || (livePanel?.isConnected ? livePanel : null);
-    if (livePanel?.isConnected && visible(livePanel)
-      && !controlValueSatisfied(element, trigger, value, key)
-      && !selectionSatisfied(trigger, element, value)) {
-      const confirm = panelAction(livePanel, /^(?:确定|确认|完成|应用|选择|保存|ok|confirm|done|apply)$/i);
-      if (confirm) {
-        activateOption(confirm);
-        let closed = await waitForInteractionClosed(session, 280);
-        if (!closed && confirm.isConnected && visible(confirm)) {
-          const trusted = await trustedClick(confirm);
-          if (!trusted?.ok && trusted?.error) fillFailureReasons.set(element, `级联地区确认按钮点击失败：${trusted.error}`);
-          closed = await waitForInteractionClosed(session, 450);
-        }
-      }
-    }
-
-    await commitControl(element, trigger);
-    const closed = await settleDynamicInteraction(session, element, '级联地区弹层');
-    const leaf = path.at(-1);
-    const confirmed = (closed || !tabbedLocationPanel(session))
-      && (controlValueSatisfied(element, trigger, value, key)
-        || selectionSatisfied(trigger, element, value)
-        || (leaf && selectionSatisfied(trigger, element, leaf)));
-    if (confirmed) trigger.classList.add(FILLED_CLASS);
-    if (!confirmed && !fillFailureReasons.get(element)) {
-      fillFailureReasons.set(element, `级联地区弹层已操作，但字段回读仍未匹配：${path.join('/')}`);
-    }
-    return confirmed;
-  }
-
-  async function waitForInteractionClosed(session, timeout = INTERACTION_CLOSE_TIMEOUT) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      if (!openInteractionRoots(session).length) return true;
-      await wait(60);
-    }
-    return !openInteractionRoots(session).length;
-  }
-
-  async function settleDynamicInteraction(session, element, reasonLabel = '动态弹层', allowConfirm = true) {
-    discoverInteractionRoots(session);
-    let closed = !openInteractionRoots(session).length;
-    // 一次性发出最可能关闭弹层的动作，再用一个短窗口观察结果；不再串行等待五轮。
-    if (!closed && allowConfirm) activateOption(confirmationButton(session));
-    if (!closed) {
-      clickOutsideControl(session.trigger || element);
-      if (element?.isConnected && typeof element.blur === 'function') element.blur();
-      const target = document.activeElement || session.trigger || element || document.body;
-      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
-      target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true }));
-      closed = await waitForInteractionClosed(session, 260);
-    }
-    if (!closed) {
-      const roots = openInteractionRoots(session).slice(0, 3).map((root) => {
-        const className = String(root.className || '').split(/\s+/).filter(Boolean).slice(0, 2).join('.');
-        return `${root.tagName.toLowerCase()}${className ? `.${className}` : ''}`;
-      }).join('、');
-      const warning = `${reasonLabel}选择后仍未关闭${roots ? `（残留：${roots}）` : ''}`;
-      interactionWarnings.push(warning);
-    }
-    session.stop();
-    return closed;
-  }
-
-  function optionTextNode(node) {
-    if (!node || /^(INPUT|TEXTAREA|SELECT|OPTION)$/.test(node.tagName)) return null;
-    const text = cleanText(node.innerText || node.textContent);
-    if (!text || text.length > 100 || GENERIC_PLACEHOLDER.test(text)) return null;
-    return node;
-  }
-
-  function visibleOptions(trigger, beforeVisible = new Set()) {
-    const semantic = [...document.querySelectorAll(OPTION_SELECTORS.join(','))].filter((node) => !beforeVisible.has(node));
-    const newlyVisible = [...document.querySelectorAll('li, button, [tabindex], [data-value], [data-key]')]
-      .filter((node) => !beforeVisible.has(node));
-    const candidates = [...new Set([...semantic, ...newlyVisible])]
-      .map(optionTextNode)
-      .filter((option) => option && visible(option) && !trigger?.contains(option) && !option.contains(trigger));
-    return candidates.filter((candidate) => !candidates.some((other) => {
-      return other !== candidate && candidate.contains(other) && cleanText(candidate.textContent) === cleanText(other.textContent);
-    }));
-  }
-
-  function visibleInteractiveSnapshot() {
-    return new Set([...document.querySelectorAll(OPTION_SELECTORS.join(','))].filter(visible));
-  }
-
-  const AUTOCOMPLETE_KEYS = new Set([
-    'school', 'college', 'major', 'company', 'currentTitle', 'department',
-    'projectName', 'certificateName'
-  ]);
-  const fillFailureReasons = new WeakMap();
-  const fillFailureObserved = new WeakMap();
-  const fillAIReviews = new WeakMap();
-  const fillAIClearRequests = new WeakSet();
-
-  function setFocusedInputValue(element, value) {
-    element.focus();
-    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-    setter ? setter.call(element, value) : (element.value = value);
-    try {
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: String(value) }));
-    } catch {
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-  }
-
-  function captureFillState(element, trigger = null) {
-    fillFailureReasons.delete(element);
-    fillFailureObserved.delete(element);
-    fillAIReviews.delete(element);
-    fillAIClearRequests.delete(element);
-    return {
-      value: 'value' in element ? String(element.value || '') : '',
-      text: element.isContentEditable ? element.textContent || '' : '',
-      checked: 'checked' in element ? Boolean(element.checked) : null,
-      hadValue: hasValue(element),
-      triggerText: cleanText(trigger?.textContent || '')
-    };
-  }
-
-  async function rollbackFailedControl(element, trigger, snapshot) {
-    if (!snapshot || !(element instanceof Element)) return false;
-    const liveTrigger = trigger instanceof Element && trigger.isConnected ? trigger : fillResultTarget(element);
-    if (!fillFailureObserved.has(element)) {
-      fillFailureObserved.set(element, controlReadback(element, liveTrigger) || '操作后仍为空');
-    }
-    const forceClear = fillAIClearRequests.has(element);
-    // If this run started from an empty custom selector, clear any candidate that the
-    // component accepted before the final validation failed.
-    if ((!snapshot.hadValue || forceClear) && liveTrigger instanceof Element) {
-      const clear = liveTrigger.querySelector([
-        '[class*="clearIcon"]', '[class*="clear-icon"]', '[class*="ClearIcon"]',
-        '[aria-label*="清除"]', '[aria-label*="clear" i]', '[title*="清除"]', '[title*="clear" i]'
-      ].join(','));
-      if (clear && visible(clear)) {
-        activateOption(clear);
-        await wait(80);
-        if (hasValue(element)) await trustedClick(clear);
-      }
-    }
-    const restoreValue = forceClear ? '' : snapshot.value;
-    if (element instanceof HTMLSelectElement) {
-      element.value = restoreValue;
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      if (!element.disabled) setFocusedInputValue(element, restoreValue);
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      element.blur();
-    } else if (element.isContentEditable) {
-      element.textContent = snapshot.text;
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    if (snapshot.checked !== null && 'checked' in element && element.checked !== snapshot.checked) {
-      element.checked = snapshot.checked;
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    await wait(40);
-    if (forceClear) return !hasValue(element);
-    return snapshot.hadValue ? String(element.value || '') === snapshot.value : !hasValue(element);
-  }
-
-  function normalizedExactText(value) {
-    return cleanText(value).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
-  }
-
-  function exactTextNodes(value, excluded = new Set()) {
-    const target = normalizedExactText(value);
-    if (!target) return [];
-    return [...document.querySelectorAll('body *')]
-      .filter((node) => !excluded.has(node) && visible(node) && !/^(INPUT|TEXTAREA|SELECT|OPTION|SCRIPT|STYLE)$/.test(node.tagName))
-      .filter((node) => normalizedExactText(node.innerText || node.textContent) === target)
-      .filter((node) => ![...node.children].some((child) => visible(child) && normalizedExactText(child.innerText || child.textContent) === target));
-  }
-
-  function clickableAutocompleteTarget(textNode, element, session = null) {
-    if (!textNode || element.contains(textNode) || textNode.contains(element)) return null;
-    // Always click the concrete option row. The previous fallback could climb from
-    // an option label to the entire short list and then click the list's centre,
-    // selecting an unrelated middle item (for example 前30% or 非统招专升本).
-    const explicit = textNode.closest('button,a,label,li,[role="option"],[role="menuitem"],[role="treeitem"],[role="radio"],[tabindex],[data-value],[data-key],[onclick],[class*="Dropdown-item"],[class*="dropdown-item"],[class*="listItem"],[class*="ListItem"],[class*="option-item"],[class*="Option-item"],[class*="list-item-container"],[class*="Select-common-item"],[class*="select-common-item"],[class*="Select-pointer"],[class*="select-pointer"],[class*="Tag-container"]');
-    if (explicit && !explicit.contains(element) && (!session || interactionRelated(session, explicit))) return explicit;
-    if (session) {
-      const root = [...session.roots].find((candidate) => candidate.isConnected && candidate.contains(textNode));
-      if (root) {
-        let row = textNode;
-        for (let depth = 0; row.parentElement && row.parentElement !== root && depth < 6; depth += 1) {
-          const parent = row.parentElement;
-          // A parent containing multiple option-like descendants is the list,
-          // not the option row. Stop before promoting the click target to it.
-          if (parent.querySelectorAll(OPTION_SELECTORS.join(',')).length > 1) break;
-          const parentText = cleanText(parent.innerText || parent.textContent);
-          if (parentText.length > 240) break;
-          row = parent;
-        }
-        if (row !== root && !row.contains(element)) return row;
-      }
-    }
-    // 无语义候选通常使用事件委托；点击候选文字节点会冒泡到候选对象。
-    return textNode;
-  }
-
-  function autocompleteConfirmed(element, value, clicked) {
-    if (normalizedExactText(element.value) !== normalizedExactText(value)) return false;
-    if (!clicked?.isConnected || !visible(clicked)) return true;
-    let node = clicked;
-    for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-      if (node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-checked') === 'true') return true;
-      if (/selected|checked|active|chosen|highlight/i.test(String(node.className || ''))) return true;
-    }
-    const expanded = element.getAttribute('aria-expanded')
-      || element.closest('[aria-expanded]')?.getAttribute('aria-expanded');
-    if (expanded === 'false') return true;
-    return false;
-  }
-
-  async function fillAutocompleteText(element, value, key) {
-    if (!AUTOCOMPLETE_KEYS.has(key) || !(element instanceof HTMLInputElement) || element.readOnly) return false;
-    const session = beginDynamicInteraction(element);
-    setFocusedInputValue(element, String(value));
-
-    const matchedNode = await waitForInteractionOption(session, value);
-    if (!matchedNode) {
-      const dynamicEvidence = discoverInteractionRoots(session).length > 0
-        || [...session.added, ...session.changed].some((node) => {
-          if (!(node instanceof Element) || node === element || !node.isConnected || !visible(node)) return false;
-          const text = interactiveDescription(node);
-          return text && text.length <= 240 && !node.contains(element);
-        });
-      if (!dynamicEvidence) {
-        // 学校、公司、专业等字段并不总是自动完成控件。页面完全没有产生候选层时，
-        // 交回普通文本输入路径；只有确实出现候选但没有目标值时才判定失败。
-        session.stop();
-        return null;
-      }
-      fillFailureReasons.set(element, `动态候选弹层中没有找到与“${value}”匹配的候选对象`);
-      await settleDynamicInteraction(session, element, '自动完成弹层');
-      return false;
-    }
-
-    const option = clickableAutocompleteTarget(matchedNode, element, session);
-    if (!option) {
-      fillFailureReasons.set(element, `找到“${value}”，但未识别到可点击的候选节点`);
-      await settleDynamicInteraction(session, element, '自动完成弹层');
-      return false;
-    }
-    rememberInteractionRoot(session, option);
-    const activated = await activateInteractionCandidate(session, option, element, value);
-    if (!activated) {
-      fillFailureReasons.set(element, `找到了“${value}”候选对象，但点击后页面没有发生变化`);
-      await settleDynamicInteraction(session, element, '自动完成弹层');
-      return false;
-    }
-    await commitAutocomplete(element);
-    const closed = await settleDynamicInteraction(session, element, '自动完成弹层');
-    const confirmed = closed && autocompleteConfirmed(element, value, option);
-    if (!confirmed) fillFailureReasons.set(element, closed ? `已点击“${value}”，但字段没有确认选中状态` : interactionBlocked);
-    return confirmed;
-  }
-
-  function selectedText(trigger, element) {
-    return cleanText(`${element.value || ''} ${trigger?.textContent || ''}`);
-  }
-
-  function selectionSatisfied(trigger, element, value) {
-    if (trigger instanceof Element) {
-      const selected = trigger.querySelector('[aria-selected="true"],[aria-checked="true"],[class*="selected-value"],[class*="SelectedValue"],[class*="singleValue"],[class*="SingleValue"],[class*="display-value"],[class*="DisplayValue"],[class*="calcEle"],[class*="selected-item"],[class*="selection-item"]');
-      const selectedShown = cleanText(selected?.textContent || '');
-      if (selectedShown && choiceMatches(selectedShown, value)) return true;
-      if (!customTriggerHasSelection(trigger)) return false;
-      const triggerShown = cleanText(trigger.textContent || '');
-      return Boolean(triggerShown && choiceMatches(triggerShown, value));
-    }
-    const shown = selectedText(trigger, element);
-    return Boolean(shown && choiceMatches(shown, value));
-  }
-
-  const CASCADE_LOCATION_KEYS = new Set(['nativePlace', 'studentOrigin', 'householdRegistration', 'currentResidence', 'city', 'desiredCity']);
-
-  function locationChoicePath(value) {
-    const source = cleanText(value);
-    const separated = source.split(/[\s,，/／>]+/).map((part) => part.trim()).filter(Boolean);
-    if (separated.length > 1) return separated;
-    const raw = source.replace(/[\s,，/／>]+/g, '');
-    if (!raw) return [];
-    const pieces = raw.match(/.+?(?:特别行政区|自治区|省|市|自治州|地区|盟|区|县|旗)(?=.+|$)/g) || [];
-    const consumed = pieces.join('');
-    const remainder = raw.startsWith(consumed) ? raw.slice(consumed.length) : '';
-    if (remainder) pieces.push(remainder);
-    return pieces.length > 1 ? pieces : [raw];
-  }
-
-  function selectTargets(key, value, preferLeaf = false) {
-    if (CASCADE_LOCATION_KEYS.has(key)) {
-      const path = locationChoicePath(value);
-      return preferLeaf && path.length ? [path.at(-1)] : path;
-    }
-    return [String(value)];
-  }
-
-  function explicitSelectorSearchValue(key, target) {
-    if (!CASCADE_LOCATION_KEYS.has(key)) {
-      return String(target);
-    }
-    // 地区搜索框使用叶子行政区关键词过滤；候选匹配仍使用带行政区后缀的完整叶子名称。
-    return String(target).replace(/(?:特别行政区|自治州|地区|盟|市|区|县|旗)$/u, '') || String(target);
-  }
-
-  function interactionOptionPreview(session, limit = 8) {
-    const roots = discoverInteractionRoots(session);
-    const texts = roots.flatMap((root) => [...root.querySelectorAll(OPTION_SELECTORS.join(','))])
-      .filter(visible)
-      .map((node) => cleanText(node.innerText || node.textContent))
-      .filter((text) => text && text.length <= 50 && !GENERIC_PLACEHOLDER.test(text));
-    return [...new Set(texts)].slice(0, limit);
-  }
-
-  async function waitForInteractionOptionList(session, timeout = 2200) {
-    const started = Date.now();
-    let previous = '';
-    let stableRounds = 0;
-    let latest = [];
-    while (Date.now() - started < timeout) {
-      discoverInteractionRoots(session);
-      latest = interactionOptionPreview(session, 30);
-      const signature = latest.join('\u0000');
-      if (latest.length && signature === previous) stableRounds += 1;
-      else stableRounds = 0;
-      if (latest.length && stableRounds >= 2) return latest;
-      previous = signature;
-      await wait(100);
-    }
-    return latest;
-  }
-
-  async function findBestCustomSelectOption(session, element, target) {
-    const editable = !element.readOnly && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement);
-    if (!editable) return { option: await waitForInteractionOption(session, target), preview: interactionOptionPreview(session) };
-    const queries = [...new Set([String(target), ...normalizedChoices(target)])]
-      .filter((query) => query && query.length <= 80)
-      .slice(0, 5);
-    // Phase 1: use the component's own search/filter behavior. Alias queries let
-    // “硕士” find “硕士研究生”, and long study-mode names fall back to “全日制”.
-    for (const query of queries) {
-      setFocusedInputValue(element, query);
-      const option = await waitForInteractionOption(session, target, 1000);
-      if (option) return { option, preview: interactionOptionPreview(session), query };
-    }
-    // Phase 2: clear the search so the full currently rendered option list becomes
-    // visible, then rank every candidate by guarded similarity instead of guessing.
-    setFocusedInputValue(element, '');
-    await wait(100);
-    const option = await waitForInteractionOption(session, target, 1400);
-    return { option, preview: interactionOptionPreview(session), query: '' };
-  }
-
-  function aiSelectReviewEligible(key) {
-    return Boolean(key && !CASCADE_LOCATION_KEYS.has(key) && !/Date$|Date\b/.test(key));
-  }
-
-  const AI_LIST_FIRST_KEYS = new Set([
-    'highestDegree', 'degree', 'academicDegree',
-    'politicalStatus', 'maritalStatus', 'englishLevel', 'languageProficiency'
-  ]);
-
-  const AI_GENERATED_TEXT_KEYS = new Set(['summary', 'whyCompany']);
-
-  async function applyAISelectSuggestion(element, trigger, value, key) {
-    const session = beginDynamicInteraction(trigger);
-    activateOption(trigger);
-    const match = await findBestCustomSelectOption(session, element, value);
-    if (!match.option) {
-      session.stop();
-      return false;
-    }
-    const activated = await activateInteractionCandidate(session, match.option, element, value);
-    if (!activated && !controlValueSatisfied(element, trigger, value, key)) {
-      await settleDynamicInteraction(session, element, 'AI 建议候选弹层');
-      return false;
-    }
-    await commitControl(element, trigger);
-    await settleDynamicInteraction(session, element, 'AI 建议候选弹层');
-    return controlValueSatisfied(element, trigger, value, key);
-  }
-
-  async function resolveCustomSelectMismatchWithAI(element, trigger, key, target, candidates = [], options = {}) {
-    if (!aiSelectReviewEligible(key)) return false;
-    const silent = Boolean(options.silent);
-    const recordClear = options.recordClear !== false;
-    const observed = controlReadback(element, trigger);
-    const safeCandidates = [...new Set(candidates.map(cleanText).filter(Boolean))].slice(0, 20);
-    let response;
-    try {
-      response = await chrome.runtime.sendMessage({
-        type: 'RESUME_AUTOFILL_AI_REVIEW_SELECT',
-        input: {
-          field: readableField(labelText(element), element),
-          key,
-          target: String(target || ''),
-          observed,
-          candidates: safeCandidates
-        }
-      });
-    } catch (error) {
-      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核调用失败：${error?.message || error}`);
-      return false;
-    }
-    if (!response?.ok) {
-      if (!silent && response?.enabled) {
-        fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核失败：${response.reason || '未知错误'}`);
-      }
-      return false;
-    }
-    if (response.decision === 'keep' && observed && !placeholderLike(observed) && customTriggerHasSelection(trigger)) {
-      fillAIReviews.set(element, {
-        decision: '保留页面值', target: String(target || ''), observed,
-        value: observed, reason: response.reason || '模型判断页面值与目标值语义等价'
-      });
-      fillFailureReasons.delete(element);
-      return true;
-    }
-    if (response.decision === 'keep') {
-      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议保留，但页面没有可确认的非占位选中值`);
-      return false;
-    }
-    if (response.decision === 'select' && safeCandidates.includes(response.value)) {
-      const applied = await applyAISelectSuggestion(element, trigger, response.value, key);
-      if (applied) {
-        const finalObserved = controlReadback(element, trigger);
-        fillAIReviews.set(element, {
-          decision: '改选页面候选', target: String(target || ''), observed: finalObserved,
-          value: response.value, reason: response.reason || '模型选择了语义最接近的现有候选'
-        });
-        fillFailureReasons.delete(element);
-        return true;
-      }
-      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 建议改选“${response.value}”，但页面未接受`);
-    }
-    if (response.decision === 'clear' && recordClear) {
-      fillAIClearRequests.add(element);
-      if (!silent) fillFailureReasons.set(element, `${fillFailureReasons.get(element) || '确定性校验未通过'}；AI 复核建议清除：${response.reason || '无法安全确认目标与页面值一致'}`);
-    }
-    return false;
-  }
-
-  function redactAIText(value, profile = {}) {
-    let text = cleanText(value)
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig, '[邮箱已隐藏]')
-      .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '[手机号已隐藏]')
-      .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, '[证件号已隐藏]');
-    const directSecrets = [profile.fullName, profile.phone, profile.email, profile.identityDocumentNumber, profile.address]
-      .map((item) => cleanText(item)).filter((item) => item.length >= 2);
-    for (const secret of directSecrets) text = text.split(secret).join('[个人信息已隐藏]');
-    return text;
-  }
-
-  function aiProfileContext(profile) {
-    const compactEntries = (entries, keys, limit = 6) => (Array.isArray(entries) ? entries : []).slice(0, limit).map((entry) => {
-      const result = {};
-      for (const key of keys) {
-        const value = redactAIText(entry?.[key], profile);
-        if (value) result[key] = value.slice(0, 500);
-      }
-      return result;
-    }).filter((entry) => Object.keys(entry).length);
-    return {
-      education: compactEntries(profile.educationEntries, ['school', 'college', 'major', 'degree', 'academicDegree', 'studyMode', 'gpa', 'ranking']),
-      work: compactEntries(profile.workEntries, ['company', 'title', 'department', 'type', 'description']),
-      projects: compactEntries(profile.projectEntries, ['name', 'role', 'description']),
-      certificates: compactEntries(profile.certificateEntries, ['name', 'level', 'issuer'], 8),
-      languages: compactEntries(profile.languageEntries, ['name', 'proficiency', 'certificate', 'score'], 8),
-      skills: [profile.computerSkills, profile.computerProficiency, profile.otherSkills, profile.skills]
-        .map((value) => redactAIText(value, profile)).filter(Boolean).map((value) => value.slice(0, 600)),
-      existingSummary: redactAIText(profile.summary, profile).slice(0, 600)
-    };
-  }
-
-  function aiPageContext(profile) {
-    const headings = [...document.querySelectorAll('h1,h2,h3,[role="heading"],[class*="company-name"],[class*="job-title"]')]
-      .filter(visible).map((node) => redactAIText(node.textContent, profile)).filter(Boolean).slice(0, 10);
-    return {
-      title: redactAIText(document.title, profile).slice(0, 180),
-      host: location.hostname,
-      headings
-    };
-  }
-
-  async function requestAIGeneratedText(profile, key, field, element) {
-    if (!AI_GENERATED_TEXT_KEYS.has(key)) return null;
-    const declaredMax = Number(element.maxLength);
-    const maxLength = declaredMax > 0 ? Math.min(declaredMax, 600) : (key === 'whyCompany' ? 220 : 260);
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: 'RESUME_AUTOFILL_AI_GENERATE_TEXT',
-        input: {
-          field: readableField(field, element), key, maxLength,
-          profileContext: aiProfileContext(profile),
-          pageContext: aiPageContext(profile)
-        }
-      });
-      if (!response?.ok || !cleanText(response.value)) {
-        return { value: '', error: response?.reason || 'AI 未返回可填写正文' };
-      }
-      return {
-        value: cleanText(response.value).slice(0, maxLength),
-        reason: response.reason || '根据去标识化经历信息生成'
-      };
-    } catch (error) {
-      return { value: '', error: error?.message || String(error) };
-    }
-  }
-
-  async function fillCustomSelect(element, value, key = '') {
-    const trigger = customSelectTrigger(element);
-    if (!trigger) return false;
-    const snapshot = captureFillState(element, trigger);
-    if (AI_LIST_FIRST_KEYS.has(key)) {
-      const listSession = beginDynamicInteraction(trigger);
-      activateOption(trigger);
-      const listCandidates = await waitForInteractionOptionList(listSession);
-      await settleDynamicInteraction(listSession, element, 'AI 候选读取弹层', false);
-      if (listCandidates.length && await resolveCustomSelectMismatchWithAI(
-        element, trigger, key, value, listCandidates, { silent: true, recordClear: false }
-      )) {
-        trigger.classList.add(FILLED_CLASS);
-        return true;
-      }
-    }
-    const session = beginDynamicInteraction(trigger);
-    activateOption(trigger);
-    // 可编辑地区控件先直接搜索最末级区/县；只读级联控件则保留
-    // 完整路径，依次点击省 → 市 → 区/县。
-    const editableLocation = CASCADE_LOCATION_KEYS.has(key)
-      && !element.readOnly && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement);
-    const fullLocationTargets = selectTargets(key, value, false);
-    let targets = selectTargets(key, value, editableLocation);
-    let locationFallbackUsed = false;
-    const candidateTexts = new Set();
-    const explicitPanel = await waitForExplicitConfirmationPanel(session);
-    if (explicitPanel) {
-      const target = targets.at(-1) || String(value);
-      let confirmed = await fillExplicitConfirmationSelect(
-        session, explicitPanel, element, trigger, target, explicitSelectorSearchValue(key, target)
-      );
-      if (!confirmed && controlValueSatisfied(element, trigger, target, key)) {
-        confirmed = true;
-        fillFailureReasons.delete(element);
-      }
-      if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
-      return confirmed;
-    }
-    const cascaderPanel = CASCADE_LOCATION_KEYS.has(key) ? tabbedLocationPanel(session) : null;
-    if (cascaderPanel) {
-      const confirmed = await fillTabbedLocationSelect(session, cascaderPanel, element, trigger, key, value);
-      if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
-      return confirmed;
-    }
-    let selectedAny = false;
-    for (let level = 0; level < targets.length; level += 1) {
-      const target = targets[level];
-      const match = await findBestCustomSelectOption(session, element, target);
-      for (const candidate of match.preview || []) candidateTexts.add(candidate);
-      const option = match.option;
-      if (!option) {
-        if (editableLocation && !locationFallbackUsed && fullLocationTargets.length > 1) {
-          // 输入区/县后没有可确认候选，说明该组件虽然有 input，但不支持
-          // 跨级搜索。不直接判失败，清空搜索后改用省 → 市 → 区/县。
-          locationFallbackUsed = true;
-          targets = fullLocationTargets;
-          setFocusedInputValue(element, '');
-          activateOption(trigger);
-          await wait(100);
-          level = -1;
-          continue;
-        }
-        const preview = match.preview.length ? `；当前候选：${match.preview.join(' / ')}` : '';
-        const locationStrategy = editableLocation
-          ? (locationFallbackUsed ? '；已尝试直接搜索区/县并回退到省→市→区/县逐级选择' : '；已尝试直接搜索最末级区/县')
-          : '';
-        fillFailureReasons.set(element, `搜索别名并检查下拉候选后仍没有找到安全匹配项${locationStrategy}${preview}`);
-        await settleDynamicInteraction(session, element, '下拉弹层');
-        if (await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts])) {
-          selectedAny = true;
-          continue;
-        }
-        await rollbackFailedControl(element, trigger, snapshot);
-        return false;
-      }
-      candidateTexts.add(cleanText(option.innerText || option.textContent));
-      let activated = await activateInteractionCandidate(session, option, element, target);
-      if (!activated && controlValueSatisfied(element, trigger, target, key)) {
-        activated = true;
-        fillFailureReasons.delete(element);
-      }
-      if (!activated) {
-        if (editableLocation && !locationFallbackUsed && fullLocationTargets.length > 1) {
-          locationFallbackUsed = true;
-          targets = fullLocationTargets;
-          setFocusedInputValue(element, '');
-          activateOption(trigger);
-          await wait(100);
-          level = -1;
-          continue;
-        }
-        await settleDynamicInteraction(session, element, '下拉弹层');
-        if (await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts])) {
-          selectedAny = true;
-          continue;
-        }
-        if (!fillFailureReasons.get(element)) {
-          fillFailureReasons.set(element, `找到了“${target}”候选行，DOM 点击和浏览器级点击后字段仍未回读到该值`);
-        }
-        await settleDynamicInteraction(session, element, '下拉弹层');
-        await rollbackFailedControl(element, trigger, snapshot);
-        return false;
-      }
-      selectedAny = true;
-    }
-    await commitControl(element, trigger);
-    const closed = await settleDynamicInteraction(session, element, '下拉弹层');
-    let confirmed = Boolean(fillAIReviews.get(element)) || (selectedAny && closed
-      && (selectionSatisfied(trigger, element, value) || selectionSatisfied(trigger, element, targets.at(-1))
-        || controlValueSatisfied(element, trigger, value, key)));
-    if (!confirmed) {
-      confirmed = await resolveCustomSelectMismatchWithAI(element, trigger, key, value, [...candidateTexts]);
-    }
-    if (!confirmed) {
-      const locationStrategy = editableLocation
-        ? (locationFallbackUsed ? '（已尝试区/县直接搜索和省→市→区/县逐级选择）' : '（已尝试区/县直接搜索）')
-        : '';
-      if (!fillFailureReasons.get(element) || !/AI /.test(fillFailureReasons.get(element))) {
-        fillFailureReasons.set(element, closed ? `候选项已点击，但字段回读值与目标值不一致${locationStrategy}` : interactionBlocked);
-      }
-    }
-    if (confirmed) trigger.classList.add(FILLED_CLASS);
-    if (!confirmed) await rollbackFailedControl(element, trigger, snapshot);
-    return confirmed;
-  }
-
-  async function fillCustomDate(element, value) {
-    const trigger = customSelectTrigger(element);
-    if (!trigger) return false;
-    const session = beginDynamicInteraction(trigger);
-    try {
-    const structuralDatePanel = () => {
-      const candidates = new Set([
-        ...discoverInteractionRoots(session),
-        ...document.querySelectorAll('[role="dialog"],[role="grid"],[aria-modal="true"]')
-      ]);
-      const dynamicSeeds = [...session.added, ...session.changed].slice(-30);
-      for (const seed of dynamicSeeds) {
-        let node = seed instanceof Element ? seed : seed?.parentElement;
-        for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-          if (node !== document.body && node !== document.documentElement) candidates.add(node);
-        }
-      }
-      return [...candidates]
-        .filter((root) => root instanceof Element && visible(root))
-        .map((root) => {
-          const nodes = [root, ...root.querySelectorAll('button,[role="button"],[role="gridcell"],[role="option"],[tabindex],td,li,div,span')]
-            .filter(visible)
-            .map((node) => cleanText(`${node.getAttribute('aria-label') || ''} ${node.textContent}`))
-            .filter((text) => text && text.length <= 24);
-          const description = `${root.getAttribute('aria-label') || ''} ${root.getAttribute('role') || ''} ${root.className || ''}`;
-          const years = nodes.filter((text) => /(?:19|20)\d{2}(?:年)?/.test(text)).length;
-          const months = nodes.filter((text) => /^(?:0?[1-9]|1[0-2]|一|二|三|四|五|六|七|八|九|十|十一|十二)月?$/.test(text)).length;
-          const days = nodes.filter((text) => /^(?:[1-9]|[12]\d|3[01])(?:日|号)?$/.test(text)).length;
-          const score = (/calendar|date|日期|日历|年月/i.test(description) ? 5 : 0)
-            + (years ? 3 : 0) + (months >= 3 ? 3 : 0) + (days >= 7 ? 4 : 0);
-          const rect = root.getBoundingClientRect();
-          return { root, score, area: rect.width * rect.height };
-        })
-        .filter((item) => item.score >= 6)
-        .sort((left, right) => right.score - left.score || left.area - right.area)[0]?.root || null;
-    };
-    const dateOverlay = () => {
-      const roots = discoverInteractionRoots(session);
-      return roots.find((root) => root.matches?.('[class*="basic-selector-year"],[class*="phoenix-calendar"]')
-        || root.querySelector('[class*="basic-selector-year"],[class*="phoenix-calendar"]'))
-        || [...document.querySelectorAll('[class*="Dropdown-dropdown"],[class*="dropdown-dropdown"],.common-unmodeled-layer,.phoenix-date-picker,.phoenix-date-picker__wrap,.phoenix-calendar')]
-          .find((root) => visible(root) && (root.matches?.('[class*="basic-selector-year"],[class*="phoenix-calendar"]')
-            || root.querySelector('[class*="basic-selector-year"],[class*="phoenix-calendar"]')
-            || /calendar|date|panal/i.test(String(root.className || ''))))
-        || structuralDatePanel();
-    };
-    const waitForDateOverlay = async (timeout = 1200) => {
-      const started = Date.now();
-      while (Date.now() - started < timeout) {
-        const panel = dateOverlay();
-        if (panel) return panel;
-        await wait(30);
-      }
-      return dateOverlay() || null;
-    };
-    const label = element.closest('label,[class*="picker-input"],[class*="Picker-input"]');
-    const icon = label?.querySelector('[class*="calendar"],[class*="Calendar"],[class*="picker-addon"],[class*="Picker-addon"]');
-    const openTargets = [...new Set([element, label, icon, trigger].filter(Boolean))];
-    let openedPanel = null;
-    for (const target of openTargets) {
-      activateOption(target);
-      openedPanel = await waitForDateOverlay(900);
-      if (openedPanel) break;
-    }
-    if (!openedPanel) {
-      for (const target of openTargets) {
-        const trusted = await trustedClick(target);
-        if (trusted?.ok) openedPanel = await waitForDateOverlay(1600);
-        if (openedPanel) break;
-      }
-    }
-    if (!openedPanel) {
-      fillFailureReasons.set(element, '已点击日期输入框、日期标签和日历图标，但没有出现日期弹层');
-      session.stop();
-      return false;
-    }
-    rememberInteractionRoot(session, openedPanel);
-    const match = String(value).match(/((?:19|20)\d{2})[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?/);
-    if (!match) {
-      fillFailureReasons.set(element, `资料日期“${value}”无法解析为年月日`);
-      return false;
-    }
-    // 完整日期不能走普通“精确文本候选”捷径。日历网格、顶部输入或其他隐藏节点
-    // 可能恰好出现目标文本，但那不等于控件已经完成年/月/日选择。
-    async function waitUntil(test, timeout = 1200) {
-      const started = Date.now();
-      while (Date.now() - started < timeout) {
-        const result = test();
-        if (result) return result;
-        await wait(35);
-      }
-      return test() || null;
-    }
-    async function fastComponentClick(target, changed) {
-      if (!target) return false;
-      activateOption(target);
-      if (await waitUntil(changed, 450)) return true;
-      const trusted = await trustedClick(target);
-      return Boolean(trusted?.ok && await waitUntil(changed, 1200));
-    }
-    const currentPhoenixDatePanel = () => {
-      const roots = discoverInteractionRoots(session);
-      const root = roots.find((candidate) => candidate.matches?.('.phoenix-calendar-date-panel,.phoenix-calendar,.phoenix-date-picker__wrap,.phoenix-date-picker')
-        && candidate.querySelector('.phoenix-calendar-table'))
-        || roots.find((candidate) => candidate.querySelector('.phoenix-calendar-date-panel .phoenix-calendar-table'))
-        || [...document.querySelectorAll('.phoenix-date-picker,.phoenix-date-picker__wrap,.phoenix-calendar,.phoenix-calendar-date-panel')]
-          .find((candidate) => visible(candidate) && candidate.querySelector('.phoenix-calendar-table'));
-      if (!root) return null;
-      const calendar = root.matches?.('.phoenix-calendar')
-        ? root
-        : root.closest?.('.phoenix-calendar') || root.querySelector?.('.phoenix-calendar');
-      return calendar && visible(calendar) ? calendar : root;
-    };
-    const phoenixDatePanel = await waitUntil(currentPhoenixDatePanel, 1500);
-    if (phoenixDatePanel) {
-      rememberInteractionRoot(session, phoenixDatePanel);
-      const targetYear = Number(match[1]);
-      const targetMonth = Number(match[2]);
-      const targetDay = match[3] ? Number(match[3]) : null;
-      const yearNumber = () => Number(cleanText(currentPhoenixDatePanel()?.querySelector('.phoenix-calendar-year-select')?.textContent)
-        .match(/(?:19|20)\d{2}/)?.[0]);
-      const monthNumber = () => Number(cleanText(currentPhoenixDatePanel()?.querySelector('.phoenix-calendar-month-select')?.textContent)
-        .match(/\d{1,2}/)?.[0]);
-      if (!yearNumber() || !monthNumber()) {
-        fillFailureReasons.set(element, '已打开完整日期面板，但无法读取当前年份或月份标题');
-        return false;
-      }
-      async function clickLivePhoenix(selector, changed) {
-        let target = currentPhoenixDatePanel()?.querySelector(selector);
-        if (!target) return false;
-        activateOption(target);
-        if (await waitUntil(changed, 450)) return true;
-        // 普通事件之后组件可能替换箭头节点，浏览器级点击前必须重新定位当前节点。
-        target = currentPhoenixDatePanel()?.querySelector(selector);
-        if (!target) return Boolean(await waitUntil(changed, 60));
-        const trusted = await trustedClick(target);
-        return Boolean(trusted?.ok && await waitUntil(changed, 1200));
-      }
-
-      // 先只移动年份，避免用月份箭头跨年后又重新推导当前层级。
-      for (let step = 0; step < 160 && yearNumber() && yearNumber() !== targetYear; step += 1) {
-        const beforeYear = yearNumber();
-        const selector = targetYear < beforeYear
-          ? '.phoenix-calendar-prev-year-btn'
-          : '.phoenix-calendar-next-year-btn';
-        if (!await clickLivePhoenix(selector, () => yearNumber() && yearNumber() !== beforeYear)) {
-          fillFailureReasons.set(element, `日期面板无法从 ${beforeYear} 年移动到 ${targetYear} 年`);
-          return false;
-        }
-      }
-      if (yearNumber() !== targetYear) {
-        fillFailureReasons.set(element, `日期面板年份没有到达 ${targetYear} 年`);
-        return false;
-      }
-
-      // 年份正确后再在该年内移动月份，最多十一格，不会跨出目标年份。
-      for (let step = 0; step < 12 && monthNumber() && monthNumber() !== targetMonth; step += 1) {
-        const beforeMonth = monthNumber();
-        const selector = targetMonth < beforeMonth
-          ? '.phoenix-calendar-prev-month-btn'
-          : '.phoenix-calendar-next-month-btn';
-        if (!await clickLivePhoenix(selector, () => monthNumber() && monthNumber() !== beforeMonth)) {
-          fillFailureReasons.set(element, `日期面板无法从 ${beforeMonth} 月移动到 ${targetMonth} 月`);
-          return false;
-        }
-      }
-      if (yearNumber() !== targetYear || monthNumber() !== targetMonth) {
-        fillFailureReasons.set(element, `日期面板没有到达 ${targetYear}-${String(targetMonth).padStart(2, '0')}`);
-        return false;
-      }
-
-      if (!targetDay) {
-        const confirmed = selectionSatisfied(trigger, element, value);
-        if (confirmed) await commitControl(element, trigger);
-        return confirmed;
-      }
-      const currentDayCell = () => {
-        const livePanel = currentPhoenixDatePanel();
-        const dayCells = [...(livePanel?.querySelectorAll('.phoenix-calendar-cell') || [])]
-          .filter(visible)
-          .filter((cell) => !/last-month|next-month|outside|disabled/i.test(String(cell.className || '')))
-          .filter((cell) => cell.getAttribute('aria-disabled') !== 'true');
-        return dayCells.find((cell) => {
-          const date = cell.querySelector('.phoenix-calendar-date,[aria-selected]');
-          return date && date.getAttribute('aria-disabled') !== 'true' && Number(cleanText(date.textContent)) === targetDay;
-        }) || null;
-      };
-      const dayCell = currentDayCell();
-      if (!dayCell) {
-        fillFailureReasons.set(element, `已经到达目标年月，但当月没有找到 ${targetDay} 日`);
-        return false;
-      }
-      const targetDate = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
-      const normalizeFullDate = (raw) => {
-        const parsed = String(raw || '').match(/((?:19|20)\d{2})[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?/);
-        if (!parsed || !parsed[3]) return '';
-        return `${parsed[1]}-${String(Number(parsed[2])).padStart(2, '0')}-${String(Number(parsed[3])).padStart(2, '0')}`;
-      };
-      const dateAccepted = () => {
-        const dateInput = currentPhoenixDatePanel()?.querySelector('.phoenix-calendar-input');
-        const display = trigger.querySelector?.('[class*="display-value"],[class*="selected-value"],[class*="date-value"]');
-        const readings = [
-          element.value,
-          display?.textContent,
-          dateInput?.value
-        ].map(normalizeFullDate).filter(Boolean);
-        return readings.includes(targetDate);
-      };
-      let clicked = false;
-      for (const kind of ['text', 'cell']) {
-        let liveCell = currentDayCell();
-        let target = kind === 'text' ? liveCell?.querySelector('.phoenix-calendar-date,[aria-selected]') : liveCell;
-        if (!target) continue;
-        activateOption(target);
-        clicked = Boolean(await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 900));
-        if (!clicked) {
-          liveCell = currentDayCell();
-          target = kind === 'text' ? liveCell?.querySelector('.phoenix-calendar-date,[aria-selected]') : liveCell;
-          const trusted = target ? await trustedClick(target) : null;
-          clicked = Boolean(trusted?.ok && await waitUntil(() => dateAccepted() || !currentPhoenixDatePanel(), 1600));
-        }
-        if (clicked && dateAccepted()) break;
-      }
-      if (!clicked || !dateAccepted()) {
-        fillFailureReasons.set(element, `已点击 ${targetDate}，但日期控件没有接受该值`);
-        return false;
-      }
-      await commitControl(element, trigger);
-      return true;
-    }
-    const phoenixPanel = await waitUntil(() => {
-      const roots = discoverInteractionRoots(session);
-      return roots.find((root) => root.querySelector('.phoenix-calendar-month-panel-year-select-content'))
-        || [...document.querySelectorAll('.common-unmodeled-layer .phoenix-date-picker')]
-          .find((root) => visible(root) && !session.beforeVisible.has(root)
-            && root.querySelector('.phoenix-calendar-month-panel-year-select-content'));
-    }, 1500);
-    if (phoenixPanel) {
-      rememberInteractionRoot(session, phoenixPanel);
-      const yearNumber = () => Number(cleanText(phoenixPanel.querySelector('.phoenix-calendar-month-panel-year-select-content')?.textContent)
-        .match(/(?:19|20)\d{2}/)?.[0]);
-      const previousYear = () => phoenixPanel.querySelector('.phoenix-calendar-month-panel-prev-year-btn');
-      const nextYear = () => phoenixPanel.querySelector('.phoenix-calendar-month-panel-next-year-btn');
-      for (let step = 0; step < 160 && yearNumber() && yearNumber() !== Number(match[1]); step += 1) {
-        const beforeYear = yearNumber();
-        const arrow = Number(match[1]) < beforeYear ? previousYear() : nextYear();
-        if (!await fastComponentClick(arrow, () => yearNumber() && yearNumber() !== beforeYear)) return false;
-      }
-      if (yearNumber() !== Number(match[1])) return false;
-      const monthText = `${Number(match[2])}月`;
-      const month = [...phoenixPanel.querySelectorAll('.phoenix-calendar-month-panel-month')]
-        .find((node) => cleanText(node.textContent) === monthText);
-      const monthCell = month?.closest('[role="gridcell"]') || month;
-      if (!monthCell) return false;
-      const ok = await fastComponentClick(monthCell, () => {
-        const shown = cleanText(`${element.value || ''} ${trigger.textContent || ''}`).replace(/[年月日号/.]/g, '-').replace(/\s+/g, '');
-        return shown.includes(match[1]) && new RegExp(`(?:^|-)0?${Number(match[2])}(?:-|$)`).test(shown);
-      });
-      if (ok) await commitControl(element, trigger);
-      return ok;
-    }
-    const sdPanel = await waitUntil(() => {
-      const roots = discoverInteractionRoots(session);
-      return roots.find((root) => root.querySelector('[class*="basic-selector-year"],[class*="basic-year-container"]'))
-        || [...trigger.querySelectorAll('[class*="Dropdown-dropdown"],[class*="dropdown-dropdown"]')]
-          .find((root) => visible(root) && root.querySelector('[class*="basic-selector-year"],[class*="basic-year-container"]'));
-    }, 700);
-    if (sdPanel) {
-      rememberInteractionRoot(session, sdPanel);
-      const yearText = () => cleanText(sdPanel.querySelector('[class*="basic-selector-year"]')?.textContent);
-      const yearNumber = () => Number(yearText().match(/(?:19|20)\d{2}/)?.[0]);
-      const left = () => sdPanel.querySelector('[class*="icondoubleLeft"]');
-      const right = () => sdPanel.querySelector('[class*="icondoubleRight"]');
-      for (let step = 0; step < 160 && yearNumber() && yearNumber() !== Number(match[1]); step += 1) {
-        const beforeYear = yearNumber();
-        const arrow = Number(match[1]) < beforeYear ? left() : right();
-        if (!await fastComponentClick(arrow, () => yearNumber() && yearNumber() !== beforeYear)) return false;
-      }
-      if (yearNumber() !== Number(match[1])) return false;
-      const monthNames = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'];
-      const currentMonthNumber = () => {
-        const text = cleanText(sdPanel.querySelector('[class*="basic-selector-month"]')?.textContent);
-        const numeric = text.match(/\d{1,2}/)?.[0];
-        return numeric ? Number(numeric) : monthNames.indexOf(text) + 1;
-      };
-      // SD 的完整日期面板把年份和月份放在两个相邻标题中，下面直接显示日网格。
-      // 这种结构不能走“点击十二个月列表”的分支，需要用单箭头移动月份后点击当月日期。
-      if (match[3] && currentMonthNumber()) {
-        for (let step = 0; step < 24 && (yearNumber() !== Number(match[1]) || currentMonthNumber() !== Number(match[2])); step += 1) {
-          const before = `${yearNumber()}-${currentMonthNumber()}`;
-          const currentIndex = yearNumber() * 12 + currentMonthNumber();
-          const targetIndex = Number(match[1]) * 12 + Number(match[2]);
-          const arrow = targetIndex < currentIndex
-            ? sdPanel.querySelector('[class*="iconleft-"]')
-            : sdPanel.querySelector('[class*="iconright-"]');
-          if (!await fastComponentClick(arrow, () => `${yearNumber()}-${currentMonthNumber()}` !== before)) return false;
-        }
-        if (yearNumber() !== Number(match[1]) || currentMonthNumber() !== Number(match[2])) return false;
-        const targetDay = Number(match[3]);
-        const dayCell = [...sdPanel.querySelectorAll('[class*="basic-item-wrapper"]')]
-          .filter(visible)
-          .filter((cell) => !/fade|disabled|outside/i.test(String(cell.className || '')))
-          .find((cell) => Number(cleanText(cell.querySelector('[class*="basic-date-item"]')?.textContent)) === targetDay);
-        if (!dayCell) return false;
-        const ok = await fastComponentClick(dayCell, () => !visible(sdPanel) || selectionSatisfied(trigger, element, value));
-        if (ok) await commitControl(element, trigger);
-        return ok && (selectionSatisfied(trigger, element, value) || !visible(sdPanel));
-      }
-      const monthName = monthNames[Number(match[2]) - 1];
-      const monthText = [...sdPanel.querySelectorAll('[class*="basic-year-item"]')]
-        .find((node) => cleanText(node.textContent) === monthName);
-      const monthCell = monthText?.closest('[class*="basic-year-wrapper"]') || monthText;
-      if (!monthCell) return false;
-      if (!match[3]) {
-        const ok = await fastComponentClick(monthCell, () => selectionSatisfied(trigger, element, value) || !visible(sdPanel));
-        if (ok) await commitControl(element, trigger);
-        return ok;
-      }
-      const previousMonthCell = monthCell;
-      if (!await fastComponentClick(monthCell, () => !previousMonthCell.isConnected
-        || !visible(previousMonthCell)
-        || !sdPanel.querySelector('[class*="basic-year-container"]'))) return false;
-      const dayValue = String(Number(match[3]));
-      const dayText = await waitUntil(() => [...sdPanel.querySelectorAll('[class*="day"],[class*="date"],[class*="basic-item"],[class*="panal"] *')]
-        .filter((node) => visible(node) && cleanText(node.textContent) === dayValue)
-        .find((node) => ![...node.children].some((child) => visible(child) && cleanText(child.textContent) === dayValue)), 700);
-      if (!dayText) return false;
-      const dayCell = dayText.closest('[class*="wrapper"],[class*="item"],[role="gridcell"],button') || dayText;
-      const ok = await fastComponentClick(dayCell, () => {
-        const shown = cleanText(`${element.value || ''} ${trigger.textContent || ''}`).replace(/[年月日号/.]/g, '-').replace(/\s+/g, '');
-        return shown.includes(match[1])
-          && new RegExp(`(?:^|-)0?${Number(match[2])}(?:-|$)`).test(shown)
-          && new RegExp(`(?:^|-)0?${dayValue}(?:-|$)`).test(shown);
-      });
-      if (ok) await commitControl(element, trigger);
-      return ok;
-    }
-    const shortClickable = () => {
-      const dateRoots = [...new Set([openedPanel, ...discoverInteractionRoots(session)].filter((root) => root instanceof Element && visible(root)))];
-      const genericPanelNodes = dateRoots.flatMap((root) => [...root.querySelectorAll('*')])
-        .filter((node) => {
-          const text = cleanText(`${node.getAttribute('aria-label') || ''} ${node.textContent}`);
-          if (!text || text.length > 16) return false;
-          return interactionHint(node) || interactionHint(node.parentElement) || node.children.length === 0;
-        });
-      const candidates = [...new Set([
-        ...document.querySelectorAll('[role="option"], [role="gridcell"], button, li, [tabindex], [class*="date"], [class*="Date"], [class*="calendar"], [class*="Calendar"], [class*="year"], [class*="Year"], [class*="month"], [class*="Month"], [class*="day"], [class*="Day"]'),
-        ...genericPanelNodes
-      ])]
-        .filter((node) => interactionRelated(session, node) && cleanText(node.textContent).length <= 16)
-        .filter((node) => !node.disabled && node.getAttribute('aria-disabled') !== 'true' && !/disabled|outside|other.?month/i.test(String(node.className || '')));
-      const leaves = candidates.filter((candidate) => !candidates.some((other) => other !== candidate && candidate.contains(other) && cleanText(candidate.textContent) === cleanText(other.textContent)));
-      leaves.forEach((candidate) => rememberInteractionRoot(session, candidate));
-      return leaves;
-    };
-    const panelStarted = Date.now();
-    while (Date.now() - panelStarted < INTERACTION_TIMEOUT && !shortClickable().length) await wait(60);
-    async function clickDateToken(pattern) {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const candidate = shortClickable().find((node) => pattern.test(cleanText(node.textContent)));
-        if (!candidate) return false;
-        activateOption(candidate);
-        await wait(100);
-        const next = shortClickable().find((node) => pattern.test(cleanText(node.textContent)));
-        if (!next || next !== candidate) return true;
-      }
-      return true;
-    }
-    function yearHeader() {
-      return shortClickable().find((node) => /^(?:19|20)\d{2}(?:年)?$/.test(cleanText(node.textContent)));
-    }
-    function yearNavigation(header, direction) {
-      if (!header) return null;
-      const roots = [header.parentElement, header.parentElement?.parentElement].filter(Boolean);
-      for (const root of roots) {
-        const candidates = [...root.querySelectorAll('button,[role="button"],[tabindex],[aria-label],[title],[class*="prev"],[class*="Prev"],[class*="next"],[class*="Next"],[class*="left"],[class*="Left"],[class*="right"],[class*="Right"]')]
-          .filter((node) => node !== header && visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-        const semantic = candidates.find((node) => {
-          const description = `${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''} ${node.className || ''} ${cleanText(node.textContent)}`;
-          return direction < 0 ? /prev|previous|上一|向前|左/i.test(description) : /next|下一|向后|右/i.test(description);
-        });
-        if (semantic) return semantic;
-        const headerCenter = header.getBoundingClientRect().left + header.getBoundingClientRect().width / 2;
-        const sided = candidates.filter((node) => {
-          const center = node.getBoundingClientRect().left + node.getBoundingClientRect().width / 2;
-          return direction < 0 ? center < headerCenter : center > headerCenter;
-        }).sort((left, right) => {
-          const leftDistance = Math.abs((left.getBoundingClientRect().left + left.getBoundingClientRect().width / 2) - headerCenter);
-          const rightDistance = Math.abs((right.getBoundingClientRect().left + right.getBoundingClientRect().width / 2) - headerCenter);
-          return leftDistance - rightDistance;
-        });
-        if (sided[0]) return sided[0];
-      }
-      return null;
-    }
-    async function navigateToYear(targetYear) {
-      for (let step = 0; step < 160; step += 1) {
-        const header = yearHeader();
-        const current = Number(cleanText(header?.textContent).match(/(?:19|20)\d{2}/)?.[0]);
-        if (!current) return false;
-        if (current === Number(targetYear)) return true;
-        const direction = Number(targetYear) < current ? -1 : 1;
-        const navigation = yearNavigation(header, direction);
-        if (!navigation) return false;
-        activateOption(navigation);
-        await wait(55);
-      }
-      return false;
-    }
-    const currentMonthHeader = shortClickable().find((node) => /^(?:19|20)\d{2}\s*年?\s*(?:0?[1-9]|1[0-2])\s*月$/.test(cleanText(node.textContent)));
-    const currentMonthMatch = cleanText(currentMonthHeader?.textContent).match(/^((?:19|20)\d{2})\s*年?\s*(\d{1,2})\s*月$/);
-    if (match[3] && currentMonthMatch && currentMonthMatch[1] === match[1] && Number(currentMonthMatch[2]) === Number(match[2])) {
-      const dayNumber = String(Number(match[3]));
-      if (!await clickDateToken(new RegExp(`^(?:${dayNumber}|${match[3]})(?:日|号)?$`))) return false;
-      await wait(80);
-      const shown = cleanText(`${element.value || ''} ${trigger.textContent || ''}`).replace(/[年月日号/.]/g, '-').replace(/\s+/g, '');
-      const confirmed = Boolean(element.value) && shown.includes(match[1])
-        && new RegExp(`(?:^|-)0?${Number(match[2])}(?:-|$)`).test(shown)
-        && new RegExp(`(?:^|-)0?${dayNumber}(?:-|$)`).test(shown);
-      if (confirmed) await commitControl(element, trigger);
-      return confirmed;
-    }
-    // 另一类日期面板固定显示“1990年”并通过左右箭头逐年翻页，下面直接列出十二个月。
-    // 这种面板没有可点击的年份列表，先导航到目标年，再进入月份/日期。
-    if (yearHeader() && shortClickable().some((node) => /^(?:一|二|三|四|五|六|七|八|九|十|十一|十二)月$/.test(cleanText(node.textContent)))) {
-      if (!await navigateToYear(match[1])) return false;
-      const monthName = ['一','二','三','四','五','六','七','八','九','十','十一','十二'][Number(match[2]) - 1];
-      if (!await clickDateToken(new RegExp(`^(?:${Number(match[2])}|${match[2]}|${monthName})(?:月)?$`))) return false;
-      if (match[3]) {
-        const dayNumber = String(Number(match[3]));
-        if (!await clickDateToken(new RegExp(`^(?:${dayNumber}|${match[3]})(?:日|号)?$`))) return false;
-      }
-      await commitControl(element, trigger);
-      const shown = cleanText(`${element.value || ''} ${trigger.textContent || ''}`).replace(/[年月日号/.]/g, '-').replace(/\s+/g, '');
-      return shown.includes(match[1])
-        && new RegExp(`(?:^|-)0?${Number(match[2])}(?:-|$)`).test(shown)
-        && (!match[3] || new RegExp(`(?:^|-)0?${Number(match[3])}(?:-|$)`).test(shown));
-    }
-    for (let attempt = 0; attempt < 3 && !shortClickable().some((node) => new RegExp(`^${match[1]}(?:年)?$`).test(cleanText(node.textContent))); attempt += 1) {
-      const calendarHeader = shortClickable().find((node) => /^(?:19|20)\d{2}\s*年?\s*(?:0?[1-9]|1[0-2])\s*月$/.test(cleanText(node.textContent)))
-        || shortClickable().find((node) => /^(?:19|20)\d{2}(?:年)?$/.test(cleanText(node.textContent)));
-      if (!calendarHeader) break;
-      activateOption(calendarHeader);
-      await wait(120);
-    }
-    if (!await clickDateToken(new RegExp(`^${match[1]}(?:年)?$`))) return false;
-    const monthNumber = String(Number(match[2]));
-    if (!await clickDateToken(new RegExp(`^(?:${monthNumber}|${match[2]}|${['一','二','三','四','五','六','七','八','九','十','十一','十二'][Number(match[2]) - 1]})(?:月)?$`))) return false;
-    if (match[3]) {
-      const dayNumber = String(Number(match[3]));
-      if (!await clickDateToken(new RegExp(`^(?:${dayNumber}|${match[3]})(?:日|号)?$`))) return false;
-    }
-    await wait(80);
-    const shown = cleanText(`${element.value || ''} ${trigger.textContent || ''}`);
-    const targetYear = match[1];
-    const targetMonth = String(Number(match[2]));
-    const targetDay = match[3] ? String(Number(match[3])) : '';
-    const normalizedShown = shown.replace(/[年月日号/.]/g, '-').replace(/\s+/g, '');
-    const dateConfirmed = Boolean(element.value) && normalizedShown.includes(targetYear)
-      && new RegExp(`(?:^|-)0?${targetMonth}(?:-|$)`).test(normalizedShown)
-      && (!targetDay || new RegExp(`(?:^|-)0?${targetDay}(?:-|$)`).test(normalizedShown));
-    if (dateConfirmed) await commitControl(element, trigger);
-    return dateConfirmed;
-    } finally {
-      const closed = await settleDynamicInteraction(session, element, '日期弹层');
-      if (!closed) {
-        fillFailureReasons.set(element, interactionBlocked);
-        return false;
-      }
-    }
-  }
-
-  function customChoiceGroups() {
-    const candidates = [...document.querySelectorAll([
-      '[role="radiogroup"]',
-      '.phoenix-radio-group',
-      '[class*="radio-group"]',
-      '[class*="radioGroup"]',
-      '[class*="RadioGroup"]'
-    ].join(','))];
-    const roots = candidates
-      .filter((group) => {
-        const optionCount = group.querySelectorAll('[role="radio"],input[type="radio"],[class*="radioItem"],[class*="radio-item"]').length;
-        return optionCount >= 2 && visible(group);
-      })
-      .filter((group) => !candidates.some((other) => other !== group && other.contains(group)
-        && other.querySelectorAll('[role="radio"],input[type="radio"],[class*="radioItem"],[class*="radio-item"]').length >= 2));
-    return roots.map((group) => {
-      const container = semanticContainer(group);
-      // Walk until the option group and a title-like sibling share one root.
-      // This avoids stopping at wrappers such as `form-item__control`.
-      let fieldRoot = null;
-      for (let ancestor = group.parentElement, depth = 0; ancestor && depth < 10; ancestor = ancestor.parentElement, depth += 1) {
-        const outsideTitle = [...ancestor.querySelectorAll('label,legend,[class*="title"],[class*="Title"],[class*="field-label"],[class*="form-item__text"]')]
-          .some((node) => !group.contains(node) && !node.contains(group) && Boolean(cleanText(node.textContent)));
-        if (outsideTitle) {
-          fieldRoot = ancestor;
-          break;
-        }
-      }
-      fieldRoot ||= container || group.parentElement;
-      const titleCandidates = fieldRoot ? [...fieldRoot.querySelectorAll([
-        ':scope > [class*="title"]',
-        ':scope > [class*="Title"]',
-        ':scope > label',
-        '[class*="form-item__text"]',
-        '[class*="field-title"]',
-        '[class*="field-label"]'
-      ].join(','))] : [];
-      const explicitTitle = titleCandidates.find((node) => {
-        const label = cleanText(node.textContent);
-        return !group.contains(node) && !node.contains(group) && Boolean(label) && label.length <= 80;
-      });
-      const text = cleanText(explicitTitle?.textContent) || directSemanticLabels(container || group, group)[0] || '';
-      const rawOptions = [...group.querySelectorAll('[role="radio"],input[type="radio"],label,button,[class*="radioItem"],[class*="radio-item"],[class*="radio-text"],[class*="RadioItem"]')]
-        .filter((node) => node !== group && cleanText(node.textContent || node.value));
-      const options = [...new Set(rawOptions.map((node) => {
-        return node.closest('[role="radio"],label,button,[class*="radioItem"],[class*="radio-item"]')
-          || node.closest('[class~="phoenix-radio"]')
-          || node;
-      }))].filter((node) => group.contains(node) && cleanText(node.textContent || node.value));
-      return { group, container: fieldRoot || container, text, options };
-    }).filter(({ options }) => options.length >= 2);
-  }
-
-  function customChoiceChecked(option) {
-    if (!(option instanceof Element)) return false;
-    if (option.matches('input[type="radio"]:checked,[aria-checked="true"]')) return true;
-    if (/(?:^|\s|--)checked(?:\s|$)|(?:^|\s)selected(?:\s|$)/i.test(String(option.className || ''))) return true;
-    return Boolean(option.querySelector('input[type="radio"]:checked,[aria-checked="true"],[class*="--checked"],[class~="checked"],[class~="selected"]'));
-  }
-
-  function customChoiceIsDeclaredDefault(option) {
-    if (!(option instanceof Element)) return false;
-    const input = option.matches('input[type="radio"]') ? option : option.querySelector('input[type="radio"]');
-    if (input?.defaultChecked) return true;
-    return option.matches('[data-default="true"],[data-is-default="true"]')
-      || Boolean(option.querySelector('[data-default="true"],[data-is-default="true"]'));
-  }
-
-  function liveCustomChoice(group, value, fallback = null) {
-    const candidates = [...group.querySelectorAll('[role="radio"],input[type="radio"],label,button,[class*="radioItem"],[class*="radio-item"],[class*="radio-text"],[class*="RadioItem"]')]
-      .filter((node) => choiceMatches(node.textContent || node.value, value));
-    const exactTargets = normalizedChoices(value).map(normalizedExactText);
-    const normalized = [...new Set(candidates.map((node) => {
-      return node.closest('[role="radio"],label,button,[class*="radioItem"],[class*="radio-item"]')
-        || node.closest('[class~="phoenix-radio"]')
-        || node;
-    }))].filter((node) => group.contains(node));
-    return normalized.find((node) => exactTargets.includes(normalizedExactText(node.textContent || node.value)))
-      || normalized[0]
-      || (fallback?.isConnected && group.contains(fallback) ? fallback : null);
-  }
-
-  async function waitForCustomChoiceChecked(group, value, fallback, timeout = 140) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const option = liveCustomChoice(group, value, fallback);
-      if (customChoiceChecked(option)) return option;
-      await wait(35);
-    }
-    const option = liveCustomChoice(group, value, fallback);
-    return customChoiceChecked(option) ? option : null;
-  }
-
-  async function activateCustomChoice(group, option, value) {
-    const targets = () => {
-      const live = liveCustomChoice(group, value, option);
-      if (!live) return [];
-      const radio = live.matches('[class~="phoenix-radio"],[role="radio"],input[type="radio"]')
-        ? live
-        : live.querySelector('[class~="phoenix-radio"],[role="radio"],input[type="radio"]');
-      const wrapper = live.querySelector('[class*="radio__wrapper"],[class*="radio-wrapper"]');
-      const circle = live.querySelector('[class*="circle-wrapper"],[class*="radio__circle"]');
-      const label = live.querySelector('[class*="radio-text"],[class*="label"]');
-      return [...new Set([wrapper || live, radio || circle, label].filter(Boolean))].slice(0, 3);
-    };
-    for (const target of targets()) {
-      activateOption(target);
-      const checked = await waitForCustomChoiceChecked(group, value, option);
-      if (checked) return checked;
-    }
-    for (const target of targets()) {
-      const trusted = await trustedClick(target);
-      if (trusted?.ok) {
-        const checked = await waitForCustomChoiceChecked(group, value, option, 400);
-        if (checked) return checked;
-      }
-    }
-    return null;
-  }
-
-  function customChoiceDescription(text, options) {
-    const title = cleanText(text) || '未命名单选组';
-    const labels = options.map((node) => cleanText(node.textContent || node.value)).filter(Boolean).slice(0, 8);
-    return `${title} [${labels.join(' / ')}]`;
-  }
-
-  async function fillCustomChoices(profile, stats, overwrite, processedGroups, finalPass = false) {
-    const choiceOccurrences = new Map();
-    for (const { group, container, text, options } of customChoiceGroups()) {
-      const description = customChoiceDescription(text, options);
-      const context = sectionContext(container);
-      const key = matchKey(text.toLowerCase(), context);
-      if (!key) {
-        if (processedGroups?.has(group)) continue;
-        // The group can be mounted before its title. Give the framework one more
-        // render cycle before treating it as an unknown field.
-        if (!finalPass) continue;
-        processedGroups?.add(group);
-        markFillResult(group, UNMATCHED_CLASS);
-        stats.unmatched += 1;
-        if (stats.details.unmatched.length < 8) stats.details.unmatched.push(`${description}（发现了需要勾选的按钮组，但未识别字段标题）`);
-        recordDiagnostic(stats, 'unmatched', {
-          field: description, stage: '单选/按钮组语义映射',
-          reason: '已识别为可交互选项组，但区块标题未命中本地资料字段；为避免乱选，没有点击'
-        });
-        continue;
-      }
-      const occurrenceKey = `${context || 'global'}:${key}`;
-      const fallbackOccurrence = choiceOccurrences.get(occurrenceKey) || 0;
-      const educationResolution = educationMappedKey(key)
-        ? educationEntryResolution(profile, text, fallbackOccurrence)
-        : { explicit: false, index: fallbackOccurrence, label: '' };
-      const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
-      if (!educationResolution.explicit) choiceOccurrences.set(occurrenceKey, fallbackOccurrence + 1);
-      // The final framework-render pass must still count groups completed in the
-      // first pass, otherwise later education rows shift back to occurrence 0.
-      if (processedGroups?.has(group)) continue;
-      const value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
-      if (!value) {
-        processedGroups?.add(group);
-        markFillResult(container || group, MISSING_CLASS);
-        stats.missingData += 1;
-        if (stats.details.missingData.length < 8) stats.details.missingData.push(`${description} → ${key}`);
-        recordDiagnostic(stats, 'missingData', {
-          field: description, key, stage: '本地资料取值',
-          reason: educationResolution.explicit && occurrence < 0
-            ? `页面选项组明确指定${educationResolution.label}，但本地资料中没有对应教育经历；未点击任何选项`
-            : `选项组已映射为 ${key}，但本地资料第 ${occurrence + 1} 个对应值为空；未点击任何选项`
-        });
-        continue;
-      }
-      const option = options
-        .map((node) => ({ node, score: choiceMatchScore(node.textContent, value) }))
-        .filter(({ score }) => score >= 60)
-        .sort((left, right) => right.score - left.score)[0]?.node;
-      if (!option) {
-        if (!finalPass) continue;
-        processedGroups?.add(group);
-        markFillResult(group, FAILED_CLASS);
-        stats.unsupported += 1;
-        if (stats.details.unsupported.length < 8) stats.details.unsupported.push(`${description} → ${key}（没有与“${value}”匹配的选项）`);
-        recordDiagnostic(stats, 'unsupported', {
-          field: description, key, target: value,
-          observed: options.map((node) => cleanText(node.textContent || node.value)).filter(Boolean).slice(0, 10).join(' / '),
-          stage: '候选匹配', reason: '已读取页面选项，但没有任何选项达到安全匹配阈值'
-        });
-        continue;
-      }
-      const selected = options.find(customChoiceChecked);
-      processedGroups?.add(group);
-      const selectedIsDefault = customChoiceIsDeclaredDefault(selected);
-      if (selected && selected !== option && !overwrite && !selectedIsDefault) {
-        markFillResult(container || group, EXISTING_CLASS);
-        stats.existing += 1;
-        const observed = cleanText(selected.textContent || selected.value);
-        stats.details.existing.push(`${cleanText(text) || '单选组'}（页面已有：${observed}）`);
-        recordDiagnostic(stats, 'existing', {
-          field: description, key, target: value, observed, stage: '填写前检查',
-          reason: '页面已选中非默认选项，且未开启覆盖'
-        });
-        continue;
-      }
-      if (selected === option && !selectedIsDefault) {
-        markFillResult(container || group, EXISTING_CLASS);
-        stats.existing += 1;
-        const observed = cleanText(selected.textContent || selected.value);
-        stats.details.existing.push(`${cleanText(text) || '单选组'}（页面已符合：${observed}）`);
-        recordDiagnostic(stats, 'existing', {
-          field: description, key, target: value, observed, stage: '填写前检查',
-          reason: '页面已选中与目标一致的非默认选项，无需再点击'
-        });
-        continue;
-      }
-      const checked = await activateCustomChoice(group, option, value);
-      if (checked) {
-        checked.classList.add(FILLED_CLASS);
-        container?.classList.add(FILLED_CLASS);
-        stats.filled += 1;
-      } else {
-        markFillResult(container || group, FAILED_CLASS);
-        stats.unsupported += 1;
-        if (stats.details.unsupported.length < 8) {
-          stats.details.unsupported.push(`${cleanText(text)} → ${key}（找到了“${value}”选项，但点击后没有出现 checked 状态）`);
-        }
-        recordDiagnostic(stats, 'unsupported', {
-          field: description, key, target: value,
-          observed: options.filter(customChoiceChecked).map((node) => cleanText(node.textContent || node.value)).join(' / '),
-          stage: '点击后选中状态验证',
-          reason: '找到了安全匹配选项并已尝试 DOM/浏览器级点击，但回读不到 checked/aria-checked/选中类名'
-        });
-      }
-    }
-  }
-
-  function datePart(element, fallbackIndex = -1) {
-    const placeholder = (element.placeholder || '').trim();
-    if (placeholder === '年') return 'year';
-    if (placeholder === '月') return 'month';
-    if (placeholder === '日') return 'day';
-    if (fallbackIndex >= 0) return ['year', 'month', 'day'][fallbackIndex % 3] || '';
-    return '';
-  }
-
-  function datePartValue(value, part) {
-    const match = String(value || '').match(/((?:19|20)\d{2})[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?/);
-    if (!match) return value;
-    return part === 'year' ? match[1] : part === 'month' ? String(Number(match[2])) : part === 'day' && match[3] ? String(Number(match[3])) : value;
-  }
-
-  function compoundSingleDate(element, key = '') {
-    if (!(element instanceof Element) || !/Date$|Date\b/.test(key)) return null;
-    const container = semanticContainer(element);
-    if (!container) return null;
-    const controls = controlNodes(container)
-      .filter((node) => node.type !== 'hidden' && node.type !== 'checkbox' && node.type !== 'radio')
-      .filter((node) => visible(node))
-      .filter((node) => datePart(node) || node.type === 'date' || node.type === 'month' || Boolean(customSelectTrigger(node)));
-    if (!controls.includes(element) || controls.length < 2 || controls.length > 3) return null;
-    const text = cleanText(`${labelText(element)} ${directSemanticLabels(container, element).join(' ')} ${container.className || ''}`);
-    const hasRangeSignal = /至今|当前|present|currently/i.test(cleanText(container.textContent))
-      || [...container.children].some((child) => /^\s*[-—~至]\s*$/.test(cleanText(child.textContent)))
-      || /range|期间|起止/i.test(String(container.className || ''));
-    if (hasRangeSignal) return null;
-    if (!/日期|时间|年月|date|year|month|day|date_info|month-range-select|picker|calendar/i.test(text)
-      && !controls.every((node) => customSelectTrigger(node))) return null;
-    return { root: container, controls };
-  }
-
-  function compoundSingleDatePart(compound, controlOrIndex) {
-    if (!compound?.controls?.length) return '';
-    const index = typeof controlOrIndex === 'number' ? controlOrIndex : compound.controls.indexOf(controlOrIndex);
-    if (index < 0) return '';
-    const explicit = datePart(compound.controls[index]);
-    if (explicit) return explicit;
-    return ['year', 'month', 'day'][index] || '';
-  }
-
-  function compoundSingleDateReading(compound) {
-    if (!compound?.controls?.length) return '';
-    return compound.controls
-      .map((control, index) => {
-        const shown = rangeControlShownValue(control);
-        if (!shown || placeholderLike(shown)) return '';
-        const part = compoundSingleDatePart(compound, index);
-        const number = shown.match(part === 'year' ? /(?:19|20)\d{2}/ : /\d{1,2}/)?.[0];
-        if (!number) return cleanText(shown);
-        if (part === 'year') return number;
-        return String(Number(number)).padStart(2, '0');
-      })
-      .filter(Boolean)
-      .join('-');
-  }
-
-  function compoundSingleDateMatches(compound, value) {
-    if (!compound?.controls?.length) return false;
-    return compound.controls.every((control, index) => {
-      const part = compoundSingleDatePart(compound, index);
-      return Boolean(part) && rangeControlMatches(control, datePartValue(value, part));
-    });
-  }
-
-  function liveCompoundSingleDate(host, key = '', fallbackRoot = null) {
-    if (fallbackRoot?.isConnected) {
-      const first = fallbackRoot.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])');
-      const compound = first && compoundSingleDate(first, key);
-      if (compound?.root === fallbackRoot || compound?.root?.isConnected) return compound;
-    }
-    if (!(host instanceof Element) || !host.isConnected) return null;
-    for (const input of host.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')) {
-      const compound = compoundSingleDate(input, key);
-      if (compound && host.contains(compound.root)) return compound;
-    }
-    return null;
-  }
-
-  async function fillCompoundSingleDateGroup(host, initialCompound, value, key) {
-    let compound = liveCompoundSingleDate(host, key, initialCompound.root);
-    if (!compound || ![2, 3].includes(compound.controls.length)) {
-      return { ok: false, reason: '单日期控件结构不是两格年/月或三格年/月/日' };
-    }
-    const originalStates = compound.controls.map((control) => captureFillState(control, customSelectTrigger(control) || control));
-    const failures = [];
-
-    for (let pass = 0; pass < 3; pass += 1) {
-      let attempted = false;
-      for (let index = 0; index < compound.controls.length; index += 1) {
-        compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
-        if (!compound || compound.controls.length !== initialCompound.controls.length) {
-          failures.push('填写过程中单日期控件 DOM 已替换且无法重新定位');
-          continue;
-        }
-        const control = compound.controls[index];
-        const part = compoundSingleDatePart(compound, index);
-        const expected = part ? datePartValue(value, part) : '';
-        if (!part || !expected || expected === value) {
-          failures.push(`无法识别第 ${index + 1} 个日期子控件的 ${part || '部分'}`);
-          continue;
-        }
-        if (rangeControlMatches(control, expected)) continue;
-        attempted = true;
-        const filled = await fillElement(control, value, key, part);
-        compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
-        const liveControl = compound?.controls?.[index];
-        if (!filled || !liveControl || !rangeControlMatches(liveControl, expected)) {
-          failures.push(`${part === 'year' ? '年份' : part === 'month' ? '月份' : '日期'}未达到 ${expected}`);
-        }
-      }
-      compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
-      if (compoundSingleDateMatches(compound, value)) break;
-      if (!attempted) break;
-      await wait(80);
-    }
-
-    compound = liveCompoundSingleDate(host, key, compound?.root || initialCompound.root);
-    if (!compoundSingleDateMatches(compound, value)) {
-      const actual = compoundSingleDateReading(compound) || '无法回读';
-      for (let index = 0; index < (compound?.controls?.length || 0); index += 1) {
-        const control = compound.controls[index];
-        await rollbackFailedControl(control, customSelectTrigger(control) || control, originalStates[index]);
-      }
-      return {
-        ok: false,
-        reason: `单日期控件没有达到目标值（当前：${actual}${failures.length ? `；尝试：${[...new Set(failures)].slice(-4).join('；')}` : ''}）`
-      };
-    }
-    compound.controls.forEach((control) => control.classList.add(FILLED_CLASS));
-    return { ok: true, compound };
-  }
-
-  function auxiliaryControl(element, text) {
-    const container = semanticContainer(element);
-    if (!container) return false;
-    const controls = controlNodes(container).filter((node) => node.type !== 'hidden');
-    if (controls.length < 2) return false;
-    const trigger = customSelectTrigger(element);
-    if (!trigger) return false;
-    const shown = cleanText(trigger.textContent);
-    if (/手机|电话|phone|mobile/i.test(text) && /^[+＋]\d{1,4}$/.test(shown)) return true;
-    return false;
-  }
-
-  function structuralDateRange(element) {
-    const candidates = [];
-    let ancestor = element.parentElement;
-    for (let depth = 0; ancestor && depth < 10; depth += 1, ancestor = ancestor.parentElement) {
-      const controls = [...ancestor.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')];
-      if (!controls.includes(element) || controls.length < 4 || controls.length > 6 || controls.length % 2) continue;
-      const dateLike = controls.every((node) => {
-        const hint = `${node.placeholder || ''} ${node.className || ''}`;
-        return node.type === 'date' || Boolean(customSelectTrigger(node)) || /年|月|日|日期|时间|date|year|month|day/i.test(hint);
-      });
-      if (!dateLike) continue;
-      const text = cleanText(ancestor.textContent);
-      const hasRangeSignal = /至今|当前|present|currently/i.test(text)
-        || [...ancestor.children].some((child) => /^\s*[-—–~至]\s*$/.test(cleanText(child.textContent)))
-        || /range|期间|起止/i.test(String(ancestor.className || ''));
-      if (hasRangeSignal) candidates.push({ root: ancestor, controls });
-    }
-    return candidates[0] || null;
-  }
-
-  function structuralDatePart(controls, index) {
-    const half = controls.length / 2;
-    const position = index % half;
-    const corresponding = [controls[position], controls[position + half]].filter(Boolean);
-    const explicit = corresponding.map((node) => datePart(node)).find(Boolean);
-    if (explicit) return explicit;
-    if (half === 1) return '';
-    return ['year', 'month', 'day'][position] || '';
-  }
-
-  const DATE_RANGE_KINDS = {
-    educationDateRange: ['educationStartDate', 'graduationDate'],
-    workDateRange: ['workStartDate', 'workEndDate'],
-    projectDateRange: ['projectStartDate', 'projectEndDate']
-  };
-
-  function liveStructuralDateRange(host, fallbackRoot = null) {
-    if (fallbackRoot?.isConnected) {
-      const first = fallbackRoot.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])');
-      const range = first && structuralDateRange(first);
-      if (range?.root === fallbackRoot || range?.root?.isConnected) return range;
-    }
-    if (!(host instanceof Element) || !host.isConnected) return null;
-    for (const input of host.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')) {
-      const range = structuralDateRange(input);
-      if (range && host.contains(range.root)) return range;
-    }
-    return null;
-  }
-
-  function allStructuralDateRanges() {
-    const ranges = [];
-    const seen = new Set();
-    for (const input of document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')) {
-      if (!input.isConnected || !visible(input)) continue;
-      const range = structuralDateRange(input);
-      if (range && !seen.has(range.root)) {
-        seen.add(range.root);
-        ranges.push(range);
-      }
-    }
-    return ranges;
-  }
-
-  function rangeDescriptor(range) {
-    const ranges = allStructuralDateRanges().filter((candidate) => candidate.controls.length === range.controls.length);
-    const context = sectionContext(range.controls[0]);
-    const sameContext = context
-      ? ranges.filter((candidate) => sectionContext(candidate.controls[0]) === context)
-      : ranges;
-    const index = Math.max(0, sameContext.findIndex((candidate) => candidate.root === range.root));
-    return { controls: range.controls.length, context, index };
-  }
-
-  function locateStructuralDateRange(descriptor, host = null, fallbackRoot = null) {
-    const direct = liveStructuralDateRange(host, fallbackRoot);
-    if (direct && direct.controls.length === descriptor.controls) return direct;
-    const ranges = allStructuralDateRanges().filter((candidate) => candidate.controls.length === descriptor.controls);
-    const sameContext = descriptor.context
-      ? ranges.filter((candidate) => sectionContext(candidate.controls[0]) === descriptor.context)
-      : ranges;
-    return sameContext[descriptor.index] || ranges[descriptor.index] || null;
-  }
-
-  function rangeControlHasValue(element) {
-    if (!(element instanceof Element)) return false;
-    if (String(element.value || '').trim() && !placeholderLike(element.value)) return true;
-    const trigger = customSelectTrigger(element);
-    if (!trigger) return false;
-    const shown = String(trigger.textContent || '').trim();
-    return Boolean(shown && !placeholderLike(shown));
-  }
-
-  function structuralRangeComplete(range) {
-    return Boolean(range?.controls?.length >= 4 && range.controls.every(rangeControlHasValue));
-  }
-
-  function rangeControlShownValue(element) {
-    if (!(element instanceof Element)) return '';
-    const trigger = customSelectTrigger(element);
-    const displayed = trigger?.querySelector('[class*="display-value"]')?.textContent
-      || trigger?.textContent
-      || element.value
-      || '';
-    return cleanText(displayed);
-  }
-
-  function structuralRangeReading(range, side = 0) {
-    if (!range?.controls?.length || range.controls.length % 2) return '';
-    const half = range.controls.length / 2;
-    return range.controls.slice(side ? half : 0, side ? range.controls.length : half)
-      .map(rangeControlShownValue)
-      .filter((value) => value && !placeholderLike(value))
-      .join('-');
-  }
-
-  function rangeControlMatches(element, expected) {
-    const shown = rangeControlShownValue(element);
-    if (!shown) return false;
-    const expectedText = String(expected);
-    if (/^\d+$/.test(expectedText)) {
-      const number = shown.match(/(?:^|\D)0*(\d+)(?:\D|$)/)?.[1];
-      return number !== undefined && Number(number) === Number(expectedText);
-    }
-    return normalizedExactText(shown) === normalizedExactText(expectedText);
-  }
-
-  function structuralRangeMatches(range, startValue, endValue) {
-    if (!range || ![4, 6].includes(range.controls.length)) return false;
-    const half = range.controls.length / 2;
-    const parts = half === 2 ? ['year', 'month'] : ['year', 'month', 'day'];
-    return range.controls.every((control, index) => {
-      const source = index < half ? startValue : endValue;
-      return rangeControlMatches(control, datePartValue(source, parts[index % half]));
-    });
-  }
-
-  async function fillStructuralDateRangeGroup(host, initialRange, startValue, endValue, keys, overwrite) {
-    const descriptor = rangeDescriptor(initialRange);
-    let range = locateStructuralDateRange(descriptor, host, initialRange.root);
-    if (!range || ![4, 6].includes(range.controls.length)) {
-      return { ok: false, reason: '日期范围不是四格年月或六格年月日结构' };
-    }
-    const half = range.controls.length / 2;
-    const expectedParts = half === 2 ? ['year', 'month'] : ['year', 'month', 'day'];
-    const sideValues = [startValue, endValue];
-    const originalStates = range.controls.map((control) => captureFillState(control, customSelectTrigger(control) || control));
-
-    if (!startValue) return { ok: false, missingKey: keys[0], reason: '开始日期资料为空' };
-    if (!endValue) return { ok: false, missingKey: keys[1], reason: '结束日期资料为空' };
-
-    // 选择年份后，部分组件会自动把月份设成 1；任意一次交互还可能触发整组重渲染。
-    // 因此按“多轮校正”处理：单格失败不终止，继续尝试后面的格子；下一轮只补不匹配项。
-    const failures = [];
-    for (let pass = 0; pass < 3; pass += 1) {
-      let attempted = false;
-      for (let side = 0; side < 2; side += 1) {
-        const sourceValue = sideValues[side];
-        for (let position = 0; position < half; position += 1) {
-          range = locateStructuralDateRange(descriptor, host, range?.root || initialRange.root);
-          if (!range || range.controls.length !== half * 2) {
-            failures.push('填写过程中日期范围 DOM 已替换且无法重新定位');
-            continue;
-          }
-          const control = range.controls[side * half + position];
-          const part = expectedParts[position];
-          const expected = datePartValue(sourceValue, part);
-          if (rangeControlMatches(control, expected)) continue;
-          attempted = true;
-          const filled = await fillElement(control, sourceValue, keys[side], part);
-          range = locateStructuralDateRange(descriptor, host, range?.root || initialRange.root);
-          const liveControl = range?.controls?.[side * half + position];
-          if (!filled || !liveControl || !rangeControlMatches(liveControl, expected)) {
-            failures.push(`${side ? '结束' : '开始'}${part === 'year' ? '年份' : part === 'month' ? '月份' : '日期'}未达到 ${expected}`);
-          }
-        }
-      }
-      range = locateStructuralDateRange(descriptor, host, range?.root || initialRange.root);
-      if (structuralRangeMatches(range, startValue, endValue)) break;
-      if (!attempted) break;
-      await wait(80);
-    }
-
-    range = locateStructuralDateRange(descriptor, host, range.root);
-    if (!structuralRangeMatches(range, startValue, endValue)) {
-      const missing = range?.controls?.map((control, index) => rangeControlHasValue(control) ? '' : `${index < half ? '开始' : '结束'}${expectedParts[index % half]}`)
-        .filter(Boolean).join('、');
-      const actual = range?.controls?.map(rangeControlShownValue).join(' / ') || '无法回读';
-      const details = [...new Set(failures)].slice(-4).join('、');
-      for (let index = 0; index < (range?.controls?.length || 0); index += 1) {
-        const control = range.controls[index];
-        await rollbackFailedControl(control, customSelectTrigger(control) || control, originalStates[index]);
-      }
-      return { ok: false, reason: `日期范围没有达到目标值（当前：${actual}${missing ? `；空格：${missing}` : ''}${details ? `；尝试：${details}` : ''}）` };
-    }
-    range.controls.forEach((control) => control.classList.add(FILLED_CLASS));
-    return { ok: true, range };
-  }
-
-  function atsxPeriodMonthWidgets() {
-    return [...document.querySelectorAll('.atsx-date-picker-period-month,[class*="atsx-date-picker-period-month"]')]
-      .filter((widget) => visible(widget))
-      .filter((widget, index, list) => list.indexOf(widget) === index)
-      .filter((widget) => widget.querySelectorAll('[class*="period-month-label"]').length >= 2);
-  }
-
-  function atsxPeriodMonthLabels(widget) {
-    const labels = [...widget.querySelectorAll('[class*="period-month-label"]')].filter(visible);
-    const begin = widget.querySelector('[data-cy$="periodInputBegin"]') || labels[0] || null;
-    const end = widget.querySelector('[data-cy$="periodInputEnd"]') || labels[1] || null;
-    return [begin, end];
-  }
-
-  function atsxPeriodMonthReading(widget, side) {
-    const label = atsxPeriodMonthLabels(widget)[side];
-    if (!label) return '';
-    const year = cleanText(label.querySelector('[data-cy="year"],[class*="label-year"]')?.textContent);
-    const month = cleanText(label.querySelector('[data-cy="month"],[class*="label-month"]')?.textContent);
-    if (!/(?:19|20)\d{2}/.test(year) || !/\d{1,2}/.test(month)) return '';
-    return `${year.match(/(?:19|20)\d{2}/)[0]}-${String(Number(month.match(/\d{1,2}/)[0])).padStart(2, '0')}`;
-  }
-
-  function atsxPeriodMonthExpected(value) {
-    const match = String(value || '').match(/((?:19|20)\d{2})[-/.年](\d{1,2})/);
-    return match ? `${match[1]}-${String(Number(match[2])).padStart(2, '0')}` : '';
-  }
-
-  function atsxPeriodContextAndKey(widget) {
-    const cue = `${widget.getAttribute('data-cy') || ''} ${labelText(widget)}`;
-    let context = sectionContext(widget);
-    if (!context && /internship|employment|work/i.test(cue)) context = 'work';
-    if (!context && /education|school/i.test(cue)) context = 'education';
-    if (!context && /project/i.test(cue)) context = 'project';
-    const key = matchKey(labelText(widget), context) || contextualKey('起止时间', context);
-    return { context, key };
-  }
-
-  function atsxVisiblePeriodPanel() {
-    const roots = [...document.querySelectorAll('[class*="atsx-date-picker-period-month-panel"],[class*="date-picker-period-month-panel"]')]
-      .filter((node) => visible(node));
-    return roots.find((root) => root.querySelector('[class*="panel-list-item"]')) || roots[0] || null;
-  }
-
-  function atsxPeriodTokenMatches(node, part, expected) {
-    const text = cleanText(node.textContent);
-    const data = cleanText(node.getAttribute('data-cy'));
-    if (part === 'year') return [text, data].some((value) => Number(value.match(/(?:19|20)\d{2}/)?.[0]) === Number(expected));
-    const monthNames = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'];
-    return [text, data].some((value) => {
-      const number = value.match(/\d{1,2}/)?.[0];
-      return number ? Number(number) === Number(expected) : monthNames[Number(expected) - 1] === value;
-    });
-  }
-
-  async function fillAtsxPeriodMonthSide(widget, side, value) {
-    const expected = atsxPeriodMonthExpected(value);
-    const match = expected.match(/^((?:19|20)\d{2})-(\d{2})$/);
-    if (!match) return { ok: false, reason: `资料日期无法解析为年月` };
-    const label = atsxPeriodMonthLabels(widget)[side];
-    if (!label) return { ok: false, reason: `没有找到${side ? '结束' : '开始'}时间入口` };
-    if (atsxPeriodMonthReading(widget, side) === expected) return { ok: true };
-    const session = beginDynamicInteraction(widget);
-    const waitUntil = async (test, timeout = 800) => {
-      const started = Date.now();
-      while (Date.now() - started < timeout) {
-        const result = test();
-        if (result) return result;
-        await wait(35);
-      }
-      return test() || null;
-    };
-    const clickWithFallback = async (resolveTarget, accepted = null) => {
-      let target = resolveTarget();
-      if (!target) return false;
-      const revision = session.revision;
-      activateOption(target);
-      if (await waitUntil(() => accepted?.() || session.revision !== revision || !target.isConnected, 180)) return true;
-      target = resolveTarget();
-      if (!target) return Boolean(accepted?.());
-      const trusted = await trustedClick(target);
-      return Boolean(trusted?.ok && await waitUntil(() => accepted?.() || !target.isConnected || session.revision !== revision, 650));
-    };
-    activateOption(label);
-    let panel = await waitUntil(atsxVisiblePeriodPanel, 500);
-    if (!panel) {
-      const trusted = await trustedClick(label);
-      if (trusted?.ok) panel = await waitUntil(atsxVisiblePeriodPanel, 900);
-    }
-    if (!panel) {
-      session.stop();
-      return { ok: false, reason: `点击${side ? '结束' : '开始'}时间后没有出现年月面板` };
-    }
-    rememberInteractionRoot(session, panel);
-    const token = (part, target) => {
-      const livePanel = atsxVisiblePeriodPanel();
-      if (!livePanel) return null;
-      const candidates = [...livePanel.querySelectorAll('[class*="panel-list-item"],[role="option"],[data-cy]')]
-        .filter((node) => atsxPeriodTokenMatches(node, part, target));
-      return candidates.find((node) => !candidates.some((other) => other !== node && node.contains(other))) || null;
-    };
-    const openTokenList = async (part) => {
-      if (token(part, part === 'year' ? match[1] : Number(match[2]))) return true;
-      let livePanel = atsxVisiblePeriodPanel();
-      if (!livePanel) {
-        activateOption(label);
-        livePanel = await waitUntil(atsxVisiblePeriodPanel, 500);
-        if (!livePanel) {
-          const trusted = await trustedClick(label);
-          if (trusted?.ok) livePanel = await waitUntil(atsxVisiblePeriodPanel, 700);
-        }
-      }
-      const opener = livePanel?.querySelector(`[data-cy="${part}"],[class*="${part}"]`);
-      if (!opener) return false;
-      return clickWithFallback(() => opener, () => Boolean(token(part, part === 'year' ? match[1] : Number(match[2]))));
-    };
-    if (!await openTokenList('year')
-      || !await clickWithFallback(() => token('year', match[1]))) {
-      session.stop();
-      return { ok: false, reason: `年份列表中无法选择 ${match[1]}` };
-    }
-    await wait(80);
-    if (!await openTokenList('month')
-      || !await clickWithFallback(() => token('month', Number(match[2])), () => atsxPeriodMonthReading(widget, side) === expected)) {
-      session.stop();
-      return { ok: false, reason: `月份列表中无法选择 ${Number(match[2])} 月` };
-    }
-    const ok = Boolean(await waitUntil(() => atsxPeriodMonthReading(widget, side) === expected, 900));
-    session.stop();
-    if (!ok) return { ok: false, reason: `${side ? '结束' : '开始'}时间没有回读到 ${expected}` };
-    clickOutsideControl(widget);
-    return { ok: true };
-  }
-
-  async function rollbackAtsxPeriodMonth(widget, originalReadings) {
-    const clear = widget.querySelector('[class*="clear" i],[aria-label*="清除"],[aria-label*="clear" i]');
-    if (!originalReadings[0] && !originalReadings[1] && clear && visible(clear)) {
-      activateOption(clear);
-      await wait(100);
-      if (atsxPeriodMonthReading(widget, 0) || atsxPeriodMonthReading(widget, 1)) await trustedClick(clear);
-    }
-    for (let side = 0; side < 2; side += 1) {
-      const original = originalReadings[side];
-      if (original && atsxPeriodMonthReading(widget, side) !== original) {
-        await fillAtsxPeriodMonthSide(widget, side, original);
-      }
-    }
-    const hidden = widget.querySelector('input[class*="hidden-input"],input[type="hidden"]');
-    if (!originalReadings[0] && !originalReadings[1] && hidden instanceof HTMLInputElement) {
-      setNativeValue(hidden, '');
-    }
-    return originalReadings.every((value, side) => atsxPeriodMonthReading(widget, side) === value);
-  }
-
-  async function fillAtsxPeriodMonthRanges(profile, stats, overwrite) {
-    const occurrences = new Map();
-    for (const widget of atsxPeriodMonthWidgets()) {
-      const { context, key } = atsxPeriodContextAndKey(widget);
-      if (!key || !DATE_RANGE_KINDS[key]) {
-        markFillResult(widget, UNMATCHED_CLASS);
-        stats.unmatched += 1;
-        if (stats.details.unmatched.length < 24) stats.details.unmatched.push(`${labelText(widget) || '年月起止控件'}（已识别交互结构，未确定资料字段）`);
-        recordDiagnostic(stats, 'unmatched', {
-          field: labelText(widget) || '年月起止控件', stage: 'ATSX 日期范围映射',
-          reason: '已识别为开始/结束年月组件，但附近区块和字段标题无法确定应对应教育、工作还是项目日期'
-        });
-        continue;
-      }
-      const occurrenceKey = `${context || 'global'}:${key}`;
-      const occurrence = occurrences.get(occurrenceKey) || 0;
-      occurrences.set(occurrenceKey, occurrence + 1);
-      const [startKey, endKey] = DATE_RANGE_KINDS[key];
-      const startValue = profileValue(profile, startKey, occurrence, context);
-      const endValue = profileValue(profile, endKey, occurrence, context);
-      if (!startValue || !endValue) {
-        markFillResult(widget, MISSING_CLASS);
-        stats.missingData += 1;
-        if (stats.details.missingData.length < 8) stats.details.missingData.push(`${labelText(widget) || '起止时间'} → ${!startValue ? startKey : endKey}`);
-        recordDiagnostic(stats, 'missingData', {
-          field: labelText(widget) || '起止时间', key: `${startKey}/${endKey}`,
-          target: `${startValue || '缺失'} → ${endValue || '缺失'}`, stage: '本地资料取值',
-          reason: `日期组件已映射，但第 ${occurrence + 1} 段资料缺少 ${!startValue ? startKey : endKey}；未点击日历`
-        });
-        continue;
-      }
-      const startExpected = atsxPeriodMonthExpected(startValue);
-      const endExpected = atsxPeriodMonthExpected(endValue);
-      const originalReadings = [atsxPeriodMonthReading(widget, 0), atsxPeriodMonthReading(widget, 1)];
-      if (!overwrite && atsxPeriodMonthReading(widget, 0) === startExpected && atsxPeriodMonthReading(widget, 1) === endExpected) {
-        markFillResult(widget, EXISTING_CLASS);
-        stats.existing += 1;
-        stats.details.existing.push(`${labelText(widget) || '起止时间'}（页面已符合 ${startExpected} → ${endExpected}）`);
-        recordDiagnostic(stats, 'existing', {
-          field: labelText(widget) || '起止时间', key: `${startKey}/${endKey}`,
-          target: `${startExpected} → ${endExpected}`, observed: `${atsxPeriodMonthReading(widget, 0)} → ${atsxPeriodMonthReading(widget, 1)}`,
-          stage: '填写前检查', reason: '页面开始/结束年月都已与目标资料匹配，不是 YYYY/MM 占位值'
-        });
-        continue;
-      }
-      const startResult = await fillAtsxPeriodMonthSide(widget, 0, startValue);
-      const endResult = startResult.ok ? await fillAtsxPeriodMonthSide(widget, 1, endValue) : { ok: false, reason: '开始时间失败，未继续结束时间' };
-      if (startResult.ok && endResult.ok) {
-        markFillResult(widget, FILLED_CLASS);
-        stats.filled += 1;
-      } else {
-        const failedReadings = [atsxPeriodMonthReading(widget, 0), atsxPeriodMonthReading(widget, 1)];
-        const rolledBack = await rollbackAtsxPeriodMonth(widget, originalReadings);
-        markFillResult(widget, FAILED_CLASS);
-        const failureReason = startResult.ok ? endResult.reason : startResult.reason;
-        fillFailureReasons.set(widget, `${failureReason}${rolledBack ? '' : '；组件没有清除入口，未能完全恢复原状态'}`);
-        stats.unsupported += 1;
-        if (stats.details.unsupported.length < 8) stats.details.unsupported.push(`${labelText(widget) || '起止时间'} → ${startKey}/${endKey}（${fillFailureReasons.get(widget)}）`);
-        recordDiagnostic(stats, 'unsupported', {
-          field: labelText(widget) || '起止时间', key: `${startKey}/${endKey}`,
-          target: `${startExpected} → ${endExpected}`,
-          observed: `${failedReadings[0] || '操作后仍为空'} → ${failedReadings[1] || '操作后仍为空'}`,
-          stage: 'ATSX 年/月选择后回读', reason: fillFailureReasons.get(widget)
-        });
-      }
-    }
-  }
-
-  function dateBinding(element, key, groupOccurrences) {
-    const rangeKinds = DATE_RANGE_KINDS;
-    const structuralRange = structuralDateRange(element);
-    if (structuralRange && rangeKinds[key]) {
-      const { root: rangeRoot, controls: rangeControls } = structuralRange;
-      const index = rangeControls.indexOf(element);
-      if (index >= 0) {
-        const occurrenceKey = `structural-range:${key}`;
-        if (!groupOccurrences.has(occurrenceKey)) groupOccurrences.set(occurrenceKey, { next: 0, containers: new WeakMap() });
-        const state = groupOccurrences.get(occurrenceKey);
-        if (!state.containers.has(rangeRoot)) state.containers.set(rangeRoot, state.next++);
-        const occurrence = state.containers.get(rangeRoot);
-        const half = rangeControls.length / 2;
-        return {
-          key: rangeKinds[key][index < half ? 0 : 1],
-          occurrence,
-          part: structuralDatePart(rangeControls, index)
-        };
-      }
-    }
-    const compound = compoundSingleDate(element, key);
-    if (compound) {
-      const { root, controls } = compound;
-      const index = controls.indexOf(element);
-      if (index >= 0) {
-        const occurrenceKey = `compound-date:${key}`;
-        if (!groupOccurrences.has(occurrenceKey)) groupOccurrences.set(occurrenceKey, { next: 0, containers: new WeakMap() });
-        const state = groupOccurrences.get(occurrenceKey);
-        if (!state.containers.has(root)) state.containers.set(root, state.next++);
-        return { key, occurrence: state.containers.get(root), part: compoundSingleDatePart(compound, index) };
-      }
-    }
-    const container = semanticContainer(element);
-    if (!container) return null;
-    const isDateControl = (node) => datePart(node)
-      || node.type === 'date'
-      || Boolean(customSelectTrigger(node) && (node.readOnly || /日期|时间|年月|date|year|month/i.test(`${node.placeholder || ''} ${node.className || ''}`)));
-    const controls = controlNodes(container).filter((node) => isDateControl(node));
-    const index = controls.indexOf(element);
-    if (index < 0) return null;
-    const occurrenceKey = rangeKinds[key] ? key : `compound:${key}`;
-    if (!groupOccurrences.has(occurrenceKey)) groupOccurrences.set(occurrenceKey, { next: 0, containers: new WeakMap() });
-    const state = groupOccurrences.get(occurrenceKey);
-    if (!state.containers.has(container)) state.containers.set(container, state.next++);
-    const occurrence = state.containers.get(container);
-    if (rangeKinds[key]) {
-      const half = Math.max(1, Math.ceil(controls.length / 2));
-      const sideIndex = index < half ? 0 : 1;
-      const sideStart = sideIndex ? half : 0;
-      const sideControls = controls.slice(sideStart, sideIndex ? controls.length : half);
-      const explicitPart = datePart(element);
-      const part = explicitPart || (sideControls.length > 1 ? datePart(element, sideControls.indexOf(element)) : '');
-      return { key: rangeKinds[key][sideIndex], occurrence, part };
-    }
-    if (/Date$|Date\b/.test(key) && controls.length > 1) {
-      const explicitPart = datePart(element);
-      return { key, occurrence, part: explicitPart || datePart(element, index) };
-    }
-    return null;
-  }
-
-  async function fillElement(element, value, key, part = '') {
-    if (value === undefined || value === null || String(value).trim() === '') return false;
-    const locationLeaf = CASCADE_LOCATION_KEYS.has(key) ? (locationChoicePath(value).at(-1) || String(value)) : String(value);
-    if (element instanceof HTMLSelectElement) return fillSelect(element, locationLeaf)
-      || (locationLeaf !== String(value) && fillSelect(element, value));
-    if (element.type === 'radio' || element.type === 'checkbox') return fillChoice(element, value);
-    if (part && customSelectTrigger(element)) return fillCustomSelect(element, datePartValue(value, part), key);
-    if (/Date$|Date\b/.test(key) && customSelectTrigger(element)) return fillCustomDate(element, value);
-    if (/Date$|Date\b/.test(key)) {
-      const wasReadOnly = element.readOnly;
-      if (wasReadOnly) element.removeAttribute('readonly');
-      setNativeValue(element, String(value));
-      if (wasReadOnly) element.setAttribute('readonly', '');
-      await commitControl(element, element);
-      return element.value === String(value);
-    }
-    if (customSelectTrigger(element)) return fillCustomSelect(element, value, key);
-    if (element.isContentEditable) {
-      element.focus();
-      element.textContent = locationLeaf;
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: locationLeaf }));
-      element.dispatchEvent(new Event('blur', { bubbles: true }));
-      return true;
-    }
-    if (AUTOCOMPLETE_KEYS.has(key) && element instanceof HTMLInputElement && !element.readOnly) {
-      const autocompleteResult = await fillAutocompleteText(element, value, key);
-      if (autocompleteResult !== null) return autocompleteResult;
-    }
-    setNativeValue(element, locationLeaf);
-    return normalizedExactText(element.value) === normalizedExactText(locationLeaf);
-  }
-
-  function fastFillOrdinaryControls(profile, stats, overwrite, processedControls) {
-    const controls = [...document.querySelectorAll('input:not([type="hidden"]),textarea,select,[contenteditable="true"]')];
-    for (const element of controls) {
-      if (!element.isConnected || !visible(element) || element.disabled || processedControls.has(element)) continue;
-      const type = (element.type || '').toLowerCase();
-      if (['file', 'radio', 'checkbox', 'password', 'submit', 'button', 'reset', 'image', 'date', 'month'].includes(type)) continue;
-      const text = labelText(element);
-      const context = sectionContext(element);
-      const key = matchKey(text, context);
-      if (!key || repeatedFieldMap[key] || /Date$|Date\b/.test(key) || AUTOCOMPLETE_KEYS.has(key) || customSelectTrigger(element)) continue;
-      const value = profileValue(profile, key, 0, context);
-      if (!value) continue;
-      const fastValue = CASCADE_LOCATION_KEYS.has(key) ? (locationChoicePath(value).at(-1) || String(value)) : value;
-      if (!overwrite && hasMeaningfulExistingValue(element, null, text, key)) {
-        markFillResult(element, EXISTING_CLASS);
-        stats.existing += 1;
-        const field = readableField(text, element);
-        const observed = controlReadback(element, customSelectTrigger(element));
-        stats.details.existing.push(`${field}（页面已有：${diagnosticValue(observed)}）`);
-        recordDiagnostic(stats, 'existing', {
-          field, key, target: fastValue, observed, stage: '快速字段填写前检查',
-          reason: '检测到非空、非占位、非声明默认的页面值，且未开启覆盖'
-        });
-        processedControls.add(element);
-        continue;
-      }
-      let filled = false;
-      if (element instanceof HTMLSelectElement) filled = fillSelect(element, fastValue)
-        || (String(fastValue) !== String(value) && fillSelect(element, value));
-      else if (element.isContentEditable) {
-        element.focus();
-        element.textContent = fastValue;
-        element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: String(fastValue) }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        element.dispatchEvent(new Event('blur', { bubbles: true }));
-        filled = true;
-      } else {
-        setNativeValue(element, String(fastValue));
-        filled = true;
-      }
-      if (!filled) continue;
-      element.classList.add(FILLED_CLASS);
-      processedControls.add(element);
-      stats.filled += 1;
-    }
-  }
-
-  const repeatedFieldMap = {
-    school: ['educationEntries', 'school'], college: ['educationEntries', 'college'], major: ['educationEntries', 'major'],
-    degree: ['educationEntries', 'degree'], academicDegree: ['educationEntries', 'academicDegree'], studyMode: ['educationEntries', 'studyMode'], isHighestEducation: ['educationEntries', 'isHighest'],
-    educationStartDate: ['educationEntries', 'startDate'], graduationDate: ['educationEntries', 'endDate'], gpa: ['educationEntries', 'gpa'], ranking: ['educationEntries', 'ranking'], rankingPercent: ['educationEntries', 'rankingPercent'],
-    company: ['workEntries', 'company'], currentTitle: ['workEntries', 'title'], department: ['workEntries', 'department'], workType: ['workEntries', 'type'],
-    workStartDate: ['workEntries', 'startDate'], workEndDate: ['workEntries', 'endDate'], workDescription: ['workEntries', 'description'],
-    familyName: ['familyEntries', 'name'], familyRelationship: ['familyEntries', 'relationship'], familyPhone: ['familyEntries', 'phone'],
-    familyWorkplace: ['familyEntries', 'workplace'], familyOccupation: ['familyEntries', 'occupation'],
-    projectName: ['projectEntries', 'name'], projectRole: ['projectEntries', 'role'], projectStartDate: ['projectEntries', 'startDate'],
-    projectEndDate: ['projectEntries', 'endDate'], projectDescription: ['projectEntries', 'description'],
-    certificateName: ['certificateEntries', 'name'], certificateDate: ['certificateEntries', 'date'], certificateNumber: ['certificateEntries', 'number'],
-    certificateIssuer: ['certificateEntries', 'issuer'], certificateLevel: ['certificateEntries', 'level'],
-    certificateDescription: ['certificateEntries', 'description'], languageName: ['languageEntries', 'name'],
-    languageProficiency: ['languageEntries', 'proficiency'], languageCertificate: ['languageEntries', 'certificate'], languageScore: ['languageEntries', 'score'],
-    languageListeningSpeaking: ['languageEntries', 'listeningSpeaking'], languageReadingWriting: ['languageEntries', 'readingWriting']
-  };
-
-  function educationEntryResolution(profile, fieldText, fallbackOccurrence = 0) {
-    const text = cleanText(fieldText);
-    const hints = [
-      { label: '博士', pattern: /博士|ph\.?d|doctoral/i, entry: /博士|ph\.?d|doctoral/i },
-      { label: '硕士', pattern: /硕士|研究生|master|mba/i, entry: /硕士|研究生|master|mba/i },
-      { label: '本科/学士', pattern: /本科|学士|bachelor/i, entry: /本科|学士|bachelor/i },
-      { label: '大专/专科', pattern: /大专|专科|associate/i, entry: /大专|专科|associate/i },
-      { label: '高中', pattern: /高中|high\s*school/i, entry: /高中|high\s*school/i }
-    ];
-    const hint = hints.find((item) => item.pattern.test(text));
-    if (!hint) return { explicit: false, index: fallbackOccurrence, label: '' };
-    const entries = profile.educationEntries || [];
-    const index = entries.findIndex((entry) => hint.entry.test(`${entry.degree || ''} ${entry.academicDegree || ''}`));
-    return { explicit: true, index, label: hint.label };
-  }
-
-  function educationMappedKey(key) {
-    return repeatedFieldMap[key]?.[0] === 'educationEntries';
-  }
-
-  function profileValue(profile, key, occurrence, context = '') {
-    const explicitDefaults = {
-      relativesEmployed: '否',
-      healthStatus: '健康',
-      mentalIllness: '无',
-      acceptsAdjustment: '是',
-      acceptsRotation: '是'
-    };
-    if (key === 'highestDegree') return profile.degree || '';
-    if (key === 'highestGraduationDate') return profile.graduationDate || '';
-    if (['nativePlaceProvince', 'nativePlaceCity', 'nativePlaceDistrict', 'nativePlace'].includes(key)) {
-      const explicitParts = [profile.nativePlaceProvince, profile.nativePlaceCity, profile.nativePlaceDistrict]
-        .map((value) => cleanText(value));
-      const hasExplicitLevels = explicitParts.some(Boolean);
-      let parts = hasExplicitLevels ? explicitParts : locationChoicePath(profile.nativePlace || '');
-      const directAdministration = /^(?:北京市|上海市|天津市|重庆市|香港特别行政区|澳门特别行政区)$/.test(parts[0] || '');
-      const legacyDirectDistrict = directAdministration && !hasExplicitLevels && parts.length === 2 ? parts[1] : '';
-      if (key === 'nativePlaceProvince') return hasExplicitLevels ? explicitParts[0] : (parts[0] || '');
-      if (key === 'nativePlaceCity') return hasExplicitLevels
-        ? (explicitParts[1] || (directAdministration ? explicitParts[0] : ''))
-        : ((directAdministration ? parts[0] : parts[1]) || parts[0] || '');
-      if (key === 'nativePlaceDistrict') return hasExplicitLevels ? explicitParts[2] : (legacyDirectDistrict || parts[2] || parts.at(-1) || '');
-      // 组合字段保留完整路径；直辖市在资料中可同时占省/市两级，
-      // 但级联选择时不需要连续点击两次同一个值。
-      return parts.filter(Boolean).filter((value, index, values) => index === 0 || value !== values[index - 1]).join('/') || profile.nativePlace || '';
-    }
-    if (key === 'englishName') return profile.englishName || [profile.firstName, profile.lastName].filter(Boolean).join(' ');
-    if (key === 'englishLevel') return profile.englishLevel || profile.languageEntries?.find((entry) => /^(?:英语|英文|english)$/i.test(entry.name || ''))?.certificate || profile.languageEntries?.find((entry) => /^(?:英语|英文|english)$/i.test(entry.name || ''))?.proficiency || '';
-    if (key === 'englishListeningSpeaking') return profile.englishListeningSpeaking || profile.languageEntries?.find((entry) => /^(?:英语|英文|english)$/i.test(entry.name || ''))?.listeningSpeaking || '';
-    if (key === 'englishReadingWriting') return profile.englishReadingWriting || profile.languageEntries?.find((entry) => /^(?:英语|英文|english)$/i.test(entry.name || ''))?.readingWriting || '';
-    if (context === 'basic' && (key === 'degree' || key === 'graduationDate')) return profile[key] || '';
-    const repeated = repeatedFieldMap[key];
-    if (repeated) {
-      const [collection, property] = repeated;
-      const value = profile[collection]?.[occurrence]?.[property];
-      if (value !== undefined && value !== null && String(value).trim()) return value;
-      if (occurrence > 0) return '';
-    }
-    if (key === 'currentResidence') return profile.currentResidence || profile.city || '';
-    return profile[key] || explicitDefaults[key] || '';
-  }
-
-  function readableField(text, element) {
-    return (text || element.name || element.id || element.type || '未知字段').replace(/\s+/g, ' ').trim().slice(0, 80);
-  }
-
-  function diagnosticValue(value, fallback = '—') {
-    const text = cleanText(value);
-    return text ? text.slice(0, 160) : fallback;
-  }
-
-  function recordDiagnostic(stats, category, item) {
-    if (!stats?.diagnostics?.[category]) return;
-    const normalized = {
-      field: diagnosticValue(item.field, '未命名字段'),
-      key: diagnosticValue(item.key),
-      target: diagnosticValue(item.target),
-      observed: diagnosticValue(item.observed),
-      reason: diagnosticValue(item.reason, '未提供判定原因'),
-      stage: diagnosticValue(item.stage)
-    };
-    const signature = JSON.stringify(normalized);
-    if (stats.diagnosticSignatures?.has(signature)) return;
-    stats.diagnosticSignatures?.add(signature);
-    if (stats.diagnostics[category].length < 160) stats.diagnostics[category].push(normalized);
-  }
-
-  function controlValueSatisfied(element, trigger, value, key = '', part = '') {
-    const observed = controlReadback(element, trigger);
-    if (!observed || placeholderLike(observed)) return false;
-    if (element instanceof HTMLSelectElement) {
-      const expected = part ? datePartValue(value, part) : value;
-      return choiceMatches(observed, expected);
-    }
-    if (trigger) {
-      const expected = part ? datePartValue(value, part) : value;
-      // 可编辑下拉框里“搜索文字恰好等于目标值”不是选中成功。
-      // 只信任明确 selected/checked 节点，或组件已显示非占位选中值的情况。
-      const selected = trigger.querySelector('[aria-selected="true"],[aria-checked="true"],[class*="selected-value"],[class*="SelectedValue"],[class*="singleValue"],[class*="SingleValue"],[class*="display-value"],[class*="DisplayValue"],[class*="calcEle"],[class*="selected-item"],[class*="selection-item"]');
-      const selectedShown = cleanText(selected?.textContent || '');
-      if (selectedShown && choiceMatches(selectedShown, expected)) return true;
-      if (!customTriggerHasSelection(trigger)) return false;
-      const triggerShown = cleanText(trigger.textContent || '');
-      return Boolean(triggerShown && choiceMatches(triggerShown, expected));
-    }
-    if (/Date$|Date\b/.test(key) || part) {
-      const expected = normalizedExactText(part ? datePartValue(value, part) : value).replace(/[^0-9]/g, '');
-      const actual = normalizedExactText(observed).replace(/[^0-9]/g, '');
-      return Boolean(expected && actual && (actual === expected || actual.endsWith(expected) || expected.endsWith(actual)));
-    }
-    return normalizedExactText(observed) === normalizedExactText(value);
-  }
-
-  function showToast(message) {
-    document.querySelector('.resume-autofill-toast')?.remove();
-    const toast = document.createElement('div');
-    toast.className = 'resume-autofill-toast';
-    toast.textContent = message;
-    document.documentElement.appendChild(toast);
-    setTimeout(() => toast.remove(), 5000);
-  }
-
-  function showCompletionPanel(stats) {
-    document.querySelector('.resume-autofill-completion')?.remove();
-    const panel = document.createElement('section');
-    panel.className = 'resume-autofill-completion';
-    panel.setAttribute('role', 'status');
-    panel.setAttribute('aria-live', 'polite');
-
-    const header = document.createElement('div');
-    header.className = 'resume-autofill-completion__header';
-    const title = document.createElement('strong');
-    title.textContent = '自动填写完成';
-    const close = document.createElement('button');
-    close.type = 'button';
-    close.setAttribute('aria-label', '关闭完成提示');
-    close.textContent = '×';
-    close.addEventListener('click', () => panel.remove());
-    header.append(title, close);
-
-    const summary = document.createElement('p');
-    summary.textContent = `已填写 ${stats.filled} 项（AI 复核 ${stats.aiReviewed || 0} 项），新增经历 ${stats.sectionsAdded} 段，跳过已有内容 ${stats.existing} 项。`;
-    const issues = document.createElement('p');
-    issues.textContent = `资料字段未映射 ${stats.unmatched} 项，资料缺失 ${stats.missingData} 项，实际处理失败 ${stats.unsupported} 项，有意忽略 ${stats.ignored || 0} 项。`;
-    const legend = document.createElement('div');
-    legend.className = 'resume-autofill-completion__legend';
-    legend.innerHTML = '<span class="is-filled">绿色：填写成功</span><span class="is-missing">黄色：本地资料缺失</span><span class="is-failed">红色：实际处理失败</span><span class="is-existing">蓝色：页面已有值，未覆盖</span><span class="is-unmapped">紫色：未映射资料字段</span><span class="is-ignored">灰色：有意忽略</span>';
-    const timing = document.createElement('p');
-    timing.textContent = `耗时 ${(stats.timings.totalMs / 1000).toFixed(1)} 秒。请检查日期、选择项和资格问题后手动提交。`;
-
-    const explanation = document.createElement('p');
-    explanation.className = 'resume-autofill-completion__hint';
-    explanation.textContent = '下方诊断表会列出每一项的目标值、页面回读值、判定阶段和原因。黄色=字段已映射但本地资料为空（未操作页面）；紫色=页面字段标签没有命中映射规则；红色=已尝试后回读验证未通过；蓝色=填写前已有明确的非占位、非默认值。';
-
-    const appendDetails = (label, items) => {
-      if (!items?.length) return;
-      const details = document.createElement('details');
-      const detailsSummary = document.createElement('summary');
-      detailsSummary.textContent = `${label}（显示 ${Math.min(items.length, 8)} 项）`;
-      const list = document.createElement('ol');
-      for (const item of items.slice(0, 8)) {
-        const row = document.createElement('li');
-        row.textContent = item;
-        list.appendChild(row);
-      }
-      details.append(detailsSummary, list);
-      panel.appendChild(details);
-    };
-
-    const appendDiagnosticTable = (label, items, category, open = false) => {
-      if (!items?.length) return false;
-      const details = document.createElement('details');
-      details.className = `resume-autofill-completion__diagnostics resume-autofill-completion__diagnostics--${category}`;
-      details.open = open;
-      const detailsSummary = document.createElement('summary');
-      detailsSummary.textContent = `${label}（${items.length} 项）`;
-      const wrap = document.createElement('div');
-      wrap.className = 'resume-autofill-completion__table-wrap';
-      const table = document.createElement('table');
-      const head = document.createElement('thead');
-      const headRow = document.createElement('tr');
-      for (const heading of ['字段', '映射 / 目标', '页面回读', '判定阶段', '原因']) {
-        const cell = document.createElement('th');
-        cell.textContent = heading;
-        headRow.appendChild(cell);
-      }
-      head.appendChild(headRow);
-      const body = document.createElement('tbody');
-      for (const item of items) {
-        const row = document.createElement('tr');
-        const values = [
-          item.field,
-          `${item.key !== '—' ? `${item.key}\n` : ''}${item.target}`,
-          item.observed,
-          item.stage,
-          item.reason
-        ];
-        for (const value of values) {
-          const cell = document.createElement('td');
-          cell.textContent = value || '—';
-          row.appendChild(cell);
-        }
-        body.appendChild(row);
-      }
-      table.append(head, body);
-      wrap.appendChild(table);
-      details.append(detailsSummary, wrap);
-      panel.appendChild(details);
-      return true;
-    };
-
-    const slowItems = (stats.slowFields || []).map((item) =>
-      `${item.field} → ${item.key}：${(item.ms / 1000).toFixed(2)} 秒${item.ok ? '' : '（失败）'}`
-    );
-    const actions = document.createElement('div');
-    actions.className = 'resume-autofill-completion__actions';
-    const copy = document.createElement('button');
-    copy.type = 'button';
-    copy.className = 'resume-autofill-completion__action';
-    copy.textContent = '复制本次诊断';
-    copy.addEventListener('click', async () => {
-      const report = {
-        page: location.href,
-        summary: {
-          filled: stats.filled,
-          sectionsAdded: stats.sectionsAdded,
-          existing: stats.existing,
-          unmatched: stats.unmatched,
-          missingData: stats.missingData,
-          unsupported: stats.unsupported,
-          ignored: stats.ignored || 0,
-          aiReviewed: stats.aiReviewed || 0,
-          totalSeconds: Number((stats.timings.totalMs / 1000).toFixed(1))
-        },
-        details: stats.details,
-        diagnostics: stats.diagnostics,
-        slowFields: stats.slowFields,
-        timings: stats.timings,
-        sectionPlan: stats.sectionPlan,
-        interactionWarnings: stats.interactionWarnings
-      };
-      try {
-        await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
-        copy.textContent = '已复制';
-      } catch {
-        copy.textContent = '复制失败';
-      }
-    });
-    actions.appendChild(copy);
-
-    panel.append(header, summary, issues, legend, timing, explanation);
-    appendDiagnosticTable('绿色：AI 生成、保留或改选', stats.diagnostics.aiReview, 'ai-review');
-    if (!appendDiagnosticTable('红色：处理失败', stats.diagnostics.unsupported, 'unsupported', true)) appendDetails('实际处理失败', stats.details.unsupported);
-    if (!appendDiagnosticTable('黄色：本地资料缺失', stats.diagnostics.missingData, 'missing')) appendDetails('本地资料缺失', stats.details.missingData);
-    if (!appendDiagnosticTable('紫色：页面字段未映射', stats.diagnostics.unmatched, 'unmatched')) appendDetails('资料字段未映射', stats.details.unmatched);
-    if (!appendDiagnosticTable('蓝色：页面已有明确值', stats.diagnostics.existing, 'existing')) appendDetails('页面已有明确值', stats.details.existing);
-    appendDetails('有意忽略', stats.details.ignored);
-    appendDetails('最慢字段', slowItems);
-    panel.appendChild(actions);
-    document.documentElement.appendChild(panel);
-  }
-
-  function base64ToBytes(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-    return bytes;
-  }
-
-  function isResumeUpload(element) {
-    if (element.type !== 'file') return false;
-    const nearby = cleanText(element.parentElement?.textContent);
-    const text = `${labelText(element)} ${nearby}`.slice(0, 500);
-    if (/头像|照片|证件|身份证|作品|portfolio|cover\s*letter|求职信|attachment|其他附件/i.test(text)) return false;
-    return /简历|个人履历|resume|curriculum\s*vitae|\bcv\b/i.test(text);
-  }
-
-  function describeResumeUpload(element) {
-    const root = resumeUploadRoot(element);
-    const text = cleanText(`${labelText(element)} ${root?.textContent || ''}`).slice(0, 600);
-    const parsesResume = /快速解析|帮你.*解析|智能解析|解析简历|简历解析|parse/i.test(text);
-    const attachmentOnly = /简历附件|附件上传|上传文件/i.test(text) && !parsesResume;
-    return {
-      element,
-      root,
-      text,
-      kind: parsesResume ? 'parse' : attachmentOnly ? 'attachment' : 'resume',
-      score: parsesResume ? 100 : attachmentOnly ? 20 : 50
-    };
-  }
-
-  async function findResumeUploadTargets(timeout = 1800) {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const targets = [...document.querySelectorAll('input[type="file"]')].filter(isResumeUpload).map(describeResumeUpload);
-      if (targets.length) return targets.sort((left, right) => right.score - left.score);
-      await wait(120);
-    }
-    return [...document.querySelectorAll('input[type="file"]')].filter(isResumeUpload).map(describeResumeUpload).sort((left, right) => right.score - left.score);
-  }
-
-  function resumeUploadRoot(element) {
-    let best = element.parentElement || element;
-    for (let ancestor = element.parentElement, depth = 0; ancestor && depth < 5; ancestor = ancestor.parentElement, depth += 1) {
-      const text = cleanText(ancestor.textContent).slice(0, 800);
-      const fileInputs = ancestor.querySelectorAll('input[type="file"]').length;
-      if (fileInputs === 1 && /上传简历|简历上传|拖拽.*简历|resume\s*upload|upload\s*(?:resume|cv)/i.test(text)) best = ancestor;
-      if (text.length > 700 || fileInputs > 2) break;
-    }
-    return best;
-  }
-
-  function uploadResume(element, storedFile, overwrite) {
-    if (!storedFile?.base64 || (!overwrite && element.files?.length)) return null;
-    try {
-      const file = new File([base64ToBytes(storedFile.base64)], storedFile.name, {
-        type: storedFile.type || 'application/octet-stream',
-        lastModified: storedFile.lastModified || Date.now()
-      });
-      const transfer = new DataTransfer();
-      transfer.items.add(file);
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
-      setter ? setter.call(element, transfer.files) : (element.files = transfer.files);
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-      return element.files?.length === 1 ? { file, transfer } : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function dispatchResumeDrop(root, transfer) {
-    if (!(root instanceof Element) || !transfer) return false;
-    try {
-      for (const type of ['dragenter', 'dragover', 'drop']) {
-        let event;
-        try {
-          event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer });
-        } catch {
-          event = new Event(type, { bubbles: true, cancelable: true });
-          Object.defineProperty(event, 'dataTransfer', { configurable: true, value: transfer });
-        }
-        root.dispatchEvent(event);
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  function resumeUploadSuccessText(storedFile) {
-    const fileStem = cleanText(storedFile?.name).replace(/\.[^.]+$/, '').slice(0, 40);
-    const successPattern = /(?:简历|文件).{0,20}(?:上传成功|解析成功|解析完成|已上传|已解析)|(?:上传成功|解析成功|解析完成).{0,20}(?:简历|文件)|重新上传|删除简历/i;
-    return [...document.querySelectorAll('body *')].some((node) => {
-      if (!(node instanceof HTMLElement) || !visible(node) || node.children.length > 4) return false;
-      const text = cleanText(node.textContent).slice(0, 160);
-      return Boolean(text && (successPattern.test(text) || (fileStem.length >= 3 && text.includes(fileStem))));
-    });
-  }
-
-  function resumeParsingBusy() {
-    const pattern = /(?:简历|文件).{0,12}(?:上传中|解析中|识别中|处理中)|(?:uploading|parsing|processing).{0,12}(?:resume|cv)?/i;
-    return [...document.querySelectorAll('body *')].some((node) => {
-      if (!(node instanceof HTMLElement) || !visible(node) || node.children.length > 3) return false;
-      const text = cleanText(node.textContent).slice(0, 100);
-      return Boolean(text && pattern.test(text));
-    });
-  }
-
-  async function waitForResumeParsing(storedFile, activity, timeout = 30000) {
-    const started = Date.now();
-    let lastStructuralChange = Date.now();
-    let structuralChanges = 0;
-    let busyObserved = false;
-    const observer = new MutationObserver((mutations) => {
-      if (mutations.some((mutation) => mutation.type === 'childList' || mutation.type === 'characterData')) {
-        lastStructuralChange = Date.now();
-        structuralChanges += 1;
-      }
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    try {
-      await wait(600);
-      while (Date.now() - started < timeout) {
-        const busy = resumeParsingBusy();
-        busyObserved ||= busy;
-        const quietFor = Date.now() - lastStructuralChange;
-        const formControlsIncreased = document.querySelectorAll('input,textarea,select,[contenteditable="true"],[role="combobox"]').length > activity.beforeControlCount;
-        const sawParserActivity = structuralChanges > 0 || activity.relevantCount > 0 || formControlsIncreased;
-        const accepted = resumeUploadSuccessText(storedFile) || busyObserved || activity.relevantCount > 0 || formControlsIncreased;
-        const conservativeFallbackElapsed = Date.now() - started >= 5000;
-        if (!busy && quietFor >= 900 && accepted && (sawParserActivity || conservativeFallbackElapsed)) {
-          return { completed: true, accepted: true, waitedMs: Date.now() - started, structuralChanges, busyObserved };
-        }
-        await wait(180);
-      }
-      const formControlsIncreased = document.querySelectorAll('input,textarea,select,[contenteditable="true"],[role="combobox"]').length > activity.beforeControlCount;
-      return { completed: false, accepted: resumeUploadSuccessText(storedFile) || busyObserved || activity.relevantCount > 0 || formControlsIncreased, waitedMs: Date.now() - started, structuralChanges, busyObserved };
-    } finally {
-      observer.disconnect();
-    }
-  }
-
-  async function uploadResumeAndWait(element, storedFile, overwrite) {
-    const uploadRoot = resumeUploadRoot(element);
-    const activity = {
-      count: 0,
-      relevantCount: 0,
-      beforeControlCount: document.querySelectorAll('input,textarea,select,[contenteditable="true"],[role="combobox"]').length
-    };
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (!['childList', 'characterData', 'attributes'].includes(mutation.type)) continue;
-        activity.count += 1;
-        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (target && uploadRoot && (uploadRoot.contains(target) || target.contains(uploadRoot))) activity.relevantCount += 1;
-      }
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'style', 'aria-busy', 'disabled'] });
-    try {
-      const injected = uploadResume(element, storedFile, overwrite);
-      if (!injected) return { injected: false, accepted: false, completed: false, waitedMs: 0, dropFallback: false };
-      await wait(1200);
-      const earlyAccepted = resumeUploadSuccessText(storedFile) || resumeParsingBusy()
-        || activity.relevantCount > 0
-        || document.querySelectorAll('input,textarea,select,[contenteditable="true"],[role="combobox"]').length > activity.beforeControlCount;
-      const dropFallback = !earlyAccepted && dispatchResumeDrop(uploadRoot, injected.transfer);
-      const result = await waitForResumeParsing(storedFile, activity);
-      if (result.accepted) element.classList.add(FILLED_CLASS);
-      else element.classList.add(FAILED_CLASS);
-      return { injected: true, dropFallback, ...result };
-    } finally {
-      observer.disconnect();
-    }
-  }
-
-  const REPEATED_SECTION_CONFIG = {
-    education: {
-      label: '教育经历',
-      profileKey: 'educationEntries',
-      anchorKey: 'school',
-      // 真实网站往往只写“学校”或“院校”，不一定带“名称”。
-      anchor: /学校(?:名称)?|院校(?:名称)?|毕业(?:学校|院校)|就读(?:学校|院校)|university(?:\s*name)?|school\s*name/i,
-      // 不使用过宽的单词“学习”，避免和基本信息中的学习形式串台。
-      kind: /教育(?:经历|背景|信息)?|学历(?:经历|背景|信息)?|学习经历|院校经历|education|academic(?:\s*background)?/i,
-      addPattern: /(?:添加|新增|继续添加|增加|新建|再添).{0,16}(?:教育|学历|学习经历|院校经历)|(?:教育|学历|学习经历|院校经历).{0,16}(?:添加|新增|继续添加|增加|新建|再添)|add.{0,24}(?:education|academic)/i,
-      // React/Vue 表单常用 education[0].school、education.1.school 等路径。
-      // 按索引计数可避免把“最高学历/毕业院校”这类基本信息误算成教育段。
-      indexPattern: /(?:^|[^a-z])(?:educations?|education(?:entries|experiences?|backgrounds?|histories?)?|educational(?:backgrounds?|experiences?)|academic(?:backgrounds?|experiences?|histories?)|school(?:experiences?|histories?))\s*(?:\[|\(|\.|_|-)?\s*(\d+)(?:\]|\)|\.|_|-|$)/i
-    },
-    work: {
-      label: '工作/实习经历',
-      profileKey: 'workEntries',
-      anchorKey: 'company',
-      anchor: /公司名称|单位名称|雇主|employer|company\s*name/i,
-      kind: /实习|工作|任职|职业|社会实践|实践经历|employment|intern(?:ship)?|work\s*experience/i,
-      addPattern: /(?:添加|新增|继续添加|增加|新建|再添).{0,16}(?:实习|工作|任职|职业|社会实践|实践经历)|(?:实习|工作|任职|职业|社会实践|实践经历).{0,16}(?:添加|新增|继续添加|增加|新建|再添)|add.{0,24}(?:intern|employment|work)/i,
-      indexPattern: /(?:^|[^a-z])(?:work(?:entries|experiences?|histories?)?|employment(?:entries|experiences?|histories?)?|job(?:entries|experiences?|histories?)?|internships?|internship(?:entries|experiences?|histories?)?|intern(?:entries|experiences?|histories?)?|practice(?:entries|experiences?|histories?)?)\s*(?:\[|\(|\.|_|-)?\s*(\d+)(?:\]|\)|\.|_|-|$)/i
-    },
-    project: {
-      label: '项目经历',
-      profileKey: 'projectEntries',
-      anchorKey: 'projectName',
-      anchor: /项目名称|课题名称|project\s*name/i,
-      kind: /项目|科研|课题|project|research/i,
-      addPattern: /(?:添加|新增|继续添加|增加|新建|再添).{0,16}(?:项目|科研|课题)|(?:项目|科研|课题).{0,16}(?:添加|新增|继续添加|增加|新建|再添)|add.{0,24}(?:project|research)/i,
-      indexPattern: /(?:^|[^a-z])(?:projects?|project(?:entries|experiences?|histories?)?|research(?:projects?|entries|experiences?|histories?)?|subjects?|topics?)\s*(?:\[|\(|\.|_|-)?\s*(\d+)(?:\]|\)|\.|_|-|$)/i
-    },
-    certificate: {
-      label: '证书/奖项',
-      profileKey: 'certificateEntries',
-      anchorKey: 'certificateName',
-      anchor: /证书名称|技能证书|资格证书|奖项名称|荣誉名称|资质名称|certificate\s*(?:name|title)|award\s*(?:name|title)|honou?r\s*(?:name|title)/i,
-      kind: /证书|技能证书|资格|奖项|奖励|荣誉|资质|certificate|qualification|award|honou?r/i
-    },
-    language: {
-      label: '语言经历',
-      profileKey: 'languageEntries',
-      anchorKey: 'languageName',
-      anchor: /语言名称|语言类型|外语语种|语种|language\s*(?:name|type)?/i,
-      kind: /语言|外语|语种|language/i
-    },
-    family: {
-      label: '家庭成员/联系人',
-      profileKey: 'familyEntries',
-      anchorKey: 'familyName',
-      anchor: /家庭成员.*姓名|亲属.*姓名|紧急联系人.*姓名|联系人姓名|成员姓名|family.*name|contact.*name/i,
-      kind: /家庭|亲属|父母|紧急联系人|联系人|family|relative|emergency\s*contact/i
-    }
-  };
-
-  const ADD_ACTION_PATTERN = /添加|新增|继续添加|增加|新建|再添|add|create|new|\+/i;
-  const ADD_NEGATIVE_PATTERN = /删除|移除|编辑|保存|取消|提交|上传|delete|remove|edit|save|submit|upload/i;
-
-  function nearbyKindTexts(button) {
-    const pieces = [];
-    const add = (value) => {
-      const text = cleanText(value);
-      if (text && text.length <= 120 && !pieces.includes(text)) pieces.push(text);
-    };
-    add(button.getAttribute('aria-label'));
-    add(button.getAttribute('title'));
-    add(button.textContent);
-
-    let branch = button;
-    for (let depth = 0; branch?.parentElement && depth < 10; depth += 1) {
-      const ancestor = branch.parentElement;
-      const children = [...ancestor.children];
-      const branchIndex = children.indexOf(branch);
-
-      // 同行标题、按钮前面的区块标题和包裹层中的标题语义。
-      children.forEach((child, index) => {
-        if (child === branch || child.contains(button)) return;
-        if (child.matches('button,a,[role="button"]') || child.querySelector('input,textarea,select,[contenteditable="true"]')) return;
-        const text = cleanText(child.textContent);
-        if (text.length <= 80 && (index <= branchIndex || children.length <= 4)) add(text);
-      });
-      [...ancestor.querySelectorAll('h1,h2,h3,h4,h5,h6,legend,[role="heading"],[class*="title"],[class*="Title"],[class*="heading"]')]
-        .filter((node) => !node.contains(button) && !button.contains(node))
-        .slice(0, 10)
-        .forEach((node) => add(node.textContent));
-
-      // 小型结构区可以安全使用整体文字；大型表单不能，否则会把多个“添加”串台。
-      const controls = controlNodes(ancestor).length;
-      const actions = ancestor.querySelectorAll('button,a,[role="button"]').length;
-      const whole = cleanText(ancestor.textContent);
-      if (whole.length <= 180 && controls <= 8 && actions <= 4) add(whole);
-      branch = ancestor;
-    }
-
-    // 最后按空间关系寻找按钮上方或同行的短标题，解决标题和按钮被不同包装层隔开的页面。
-    const rect = button.getBoundingClientRect();
-    [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,legend,label,strong,span,p,[role="heading"]')]
-      .filter((node) => node !== button && visible(node) && !node.contains(button) && !button.contains(node))
-      .filter((node) => {
-        const text = cleanText(node.textContent);
-        if (!text || text.length > 60 || ADD_ACTION_PATTERN.test(text)) return false;
-        if (!Object.values(REPEATED_SECTION_CONFIG).some((config) => config.kind.test(text))) return false;
-        const candidate = node.getBoundingClientRect();
-        const vertical = rect.top - candidate.bottom;
-        const sameRow = Math.abs((candidate.top + candidate.bottom) / 2 - (rect.top + rect.bottom) / 2) <= 50;
-        const overlaps = candidate.right >= rect.left - 500 && candidate.left <= rect.right + 160;
-        return overlaps && (sameRow || (vertical >= -20 && vertical <= 220));
-      })
-      .sort((left, right) => Math.abs(rect.top - left.getBoundingClientRect().bottom) - Math.abs(rect.top - right.getBoundingClientRect().bottom))
-      .slice(0, 5)
-      .forEach((node) => add(node.textContent));
-    return pieces;
-  }
-
-  function repeatedButtonKindScore(button, kind) {
-    const config = REPEATED_SECTION_CONFIG[kind];
-    if (!config) return 0;
-    const own = interactiveDescription(button);
-    if (!ADD_ACTION_PATTERN.test(own) || ADD_NEGATIVE_PATTERN.test(own)) return 0;
-    const evidence = nearbyKindTexts(button);
-    // “添加教育经历”这类明确自述文本必须压过附近其他区块的模糊文字。
-    let score = config.addPattern?.test(own) ? 30 : (config.kind.test(own) ? 12 : 0);
-    evidence.forEach((text, index) => {
-      if (config.addPattern?.test(text)) score = Math.max(score, 24 - Math.min(index, 4));
-      if (config.kind.test(text)) score = Math.max(score, 10 - Math.min(index, 6));
-      if (config.anchor.test(text)) score = Math.max(score, 8 - Math.min(index, 4));
-    });
-    // 标题缺失时，用按钮与该类经历强字段的空间邻近关系补充证据。
-    // 例如按钮只有一个“+”图标，但它紧邻“公司名称”输入框，仍可判定为工作经历入口。
-    const buttonRect = button.getBoundingClientRect();
-    for (const control of controlNodes(document)) {
-      if (!visible(control)) continue;
-      const text = labelText(control);
-      const context = sectionContext(control);
-      if (matchKey(text, context) !== config.anchorKey && !config.anchor.test(text)) continue;
-      const rect = control.getBoundingClientRect();
-      const vertical = Math.min(Math.abs(buttonRect.top - rect.bottom), Math.abs(rect.top - buttonRect.bottom));
-      const horizontal = Math.max(0, Math.max(rect.left - buttonRect.right, buttonRect.left - rect.right));
-      if (vertical <= 420 && horizontal <= 700) {
-        score = Math.max(score, context === kind ? 9 : 7);
-        break;
-      }
-    }
-    if (button.matches('button,a,[role="button"]')) score += 2;
-    else if (interactionHint(button)) score += 1;
-    return score;
-  }
-
-  function resolvedRepeatedButtonKind(button) {
-    const ranked = Object.keys(REPEATED_SECTION_CONFIG)
-      .map((kind) => ({ kind, score: repeatedButtonKindScore(button, kind) }))
-      .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score);
-    if (!ranked.length) return '';
-    if (ranked[1]?.score === ranked[0].score) {
-      const own = cleanText(`${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''} ${button.textContent}`);
-      const explicit = ranked.filter(({ kind }) => REPEATED_SECTION_CONFIG[kind].kind.test(own));
-      return explicit.length === 1 ? explicit[0].kind : '';
-    }
-    return ranked[0].kind;
-  }
-
-  function indexedRepeatedSectionSignatures(kind) {
-    const config = REPEATED_SECTION_CONFIG[kind];
-    if (!config?.indexPattern) return new Set();
-    const signatures = new Set();
-    const attributes = ['data-cy', 'data-testid', 'data-field', 'data-name', 'name', 'id'];
-    const nodes = document.querySelectorAll('[data-cy],[data-testid],[data-field],[data-name],[name],[id]');
-    for (const node of nodes) {
-      if (!(node instanceof Element) || !node.isConnected || !visible(node)) continue;
-      for (const attribute of attributes) {
-        const value = node.getAttribute(attribute);
-        if (!value) continue;
-        const match = value.match(config.indexPattern);
-        if (match) {
-          signatures.add(`${kind}:${Number(match[1])}`);
-          break;
-        }
-      }
-    }
-    return signatures;
-  }
-
-  function repeatedAnchorControls(kind) {
-    const config = REPEATED_SECTION_CONFIG[kind];
-    if (!config) return [];
-    const controls = [...document.querySelectorAll('input:not([type="hidden"]),textarea,select,[contenteditable="true"],[role="combobox"]')];
-    return controls.filter((control) => {
-      if (!control.isConnected || !visible(control)) return false;
-      const label = labelText(control);
-      const context = sectionContext(control);
-      if (matchKey(label, context) !== config.anchorKey) return false;
-      // 区块语义是最稳定的证据；标题缺失时才退回到强字段锚点。
-      // 教育的退回路径排除“最高学历毕业院校”等顶层概要字段。
-      if (context === kind) return true;
-      if (context && context !== kind) return false;
-      if (!config.anchor.test(label)) return false;
-      if (kind === 'education' && /最高学历|最高学位|基本信息|个人信息/i.test(label)) return false;
-      return true;
-    });
-  }
-
-  function repeatedSectionCount(kind) {
-    if (!REPEATED_SECTION_CONFIG[kind]) return 0;
-    // 教育经历优先按数组路径中的唯一索引计数。一段内有学校、学历、日期多个字段，
-    // 但 education[1] 只计一次；也能在新段尚未填写时立即观察到 DOM 增长。
-    const indexed = indexedRepeatedSectionSignatures(kind);
-    const anchors = repeatedAnchorControls(kind).length;
-    return Math.max(indexed.size, anchors);
-  }
-
-  async function sampledRepeatedSectionCount(kind, samples = 3, delay = 70) {
-    let max = 0;
-    for (let index = 0; index < samples; index += 1) {
-      max = Math.max(max, repeatedSectionCount(kind));
-      if (index < samples - 1) await wait(delay);
-    }
-    return max;
-  }
-
-  function nearbySectionText(button) {
-    let ancestor = button.parentElement;
-    const buttonText = cleanText(button.textContent);
-    for (let depth = 0; ancestor && depth < 7; ancestor = ancestor.parentElement, depth += 1) {
-      const heading = ancestor.querySelector(':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > [role="heading"],:scope > [class*="title"],:scope > [class*="Title"],:scope > [class*="heading"]');
-      const text = cleanText(heading?.textContent);
-      if (text && text.length <= 80) return text;
-
-      // 一些组件把区块名放在按钮同一行的普通 span/div 中，例如“技能证书 [添加]”。
-      // 读取最近结构行内不包含按钮、控件和其他操作按钮的兄弟文字，不依赖随机 class。
-      const siblingText = [...ancestor.children]
-        .filter((child) => !child.contains(button) && !button.contains(child) && visible(child))
-        .filter((child) => !child.matches('button,a,[role="button"]') && !child.querySelector('button,a,[role="button"],input,textarea,select,[contenteditable="true"]'))
-        .map((child) => cleanText(child.textContent))
-        .filter((value) => value && value !== buttonText && value.length <= 80)
-        .join(' ')
-        .slice(0, 160);
-      if (siblingText) return siblingText;
-    }
-    return '';
-  }
-
-  function findRepeatedSectionAddButton(kind) {
-    const nativeCandidates = [...document.querySelectorAll('button,[role="button"],[role="menuitem"],a,[tabindex],[onclick],[aria-label],[title],[data-action],[data-testid]')]
-      .filter((node) => {
-        const text = interactiveDescription(node);
-        return visible(node) && ADD_ACTION_PATTERN.test(text) && !ADD_NEGATIVE_PATTERN.test(text);
-      });
-    // 许多 React 页面把“添加经历”实现为普通 div/span 并在祖先上注册事件。
-    // 按短文本语义寻找，而不是依赖会随构建变化的 class 名。
-    const semanticCandidates = [...document.querySelectorAll('div,span,p,strong,li,i,svg')]
-      .filter((node) => {
-        if (!(node instanceof Element) || !visible(node)) return false;
-        // 原生交互元素及其文字子节点已由 nativeCandidates 处理；结构行只用于提供上下文，
-        // 不能反过来抢占真正的按钮成为坐标点击目标。
-        if (node.closest('button,a,[role="button"],[role="menuitem"]') || node.querySelector('button,a,[role="button"],[role="menuitem"]')) return false;
-        const text = interactiveDescription(node).slice(0, 100);
-        if (!text || text.length > 60 || !ADD_ACTION_PATTERN.test(text)) return false;
-        if (!resolvedRepeatedButtonKind(node)) return false;
-        return !node.querySelector('input,textarea,select,[contenteditable="true"]');
-      });
-    const candidates = [...new Set([...nativeCandidates, ...semanticCandidates])];
-
-    function clickableTarget(candidate) {
-      let node = candidate;
-      for (let depth = 0; node instanceof Element && depth < 6; depth += 1, node = node.parentElement) {
-        const text = cleanText(node.textContent);
-        const native = node.matches('button,a,[role="button"],[role="menuitem"]');
-        const eventHint = typeof node.onclick === 'function' || node.hasAttribute('tabindex');
-        const pointer = getComputedStyle(node).cursor === 'pointer';
-        if (native || eventHint || pointer) return node;
-        if (text.length > 160) break;
-      }
-      // React 委托事件会从文字节点冒泡到真正的 div 处理器，子元素本身也可作为坐标目标。
-      return candidate;
-    }
-
-    return candidates
-      .filter((candidate) => candidate instanceof Element && visible(candidate) && !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true')
-      .map((candidate) => {
-        const button = clickableTarget(candidate);
-        return { button, score: resolvedRepeatedButtonKind(button) === kind ? repeatedButtonKindScore(button, kind) : 0 };
-      })
-      .filter((candidate) => candidate.score > 0)
-      .sort((left, right) => right.score - left.score)[0]?.button || null;
-  }
-
-  function repeatedSectionGrowthRegion(kind, button) {
-    const config = REPEATED_SECTION_CONFIG[kind];
-    if (!config || !(button instanceof Element)) return null;
-    let best = null;
-    for (let depth = 0, node = button.parentElement; node && depth < 10; depth += 1, node = node.parentElement) {
-      if (!visible(node)) continue;
-      const controls = controlNodes(node).filter((control) => control.isConnected && visible(control));
-      if (!controls.length || controls.length > 140) continue;
-      const text = cleanText(node.textContent);
-      const kindHit = config.kind.test(text) || config.anchor.test(text);
-      if (!kindHit) continue;
-      const score = (config.kind.test(text) ? 6 : 0)
-        + (config.anchor.test(text) ? 3 : 0)
-        + (controls.length <= 60 ? 4 : 2)
-        + (text.length <= 2200 ? 2 : 0)
-        - depth;
-      if (!best || score > best.score) best = { node, score };
-    }
-    return best?.node || null;
-  }
-
-  function repeatedSectionGrowthMetrics(kind, region) {
-    const config = REPEATED_SECTION_CONFIG[kind];
-    if (!config || !(region instanceof Element)) return { controls: 0, kindControls: 0, removeActions: 0 };
-    const controls = controlNodes(region).filter((control) => control.isConnected && visible(control));
-    const kindControls = controls.filter((control) => {
-      const text = labelText(control);
-      const context = sectionContext(control);
-      return context === kind || config.anchor.test(text) || config.kind.test(text);
-    });
-    const removeActions = [...region.querySelectorAll('button,[role="button"],a,[tabindex],[onclick]')]
-      .filter((node) => visible(node) && /删除|移除|remove|delete/i.test(interactiveDescription(node))).length;
-    return { controls: controls.length, kindControls: kindControls.length, removeActions };
-  }
-
-  function repeatedSectionGrowthDetected(beforeMetrics, afterMetrics) {
-    if (!beforeMetrics || !afterMetrics) return false;
-    return afterMetrics.kindControls >= beforeMetrics.kindControls + 1
-      || afterMetrics.controls >= beforeMetrics.controls + 3
-      || afterMetrics.removeActions > beforeMetrics.removeActions;
-  }
-
-  async function waitForRepeatedSectionCount(kind, before, button = null, timeout = 900) {
-    const initialRegion = repeatedSectionGrowthRegion(kind, button);
-    const initialMetrics = initialRegion ? repeatedSectionGrowthMetrics(kind, initialRegion) : null;
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const count = repeatedSectionCount(kind);
-      if (count > before) return count;
-      const liveButton = button?.isConnected ? button : findRepeatedSectionAddButton(kind);
-      const liveRegion = repeatedSectionGrowthRegion(kind, liveButton) || (initialRegion?.isConnected ? initialRegion : null);
-      if (liveRegion && repeatedSectionGrowthDetected(initialMetrics, repeatedSectionGrowthMetrics(kind, liveRegion))) {
-        return before + 1;
-      }
-      await wait(40);
-    }
-    const finalCount = Math.max(repeatedSectionCount(kind), await sampledRepeatedSectionCount(kind, 2, 60));
-    if (finalCount > before) return finalCount;
-    const finalButton = button?.isConnected ? button : findRepeatedSectionAddButton(kind);
-    const finalRegion = repeatedSectionGrowthRegion(kind, finalButton) || (initialRegion?.isConnected ? initialRegion : null);
-    if (finalRegion && repeatedSectionGrowthDetected(initialMetrics, repeatedSectionGrowthMetrics(kind, finalRegion))) {
-      return before + 1;
-    }
-    return finalCount;
-  }
-
-  async function ensureRepeatedSections(profile, stats) {
-    for (const [kind, config] of Object.entries(REPEATED_SECTION_CONFIG)) {
-      const entries = (profile[config.profileKey] || []).filter((entry) => entry && Object.values(entry).some((value) => String(value || '').trim()));
-      // 资料中有几段，就以几段为目标；不使用固定段数或固定上限。
-      // 每次点击仍必须观察到强字段锚点增加，否则立即停止，避免错误按钮导致循环点击。
-      const desired = entries.length;
-      let current = await sampledRepeatedSectionCount(kind);
-      if (!desired) continue;
-      const plan = {
-        kind,
-        label: config.label,
-        desired,
-        existing: current,
-        needed: Math.max(0, desired - current),
-        added: 0,
-        final: current
-      };
-      stats.sectionPlan.push(plan);
-      while (current < desired) {
-        const observedCurrent = await sampledRepeatedSectionCount(kind, 2, 60);
-        if (observedCurrent > current) {
-          current = observedCurrent;
-          plan.final = current;
-          plan.needed = Math.max(0, desired - current);
-          if (current >= desired) break;
-        }
-        const button = findRepeatedSectionAddButton(kind);
-        if (!button) {
-          plan.skipped = desired - current;
-          stats.ignored += 1;
-          if (stats.details.ignored.length < 8) {
-            stats.details.ignored.push(`${config.label}：页面未提供或未识别到可安全归类的新增入口；跳过新增 ${desired - current} 段`);
-          }
-          break;
-        }
-        activateOption(button);
-        let next = await waitForRepeatedSectionCount(kind, current, button);
-        if (next <= current && button.isConnected) {
-          const trusted = await trustedClick(button);
-          if (trusted?.ok) next = await waitForRepeatedSectionCount(kind, current, button, 1800);
-        }
-        if (next <= current) {
-          stats.sectionAddFailed += desired - current;
-          stats.unsupported += 1;
-          button.classList.add(FAILED_CLASS);
-          if (stats.details.unsupported.length < 8) stats.details.unsupported.push(`${kind} 的“添加经历”按钮已点击，但没有观察到新的经历表单`);
-          recordDiagnostic(stats, 'unsupported', {
-            field: config.label, key: config.profileKey, target: `${desired} 段`, observed: `${current} 段`,
-            stage: '添加按钮点击后 DOM 增长验证',
-            reason: '已尝试 DOM 点击和浏览器级点击，但没有观察到新的数组索引或强字段锚点'
-          });
-          break;
-        }
-        stats.sectionsAdded += next - current;
-        plan.added += next - current;
-        current = next;
-        plan.final = current;
-        await wait(40);
-      }
-      plan.final = current;
-    }
-  }
-
-  function clearMarks() {
-    document.querySelectorAll(`.${FILLED_CLASS}, .${UNMATCHED_CLASS}, .${MISSING_CLASS}, .${FAILED_CLASS}, .${EXISTING_CLASS}, .${IGNORED_CLASS}`).forEach((element) => {
-      element.classList.remove(FILLED_CLASS, UNMATCHED_CLASS, MISSING_CLASS, FAILED_CLASS, EXISTING_CLASS, IGNORED_CLASS);
-    });
-    document.querySelector('.resume-autofill-toast')?.remove();
-    document.querySelector('.resume-autofill-completion')?.remove();
-    document.querySelector('.resume-autofill-audit')?.remove();
-    document.querySelectorAll('.resume-autofill-audit-target').forEach((element) => element.classList.remove('resume-autofill-audit-target'));
-    clearAuditAnnotations();
-  }
-
-  function clearAuditAnnotations() {
-    const classes = [
-      'resume-autofill-audit-mark--free-entry', 'resume-autofill-audit-mark--type-then-select',
-      'resume-autofill-audit-mark--select-only', 'resume-autofill-audit-mark--date', 'resume-autofill-audit-mark--file-upload',
-      'resume-autofill-audit-mark--add-action', 'resume-autofill-audit-mark--understood-unsupported',
-      'resume-autofill-audit-mark--not-understood', 'resume-autofill-audit-mark--safe-ignored',
-      'resume-autofill-audit-status--understood-unsupported', 'resume-autofill-audit-status--not-understood',
-      'resume-autofill-audit-status--safe-ignored'
-    ];
-    document.querySelectorAll('[data-resume-autofill-audit-ref]').forEach((element) => {
-      element.classList.remove(...classes);
-      delete element.dataset.resumeAutofillAuditRef;
-    });
-  }
-
-  function classSummary(element) {
-    return String(element?.className || '').split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
-  }
-
-  function auditOwnText(element) {
-    const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
-      .map((id) => document.getElementById(id)?.textContent || '').join(' ');
-    const labels = element.labels ? [...element.labels].map((label) => label.textContent || '').join(' ') : '';
-    return cleanText([
-      labels, labelledBy, element.getAttribute('aria-label'), element.getAttribute('title'),
-      element.getAttribute('placeholder'), element.getAttribute('name'), element.id
-    ].filter(Boolean).join(' '));
-  }
-
-  function auditWidgetSemantics(element) {
-    const root = element.closest('.phoenix-select,[class*="date-picker"],[class*="DatePicker"],[class*="calendar"],[class*="Calendar"]')
-      || customSelectTrigger(element) || element;
-    const evidence = [String(root.className || ''), root.id || ''];
-    for (const node of root.querySelectorAll('svg [id], svg use, svg title, [data-icon], [class*="date"], [class*="Date"], [class*="calendar"], [class*="Calendar"]')) {
-      evidence.push(
-        node.id || '', String(node.className?.baseVal || node.className || ''), node.textContent || '',
-        node.getAttribute('href') || '', node.getAttribute('xlink:href') || '', node.getAttribute('data-icon') || ''
-      );
-      if (evidence.length >= 50) break;
-    }
-    return cleanText(evidence.filter(Boolean).join(' '));
-  }
-
-  function auditControlKind(element, inferredText = '', matchedKey = '') {
-    const type = String(element.type || '').toLowerCase();
-    const role = element.getAttribute('role') || '';
-    const ownText = auditOwnText(element);
-    const widgetSemantics = auditWidgetSemantics(element);
-    const logicalDateWidget = element.matches('.atsx-date-picker-period-month,[class*="date-picker-period"]');
-    const fieldMatchedAsDate = Boolean(matchedKey && (/Date$|Date\b/.test(matchedKey) || DATE_RANGE_KINDS[matchedKey]));
-    if (type === 'file') return 'file-upload';
-    if (type === 'radio' || role === 'radio') return 'radio';
-    if (type === 'checkbox' || role === 'checkbox' || role === 'switch') return role === 'switch' ? 'switch' : 'checkbox';
-    if (element instanceof HTMLSelectElement) return 'native-select';
-    if (type === 'date' || type === 'month') return 'native-date';
-    if ((fieldMatchedAsDate || /日期|时间|年月|年\s*\/\s*月|date|calendar|yyyy|mm|dd|time[_-]?picker/i.test(`${ownText} ${widgetSemantics}`))
-      && (element.matches('input,[role="combobox"]') || element.readOnly || logicalDateWidget)) return 'date-trigger';
-    if (element.matches('[role="combobox"]') || element.getAttribute('aria-haspopup') === 'listbox'
-      || (element.matches('input,textarea') && customSelectTrigger(element))) {
-      return element.getAttribute('aria-autocomplete') || (!element.readOnly && AUTOCOMPLETE_KEYS.has(matchKey(inferredText, sectionContext(element))))
-        ? 'autocomplete' : 'custom-select';
-    }
-    if (element.matches('textarea,[contenteditable="true"],[role="textbox"]')) return 'free-text';
-    if (element instanceof HTMLInputElement) return 'free-text';
-    if (ADD_ACTION_PATTERN.test(interactiveDescription(element)) && !ADD_NEGATIVE_PATTERN.test(interactiveDescription(element))) return 'add-action';
-    if (element.matches('button,[role="button"],[role="menuitem"],summary')) return 'button';
-    if (element.matches('a,[role="link"]')) return 'link';
-    return 'custom-interactive';
-  }
-
-  function auditDateShape(element, matchedKey, controlKind) {
-    if (!['native-date', 'date-trigger'].includes(controlKind)) return { precision: '', mechanism: '' };
-    const type = String(element.type || '').toLowerCase();
-    const ownText = `${auditOwnText(element)} ${auditWidgetSemantics(element)}`;
-    const atsxPeriodMonth = element.matches('.atsx-date-picker-period-month,[class*="date-picker-period-month"]');
-    const range = element.matches('input') ? structuralDateRange(element) : null;
-    const container = semanticContainer(element);
-    const nearbyDateControls = container
-      ? controlNodes(container).filter((node) => datePart(node) || ['date', 'month'].includes(String(node.type || '').toLowerCase())
-        || /年|月|日|year|month|day/i.test(auditOwnText(node)))
-      : [];
-    const parts = range?.controls?.length ? range.controls.length / 2 : nearbyDateControls.length;
-    const explicitDay = type === 'date' || parts === 3 || /日|day|dd|yyyy\W*mm\W*dd/i.test(ownText);
-    const explicitMonth = type === 'month' || parts === 2 || /月|month|mm|yyyy\W*mm/i.test(ownText);
-    const precision = atsxPeriodMonth ? 'year-month' : explicitDay ? 'year-month-day' : explicitMonth ? 'year-month' : 'unknown-date';
-    let mechanism = 'custom-calendar-or-list';
-    if (atsxPeriodMonth) mechanism = 'period-month-two-end-lists';
-    else if (type === 'date' || type === 'month') mechanism = 'browser-native-picker';
-    else if (parts >= 2) mechanism = parts >= 3 ? 'separate-year-month-day-lists' : 'separate-year-month-lists';
-    else if (customSelectTrigger(element)) mechanism = 'dropdown-or-calendar-panel';
-    else if (!element.readOnly) mechanism = 'free-date-text';
-    return { precision, mechanism };
-  }
-
-  function auditFieldCapability(element, matchedKey, controlKind, repeatedKind) {
-    const hadFillFailure = Boolean(fillFailureReasons.get(element));
-    const supportedKinds = new Set([
-      'free-text', 'autocomplete', 'native-select', 'custom-select', 'native-date', 'date-trigger',
-      'radio', 'checkbox', 'switch', 'file-upload'
-    ]);
-    if (repeatedKind) return { capability: 'understood-supported', reason: '' };
-    if (hadFillFailure) return { capability: 'understood-unsupported', reason: '此前填写尝试失败；具体资料值和失败原文不写入审计报告' };
-    if (supportedKinds.has(controlKind)) return { capability: 'understood-supported', reason: '' };
-    if (controlKind === 'add-action') {
-      return { capability: 'understood-unsupported', reason: '已识别为添加按钮，但没有确定它要新增哪一类区块，暂不自动点击' };
-    }
-    return { capability: 'not-understood', reason: `发现了可交互元素，但暂时没有 ${controlKind} 的安全操作规则` };
-  }
-
-  function auditInputMode(controlKind) {
-    if (controlKind === 'free-text') return 'free-entry';
-    if (controlKind === 'autocomplete') return 'type-then-select';
-    if (['native-select', 'custom-select', 'radio', 'checkbox', 'switch'].includes(controlKind)) return 'select-only';
-    if (['native-date', 'date-trigger'].includes(controlKind)) return 'date';
-    if (controlKind === 'file-upload') return 'file-upload';
-    if (controlKind === 'add-action') return 'add-action';
-    return 'other-action';
-  }
-
-  function auditVisualTarget(element) {
-    const phoenixSelect = element.closest('.phoenix-select');
-    if (phoenixSelect instanceof Element && phoenixSelect.isConnected) return phoenixSelect;
-    const trigger = customSelectTrigger(element);
-    if (trigger instanceof Element && trigger.isConnected) return trigger;
+  function visualTarget(element) {
+    const addTarget = preciseAddTarget(element);
+    if (addTarget) return addTarget;
+    const phoenixButtonSelect = phoenixButtonSelectRoot(element);
+    if (phoenixButtonSelect) return phoenixButtonSelect;
+    const radioGroup = radioGroupRoot(element);
+    if (radioGroup) return radioGroup;
+    if (declaredFieldMode(element) === 'string' && isPlainEditableTextField(element)) return element;
+    const select = selectRoot(element);
+    if (select) return select;
+    const labelled = element.closest('label');
+    if (labelled && ['radio', 'checkbox'].includes(String(element.type || '').toLowerCase())) return labelled;
     return element;
   }
 
-  function auditMarkKind(item) {
-    if (item.inputMode && item.inputMode !== 'other-action') return item.inputMode;
-    if (['understood-unsupported', 'not-understood', 'safe-ignored'].includes(item.capability)) return item.capability;
-    return item.inputMode || 'other-action';
+  function widgetEvidence(element) {
+    const root = selectRoot(element) || element.closest('[class*="date"],[class*="Date"],[class*="calendar"],[class*="Calendar"]') || element;
+    const evidence = [classSummary(root), root.id || '', root.getAttribute('data-testid') || '', root.getAttribute('data-cy') || ''];
+    for (const node of root.querySelectorAll('svg [id],svg use,[data-icon]')) {
+      evidence.push(node.id || '', node.getAttribute('href') || '', node.getAttribute('xlink:href') || '', node.getAttribute('data-icon') || '');
+      if (evidence.length > 30) break;
+    }
+    return cleanText(evidence.join(' '));
   }
 
-  function auditRequirement(element) {
+  function controlKind(element, text, matchedKey) {
+    const type = String(element.type || '').toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    const widget = widgetEvidence(element);
+    if (element instanceof HTMLCanvasElement) return 'canvas';
+    if (radioGroupRoot(element) === element) return 'radio-group';
+    if (element.matches('.atsx-upload,.atsx-upload-btn')) return 'file-upload';
+    if (element.matches('.ud__picker')) return 'date-trigger';
+    if (element.matches('.common-unmodeled-layer,.common-unmodeled-layer__layerContent,.phoenix-selectList')
+      && (element.matches('.phoenix-selectList') || element.querySelector('.phoenix-selectList'))) {
+      return element.querySelector('.phoenix-selectList--search,input[placeholder="搜索"]')
+        ? 'searchable-option-panel' : 'option-panel';
+    }
+    if (phoenixButtonSelectRoot(element) === element) return 'select-trigger';
+    if (element.matches('.atsx-date-picker-dropdown')) return 'month-picker';
+    if (element.matches('.atsx-date-picker-period-month-label')) return 'month-trigger';
+    if (element.matches('.phoenix-date-picker')) {
+      if (element.querySelector('.phoenix-calendar-month-calendar,.phoenix-calendar-month-panel')) return 'month-picker';
+      if (element.querySelector('.phoenix-calendar-date-panel,.phoenix-calendar-table')) return 'date-picker';
+      return 'date-trigger';
+    }
+    if (element.matches('[class*="sd-panal-menu-wrapper"]')
+      && element.querySelector('[class*="sd-basic-year-container"],[class*="sd-basic-year-item"]')) return 'month-picker';
+    if (type === 'file') return 'file-upload';
+    if (element.matches('[contenteditable]:not([contenteditable="false"])') || role === 'textbox' && !element.matches('input,textarea')) return 'rich-text';
+    if (type === 'range' || role === 'slider') return 'slider';
+    if (role === 'spinbutton') return 'stepper';
+    if (type === 'radio' || role === 'radio') return 'radio';
+    if (type === 'checkbox' || role === 'checkbox' || role === 'switch') return role === 'switch' ? 'switch' : 'checkbox';
+    if (element instanceof HTMLSelectElement) return 'native-select';
+    if (type === 'date' || type === 'month' || type === 'datetime-local') return 'native-date';
+    // 组件已经声明为 string_info 时，只允许当前字段内部的证据参与分类。
+    // 外层重复卡片或兄弟字段中的 select_info 不得把它污染成选择控件。
+    if (declaredFieldMode(element) === 'string' && isPlainEditableTextField(element)) return 'free-text';
+    // 姓名、英文名、证件号码等开放值域文本框优先按“自由写入”判定。
+    // autocomplete 只是浏览器自动补全提示，不是封闭值域证据。
+    if (isOpenTextField(element, matchedKey, text)) return 'free-text';
+    const activationHandler = `${element.getAttribute('onfocus') || ''} ${element.getAttribute('onclick') || ''} ${element.getAttribute('onmousedown') || ''}`;
+    const dateSemantic = DATE_KEYS.test(matchedKey)
+      || /日期|时间|年月|入学(?:日期|时间)|毕业(?:日期|时间)|date|calendar|setday|yyyy|mm|dd|time[_-]?picker/i.test(`${text} ${widget} ${activationHandler}`);
+    const closedEvidence = closedValueEvidence(element);
+    if (dateSemantic && isMokaYearMonthSelect(element) && closedEvidence.length > 0) {
+      return searchableEvidence(element) ? 'autocomplete' : 'custom-select';
+    }
+    if (dateSemantic && (element.matches('input,[role="combobox"],[role="button"]') || element.readOnly)) return 'date-trigger';
+    if (isPlainEditableTextField(element) && closedEvidence.length === 0) return 'free-text';
+    if (closedEvidence.length > 0) {
+      return searchableEvidence(element) ? 'autocomplete' : 'custom-select';
+    }
+    if (element.matches('textarea,[role="textbox"]')) return 'free-text';
+    if (element instanceof HTMLInputElement) return 'free-text';
+    const description = actionDescription(element);
+    if (ADD_PATTERN.test(description) && !ADD_NEGATIVE_PATTERN.test(description)) return 'add-action';
+    if (element.matches('summary')) return 'disclosure';
+    if (element.matches('button,[role="button"],[role="menuitem"],[role="tab"]')) return 'button';
+    if (element.matches('a,[role="link"]')) return 'link';
+    if (getComputedStyle(element).cursor === 'pointer' && !['listbox', 'radiogroup', 'group'].includes(role)) return 'button';
+    return 'custom-interactive';
+  }
+
+  function fieldControl(kind) {
+    return ['file-upload', 'rich-text', 'slider', 'stepper', 'radio', 'radio-group', 'checkbox', 'switch', 'native-select', 'native-date', 'date-trigger', 'date-picker', 'month-trigger', 'month-picker', 'select-trigger', 'option-panel', 'searchable-option-panel', 'autocomplete', 'custom-select', 'free-text'].includes(kind);
+  }
+
+  function elementKind(kind) {
+    if (fieldControl(kind)) return 'field';
+    if (['add-action', 'disclosure', 'button', 'link'].includes(kind)) return 'action';
+    return 'container';
+  }
+
+  function cardinality(element, kind) {
+    if (kind === 'radio-group') return 'single';
+    if (element.multiple || element.getAttribute('aria-multiselectable') === 'true') return 'multi';
+    if (kind === 'checkbox') {
+      const group = element.closest('fieldset,[role="group"],[role="listbox"]');
+      if (group && group.querySelectorAll('input[type="checkbox"],[role="checkbox"]').length > 1) return 'multi';
+    }
+    return 'single';
+  }
+
+  function editability(element, kind = '') {
+    if (element.disabled || element.getAttribute('aria-disabled') === 'true') return 'disabled';
+    if (['native-date', 'date-trigger', 'date-picker', 'month-trigger', 'month-picker', 'select-trigger', 'option-panel'].includes(kind)) return 'selectable';
+    if (kind === 'searchable-option-panel') return 'editable';
+    if (['native-select', 'custom-select', 'radio', 'radio-group', 'checkbox', 'switch'].includes(kind)
+      && !searchableEvidence(element)) return 'selectable';
+    if (element.readOnly || element.getAttribute('aria-readonly') === 'true') {
+      if (['native-select', 'custom-select', 'date-trigger', 'date-picker', 'month-trigger', 'month-picker'].includes(kind)) return 'selectable';
+      return 'readonly';
+    }
+    return 'editable';
+  }
+
+  function actionType(element, family, kind, matchedKey, text) {
+    const state = editability(element, kind);
+    if (family === 'field') {
+      if (!['editable', 'selectable'].includes(state)) return 'none';
+      if (kind === 'file-upload') return 'upload';
+      if (kind === 'rich-text') return 'set-content';
+      if (kind === 'slider' || kind === 'stepper') return 'adjust';
+      if (cardinality(element, kind) === 'multi') return 'select-multi';
+      if (kind === 'checkbox' || kind === 'switch') return 'toggle';
+      if (kind === 'native-date' || kind === 'date-trigger' || kind === 'date-picker' || kind === 'month-trigger' || kind === 'month-picker') {
+        const range = /(?:Start|End)$/.test(matchedKey) && /至|起止|范围|range|period/i.test(text);
+        return range ? 'select-steps' : 'select';
+      }
+      if (kind === 'custom-select' && /^(?:nativePlace|householdRegistration|currentResidence)$/.test(matchedKey)) return 'select-steps';
+      if (kind === 'searchable-option-panel') return 'select-search';
+      if (kind === 'select-trigger' || kind === 'option-panel') return 'select';
+      if (kind === 'autocomplete') return 'select-search';
+      if (['native-select', 'custom-select', 'radio', 'radio-group'].includes(kind)) return 'select';
+      return kind === 'free-text' ? 'write' : 'none';
+    }
+    if (family === 'container') return 'none';
+    if (kind === 'add-action') return 'structure-add';
+    if (/删除|移除|delete|remove/i.test(text)) return 'structure-remove';
+    if (/提交|投递|申请|保存|下一步|完成|submit|apply|save|next|finish/i.test(text)) return 'submit';
+    if (/重置|清空|reset|clear/i.test(text)) return 'reset';
+    if (/取消|返回|cancel|back/i.test(text)) return 'cancel';
+    if (kind === 'disclosure' || element.hasAttribute('aria-expanded')) return element.getAttribute('aria-expanded') === 'true' ? 'collapse' : 'expand';
+    if (kind === 'link' || element.getAttribute('role') === 'tab') return 'navigate';
+    return 'click';
+  }
+
+  function valueDomain(element, family, action, kind) {
+    if (family !== 'field' || action === 'none') return 'none';
+    if (action === 'upload') return 'file';
+    if (action === 'toggle') return 'boolean';
+    if (action === 'adjust' || ['number', 'range'].includes(String(element.type || '').toLowerCase())) return 'numeric';
+    if (action === 'select-search') {
+      const controls = element.getAttribute('aria-controls');
+      return controls && document.getElementById(controls) ? 'closed-local' : 'closed-remote';
+    }
+    if (['select', 'select-multi', 'select-steps'].includes(action)) return 'closed-local';
+    if (kind === 'free-text' || kind === 'rich-text') return 'open';
+    return 'none';
+  }
+
+  function operationGroup(action) {
+    if (['write', 'set-content'].includes(action)) return 'direct-write';
+    if (action === 'select-search') return 'input-select';
+    if (['select', 'select-multi', 'select-steps'].includes(action)) return 'closed-select';
+    if (action === 'upload') return 'upload';
+    if (action === 'none') return 'no-action';
+    return 'click';
+  }
+
+  function semanticType(element, matchedKey, kind, text) {
+    const type = String(element.type || '').toLowerCase();
+    if (kind === 'native-date' || kind === 'date-trigger' || kind === 'date-picker' || kind === 'month-trigger' || kind === 'month-picker' || DATE_KEYS.test(matchedKey)) return 'date';
+    if (type === 'email' || matchedKey === 'email') return 'email';
+    if (type === 'tel' || matchedKey === 'phone') return 'phone';
+    if (/salary|amount|薪资|金额/i.test(`${matchedKey} ${text}`)) return 'amount';
+    if (kind === 'file-upload') return 'resume-file';
+    if (['checkbox', 'switch', 'radio', 'radio-group', 'select-trigger', 'option-panel', 'searchable-option-panel'].includes(kind)) return 'choice';
+    if (kind === 'rich-text') return 'rich-text';
+    if (['slider', 'stepper'].includes(kind)) return 'numeric';
+    return matchedKey ? 'profile-field' : 'unknown';
+  }
+
+  function classification(element, kind, action, matchedKey, text) {
+    const evidence = [];
+    let reasonCode = 'CONTROL_SEMANTICS';
+    if (action === 'write' && kind === 'free-text') {
+      reasonCode = isOpenTextField(element, matchedKey, text) ? 'OPEN_TEXT_SEMANTIC' : 'PLAIN_EDITABLE_TEXT';
+      evidence.push(`native-${element.tagName.toLowerCase()}`);
+      evidence.push(`type-${String(element.type || 'text').toLowerCase()}`);
+      evidence.push('editable');
+      evidence.push('no-closed-value-evidence');
+      if (matchedKey) evidence.push(`semantic-${matchedKey}`);
+      if (declaredFieldMode(element) === 'string') evidence.push('string-info-wrapper');
+      if (element.hasAttribute('autocomplete')) evidence.push('autocomplete-ignored-as-browser-hint');
+    } else if (['select', 'select-search', 'select-multi', 'select-steps'].includes(action)) {
+      const readonlySelection = Boolean(element.readOnly || element.getAttribute('aria-readonly') === 'true')
+        && ['custom-select', 'date-trigger', 'date-picker', 'month-trigger', 'month-picker'].includes(kind);
+      reasonCode = readonlySelection ? 'READONLY_SELECTION_TRIGGER' : 'CLOSED_VALUE_EVIDENCE';
+      evidence.push(...closedValueEvidence(element));
+      if (readonlySelection) evidence.push('readonly-blocks-typing', 'selection-changes-value');
+      if (element instanceof HTMLSelectElement) evidence.push('options-required');
+      if (kind === 'month-picker') evidence.push('calendar-year-month-grid', 'input-disabled-or-absent');
+      if (kind === 'select-trigger') evidence.push('phoenix-button-caret-trigger');
+      if (kind === 'option-panel') evidence.push('fixed-option-list', 'no-search-input');
+      if (kind === 'searchable-option-panel') evidence.push('option-list', 'popup-search-input');
+    } else {
+      evidence.push(`kind-${kind}`);
+    }
+    return { reasonCode, evidence: [...new Set(evidence)] };
+  }
+
+  function interactionPlan(element, action, matchedKey) {
+    const steps = [];
+    if (action === 'select-steps') {
+      if (/nativePlace|Registration|Residence/i.test(matchedKey)) {
+        steps.push(
+          { id: 'level-1', action: 'select', dependsOn: [] },
+          { id: 'level-2', action: 'select', dependsOn: ['level-1'] },
+          { id: 'level-3', action: 'select', dependsOn: ['level-2'] },
+          { id: 'confirm', action: 'confirm', dependsOn: ['level-3'] }
+        );
+      } else {
+        steps.push(
+          { id: 'start', action: 'select', dependsOn: [] },
+          { id: 'end', action: 'select', dependsOn: ['start'] },
+          { id: 'confirm', action: 'confirm', dependsOn: ['end'] }
+        );
+      }
+    } else if (['structure-add', 'structure-remove', 'expand', 'collapse'].includes(action)) {
+      steps.push({ id: 'activate', action: 'click', dependsOn: [] });
+      if (action === 'structure-remove') steps.push({ id: 'confirm', action: 'confirm', dependsOn: ['activate'] });
+      steps.push({ id: 'rescan', action: 'rescan-page', dependsOn: [action === 'structure-remove' ? 'confirm' : 'activate'] });
+    }
+    return {
+      multiStep: steps.length > 0,
+      steps,
+      searchable: action === 'select-search' || element.getAttribute('aria-autocomplete') === 'list',
+      confirmationRequired: ['select-steps', 'structure-remove'].includes(action) || element.getAttribute('aria-haspopup') === 'dialog'
+    };
+  }
+
+  function safety(action, text) {
+    if (['structure-remove', 'reset'].includes(action) || /注销|永久删除|delete\s+account/i.test(text)) {
+      return { level: 'dangerous', reasonCode: 'DANGEROUS_ACTION', reason: '该操作可能删除或清空页面数据' };
+    }
+    if (['submit', 'navigate', 'cancel'].includes(action)) {
+      return { level: 'guarded', reasonCode: 'SIDE_EFFECT_ACTION', reason: '该操作可能提交数据、离开页面或推进流程' };
+    }
+    if (action === 'click') {
+      return { level: 'guarded', reasonCode: 'AMBIGUOUS_ACTION', reason: '按钮副作用尚不明确' };
+    }
+    return { level: 'normal', reasonCode: '', reason: '' };
+  }
+
+  function adaptation(element, kind, action, state, safetyResult) {
+    if (state === 'readonly') return { status: 'adapted', reasonCode: 'READONLY', reason: '只读展示字段，无需操作' };
+    if (state === 'disabled') return { status: 'adapted', reasonCode: 'DISABLED', reason: '禁用字段，无需操作' };
+    if (safetyResult.level !== 'normal') return { status: 'adapted', reasonCode: safetyResult.reasonCode, reason: safetyResult.reason };
+    if (kind === 'canvas') return { status: 'unadapted', reasonCode: 'CANVAS_RENDERED', reason: '控件由 Canvas 绘制，无法读取标准 DOM 语义' };
+    if (kind === 'rich-text') return { status: 'partial', reasonCode: 'UNSUPPORTED_RICH_TEXT', reason: '已识别富文本，但编辑器协议需要进一步解析' };
+    if (kind === 'slider' || kind === 'stepper') return { status: 'partial', reasonCode: 'UNSUPPORTED_ADJUSTMENT', reason: '已识别数值调节控件，但操作轨迹仍需适配' };
+    if (/virtual|virtualized/i.test(rawClassName(element))) return { status: 'partial', reasonCode: 'VIRTUAL_LIST', reason: '可能使用虚拟滚动，当前 DOM 中候选项可能不完整' };
+    if (action === 'select-search' && !element.getAttribute('aria-controls')) {
+      return { status: 'partial', reasonCode: 'DYNAMIC_OPTIONS', reason: '候选项可能需要输入或展开后异步加载' };
+    }
+    if (kind === 'custom-interactive' || action === 'none' && kind !== 'free-text') {
+      return { status: 'unadapted', reasonCode: 'CUSTOM_NO_SEMANTIC', reason: '发现可交互元素，但缺少可靠的标准语义' };
+    }
+    return { status: 'adapted', reasonCode: '', reason: '' };
+  }
+
+  function dateShape(element, kind, text) {
+    if (!['native-date', 'date-trigger', 'date-picker', 'month-trigger', 'month-picker'].includes(kind)) return { precision: '', mechanism: '' };
+    const type = String(element.type || '').toLowerCase();
+    const evidence = `${text} ${widgetEvidence(element)}`;
+    const precision = kind === 'date-picker' ? 'year-month-day'
+      : kind === 'month-trigger' || kind === 'month-picker' || type === 'month' || /年月|year.?month|yyyy\W*mm/i.test(evidence)
+      ? 'year-month' : type === 'date' || /年月日|yyyy\W*mm\W*dd|date/i.test(evidence) ? 'year-month-day' : 'unknown-date';
+    const mechanism = kind === 'date-picker' ? 'custom-date-calendar'
+      : ['month-trigger', 'month-picker'].includes(kind) ? 'custom-month-calendar'
+      : type === 'date' || type === 'month' || type === 'datetime-local'
+        ? 'browser-native-picker' : element.readOnly ? 'custom-calendar-or-list' : 'free-date-text';
+    return { precision, mechanism };
+  }
+
+  function requirement(element) {
     if (element.required || element.getAttribute('aria-required') === 'true') return 'required';
-    const ownText = auditOwnText(element);
-    const nearbyLabel = element.closest('label')?.textContent || element.parentElement?.querySelector(':scope > label')?.textContent || '';
-    if (/(?:^|\s)[*＊]|必填|required/i.test(`${ownText} ${nearbyLabel}`)) return 'required';
-    return 'not-marked-required';
+    const nearby = `${directLabelText(element)} ${element.parentElement?.textContent || ''}`;
+    return /[*＊]|必填|required/i.test(nearby) ? 'required' : 'not-marked-required';
   }
 
-  function auditDomPath(element) {
+  function domPath(element) {
     const parts = [];
     let node = element;
     for (let depth = 0; node instanceof Element && depth < 4; depth += 1, node = node.parentElement) {
@@ -4351,45 +1590,1364 @@
     return parts.join(' > ');
   }
 
-  function auditElementRecord(element, index) {
-    const visualTarget = auditVisualTarget(element);
-    const semanticField = element.matches('input,textarea,select,[contenteditable="true"],[role="textbox"],[role="combobox"],[role="radio"],[role="checkbox"],[role="switch"]');
-    const logicalDateWidget = element.matches('.atsx-date-picker-period-month,[class*="date-picker-period"]');
-    const selectTrigger = customSelectTrigger(element);
-    const fieldLike = semanticField || logicalDateWidget || Boolean(selectTrigger && (selectTrigger === element || element.contains(selectTrigger)));
-    const inferredText = fieldLike ? labelText(element) : interactiveDescription(element);
-    const context = fieldLike ? sectionContext(element) : '';
-    const matchedKey = fieldLike ? matchKey(inferredText, context) : '';
-    const controlKind = auditControlKind(element, inferredText, matchedKey);
-    const description = interactiveDescription(element);
-    const repeatedKind = controlKind === 'add-action' ? resolvedRepeatedButtonKind(element) : '';
-    const dangerous = /提交|投递|删除|移除|保存|登录|授权|同意|下一步|submit|apply|delete|remove|save|login|authori[sz]e|next/i.test(description);
-    const ignored = Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'
-      || (fieldLike && inferredText && ignoredText.test(inferredText)));
-    const capabilityResult = ignored || dangerous
-      ? { capability: 'safe-ignored', reason: dangerous ? '提交、保存、删除等危险操作不会自动执行' : '控件已禁用或属于安全忽略项' }
-      : auditFieldCapability(element, matchedKey, controlKind, repeatedKind);
-    const inputMode = auditInputMode(controlKind);
-    const dateShape = auditDateShape(element, matchedKey, controlKind);
-    const requirement = fieldLike ? auditRequirement(element) : '';
-    const rect = visualTarget.getBoundingClientRect();
+  function isRepeatRecordCardElement(element) {
+    return element instanceof Element
+      && classTokens(element).some((token) => /^apply-form-array-card(?:__|$)/i.test(token));
+  }
+
+  function closestRepeatRecordCard(element, maxDepth = 12) {
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < maxDepth; depth += 1, node = node.parentElement) {
+      if (isRepeatRecordCardElement(node)) return node;
+      if (node.matches('form,main,body,html')) break;
+    }
+    return null;
+  }
+
+  function normalizedSignatureLabel(value) {
+    return cleanText(value).toLowerCase().replace(/[\s:：*＊()[\]（）【】]+/g, '').replace(/\d+$/, '');
+  }
+
+  function recordFieldSignature(root) {
+    if (!(root instanceof Element) || !hasInteractiveDescendant(root)) return [];
+    const roots = pageFieldRoots(root);
+    const labels = roots.map((field) => normalizedSignatureLabel(fieldRootTitle(field)))
+      .filter(Boolean);
+    if (labels.length) return labels;
+    const fallback = normalizedSignatureLabel(fieldRootTitle(root));
+    return fallback ? [fallback] : [];
+  }
+
+  function signatureSimilarity(left, right) {
+    const leftSet = new Set(left);
+    const rightSet = new Set(right);
+    if (!leftSet.size || !rightSet.size) return 0;
+    let overlap = 0;
+    for (const item of leftSet) if (rightSet.has(item)) overlap += 1;
+    return overlap / Math.max(leftSet.size, rightSet.size);
+  }
+
+  function genericRepeatRecordDetails(element) {
+    let node = element.parentElement;
+    for (let depth = 0; node instanceof Element && depth < 10; depth += 1, node = node.parentElement) {
+      if (node.matches('form,main,body,html')) break;
+      if (pageBlockLooksLikeModule(node)) break;
+      if (!(node.parentElement instanceof Element)) continue;
+      const signature = recordFieldSignature(node);
+      if (!signature.length) continue;
+      const siblings = [...node.parentElement.children].filter((sibling) => sibling instanceof Element
+        && visible(sibling)
+        && hasInteractiveDescendant(sibling)
+        && signatureSimilarity(signature, recordFieldSignature(sibling)) >= 0.5);
+      if (siblings.length < 2 || !siblings.includes(node)) continue;
+      const index = siblings.indexOf(node) + 1;
+      return {
+        recordIndex: index,
+        recordTotal: siblings.length,
+        recordGroup: index ? `${domPath(node.parentElement)}::record[${index - 1}]` : ''
+      };
+    }
+    return { recordIndex: 0, recordTotal: 0, recordGroup: '' };
+  }
+
+  function repeatRecordDetails(element) {
+    const card = closestRepeatRecordCard(element);
+    if (!(card instanceof Element) || !(card.parentElement instanceof Element)) {
+      return genericRepeatRecordDetails(element);
+    }
+    const siblings = [...card.parentElement.children].filter(isRepeatRecordCardElement);
+    const index = siblings.indexOf(card) + 1;
+    if (!index || siblings.length < 2) return genericRepeatRecordDetails(element);
+    return {
+      recordIndex: index,
+      recordTotal: siblings.length,
+      recordGroup: index ? `${domPath(card.parentElement)}::record[${index - 1}]` : ''
+    };
+  }
+
+  function repeatBindingDetails(element, profilePath = '', context = '') {
+    if (!profilePath.includes('[]')) return { repeatSection: '', repeatIndex: 0, repeatGroup: '' };
+    const evidence = [];
+    let node = element;
+    for (let depth = 0; node instanceof Element && depth < 10; depth += 1, node = node.parentElement) {
+      evidence.push(node.getAttribute('data-cy') || '', node.getAttribute('name') || '', node.id || '', node.getAttribute('data-testid') || '');
+    }
+    const text = evidence.join(' ');
+    const sectionName = profilePath.split('[]')[0];
+    const aliases = {
+      educationExperiences: ['education', 'academic'], workExperiences: ['work', 'experience', 'employment', 'intern'],
+      campusExperiences: ['campus'], projectExperiences: ['project'], practiceExperiences: ['practice'],
+      languageSkills: ['language'], certificates: ['certificate'], awards: ['award', 'honor', 'honour'],
+      publications: ['publication', 'paper'], patents: ['patent'], familyMembers: ['family', 'relative']
+    };
+    const names = aliases[sectionName] || [context, sectionName];
+    let index = -1;
+    for (const name of names.filter(Boolean)) {
+      const match = text.match(new RegExp(`${name}(?:Entries?)?(?:\\[|\\.|_|-)(\\d+)`, 'i'));
+      if (match) { index = Number(match[1]); break; }
+    }
+    return {
+      repeatSection: sectionName,
+      repeatIndex: index >= 0 ? index + 1 : 0,
+      repeatGroup: index >= 0 ? `${sectionName}[${index}]` : ''
+    };
+  }
+
+  function normalizeModuleTitleText(value, maxLength = 120) {
+    return cleanText(value)
+      .replace(/^\s*\d+[.、]\s*/, '')
+      .replace(/\s+(?:添加|新增|取消|保存|编辑|修改|删除)$/i, '')
+      .replace(/(?:（必填）|\(必填\)|必填)$/g, '')
+      .slice(0, maxLength);
+  }
+
+  function looksLikeModuleTitleText(value) {
+    const text = normalizeModuleTitleText(value, 120);
+    return Boolean(text && text.length <= 80 && MODULE_TITLE_RE.test(text));
+  }
+
+  function semanticIdentity(element) {
+    if (!(element instanceof Element)) return '';
+    return [
+      element.tagName.toLowerCase(),
+      element.id || '',
+      rawClassName(element),
+      element.getAttribute('role') || '',
+      element.getAttribute('name') || '',
+      element.getAttribute('data-testid') || '',
+      element.getAttribute('data-test') || ''
+    ].filter(Boolean).join(' ');
+  }
+
+  function looksLikeEmptyStateTitle(value) {
+    return /^(?:无|没有|暂无).{0,24}(?:经历|经验|信息|内容)$/.test(normalizeModuleTitleText(value, 80));
+  }
+
+  function looksLikeNavigationText(value) {
+    const text = cleanText(value);
+    if (!text) return false;
+    const numbered = text.match(/(?:^|\s)\d+[.、]?\s*[\u4e00-\u9fffA-Za-z]{2,16}/g) || [];
+    const moduleWords = text.match(MODULE_TITLE_WORDS_RE) || [];
+    return numbered.length >= 4 || new Set(moduleWords.map((item) => item.toLowerCase())).size >= 5;
+  }
+
+  function semanticLooksLikeModuleTitle(value) {
+    const text = normalizeModuleTitleText(value, 120);
+    return Boolean(text && text.length <= 80 && !looksLikeEmptyStateTitle(text)
+      && !looksLikeNavigationText(text) && MODULE_TITLE_RE.test(text));
+  }
+
+  function semanticLooksLikeShortTitle(value) {
+    const text = normalizeModuleTitleText(value, 120);
+    if (!text || looksLikeEmptyStateTitle(text) || looksLikeNavigationText(text)) return false;
+    if (/^(?:required|invalid|error|\*+|必填|未填写|请选择|请输入)$/i.test(text)) return false;
+    return text.length <= 32;
+  }
+
+  function semanticHidden(element) {
+    if (!(element instanceof Element)) return true;
+    const tag = element.tagName.toLowerCase();
+    const style = String(element.getAttribute('style') || '').replace(/\s+/g, '').toLowerCase();
+    return ['script', 'style', 'noscript', 'template', 'meta', 'link'].includes(tag)
+      || /(?:resume-page-audit|__resumePageAudit|resume-audit|aminer-ai-extension-root|extension-root|chrome-extension)/i.test(semanticIdentity(element))
+      || element.hasAttribute('hidden')
+      || String(element.getAttribute('type') || '').toLowerCase() === 'hidden'
+      || element.getAttribute('aria-hidden') === 'true'
+      || style.includes('display:none')
+      || style.includes('visibility:hidden')
+      || !visible(element);
+  }
+
+  function semanticControl(element) {
+    if (semanticHidden(element)) return false;
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    if (['input', 'textarea', 'select', 'button'].includes(tag)) return true;
+    if (element.getAttribute('contenteditable') === 'true') return true;
+    if (['textbox', 'combobox', 'radio', 'checkbox', 'switch', 'slider', 'spinbutton'].includes(role)) return true;
+    const identity = semanticIdentity(element);
+    return /(?:^|[\s_-])(?:input|select|radio|checkbox|textarea|upload|picker|cascader|date|datepicker|button|btn|combobox|switch|slider)(?:$|[\s_-])/i.test(identity)
+      || /(?:phoenix|el|ant|atsx|ud)(?:__|-)[\w-]*(?:input|select|radio|checkbox|textarea|upload|picker|cascader|date|button|btn|combobox|switch|slider)/i.test(identity);
+  }
+
+  function semanticInteractive(element, isControl) {
+    if (isControl) return true;
+    if (semanticHidden(element)) return false;
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    if (['a', 'details', 'summary', 'option'].includes(tag)) return true;
+    if (element.hasAttribute('onclick') || element.hasAttribute('tabindex')) return true;
+    if (['button', 'link', 'menuitem', 'option', 'radio', 'checkbox', 'switch', 'tab', 'textbox', 'combobox', 'slider', 'spinbutton', 'searchbox'].includes(role)) return true;
+    return /(?:add[-_]?btn|addmore|remove[-_]?btn|delete[-_]?btn|edit[-_]?btn|save[-_]?btn|cancel[-_]?btn|operate|action|btn)/i.test(semanticIdentity(element))
+      && /(?:添加|新增|删除|编辑|保存|取消|修改)/i.test(cleanText(element.innerText || element.textContent).slice(0, 40));
+  }
+
+  function semanticExplicitZone(element) {
+    if (!(element instanceof Element)) return '';
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    if (tag === 'head') return 'head';
+    if (tag === 'header') return 'header';
+    if (tag === 'nav') return 'nav';
+    if (tag === 'aside') return 'sidebar';
+    if (tag === 'main') return 'main';
+    if (tag === 'footer') return 'footer';
+    if (tag === 'dialog' || ['dialog', 'alertdialog', 'tooltip', 'menu', 'listbox'].includes(role)) return 'overlay';
+    const identity = semanticIdentity(element);
+    if (semanticLooksLikeFooter(element, identity)) return 'footer';
+    if (/(?:modal|dialog|popup|popover|tooltip|dropdown|overlay|cascader|picker|popper|select[-_]?menu|select[-_]?dropdown)/i.test(identity)) return 'overlay';
+    if (/(?:\bnav\b|nav[-_]|navbar|nav-bar|\bmenu\b|menu[-_]|\btabs?\b|tabs?[-_]|\bsteps?\b|steps?[-_]|breadcrumb)/i.test(identity)) return 'nav';
+    if (/(?:sidebar|aside|sider|drawer|side[-_]?(?:bar|nav|menu))/i.test(identity)) return 'sidebar';
+    if (/(?:header|top|masthead)/i.test(identity)) return 'header';
+    if (/(?:main|content|container|page|form|resume|apply|delivery)/i.test(identity)) return 'main';
+    return '';
+  }
+
+  function semanticStrongLandmarkZone(element, zone) {
+    if (!(element instanceof Element)) return false;
+    const tag = element.tagName.toLowerCase();
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    const identity = semanticIdentity(element);
+    if (zone === 'head') return tag === 'head';
+    if (zone === 'header') {
+      return tag === 'header' || role === 'banner'
+        || /(?:^|[\s_-])(?:topbar|top-bar|masthead|nav-header|global[-_\s]?header|site[-_\s]?header|page[-_\s]?header|app[-_\s]?header)(?:$|[\s_-])/i.test(identity);
+    }
+    if (zone === 'nav') return tag === 'nav' || role === 'navigation';
+    if (zone === 'sidebar') return tag === 'aside' || role === 'complementary';
+    if (zone === 'main') return tag === 'main' || role === 'main';
+    if (zone === 'footer') return tag === 'footer' || role === 'contentinfo';
+    if (zone === 'overlay') return tag === 'dialog' || ['dialog', 'alertdialog'].includes(role);
+    return false;
+  }
+
+  function semanticInsideFieldComponent(element) {
+    for (let node = element.parentElement; node instanceof Element; node = node.parentElement) {
+      const tag = node.tagName.toLowerCase();
+      const identity = semanticIdentity(node);
+      if (/(?:form[-_]?item|field|input[_-]?box|info[_-]?box|ant-form-item|el-form-item|ud-formily-item|rocket-form-field|apply-field|apply-fields|input|select|textarea|picker|cascader|upload)/i.test(identity)) {
+        return true;
+      }
+      if (tag === 'body' || tag === 'main' || ['section', 'fieldset', 'form'].includes(tag)
+        || /(?:section|module|block|panel|card|send_box|createFormSection|applyFormModuleWrapper|cv-module|apply-block|resumeEditForm|apply-form)/i.test(identity)) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function semanticInsideFormPage(element) {
+    for (let node = element; node instanceof Element; node = node.parentElement) {
+      const tag = node.tagName.toLowerCase();
+      const identity = semanticIdentity(node);
+      if (/(?:resumeEditForm|saasResumeEditForm|resumeFormPage|apply-form|complete-form|atsx-form|form-root|wrapper-editor|STFormContainer|apply-block|job-form)/i.test(identity)) {
+        return true;
+      }
+      if (tag === 'body' || tag === 'header' || tag === 'nav' || tag === 'footer') return false;
+    }
+    return false;
+  }
+
+  function semanticShouldUseExplicitZone(element, explicitZone, inheritedZone) {
+    if (!explicitZone) return false;
+    if (['head', 'main', 'overlay'].includes(explicitZone)) return true;
+    if (semanticStrongLandmarkZone(element, explicitZone)) return true;
+    if (['header', 'nav', 'sidebar', 'footer'].includes(explicitZone) && semanticInsideFieldComponent(element)) return false;
+    if (explicitZone === 'header' && semanticInsideFormPage(element)) return false;
+    if (explicitZone === 'header' && inheritedZone === 'main') {
+      return false;
+    }
+    return true;
+  }
+
+  function semanticLooksLikeFooter(element, identity = semanticIdentity(element)) {
+    const text = cleanText(element.innerText || element.textContent || '').slice(0, 500);
+    const legalPattern = /(?:copyright|copy[-_ ]?right|beian|icp|legal|polic(?:y|ies)|privacy|terms|版权所有|备案|公网安备|隐私政策|用户协议|©)/i;
+    if (legalPattern.test(identity)) {
+      return true;
+    }
+    if (!/(?:^|[\s_-])(?:footer|site-footer|page-footer|global-footer)(?:$|[\s_-])/i.test(identity)) {
+      return false;
+    }
+    const hasEditable = Boolean(element.querySelector('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]'));
+    if (hasEditable) return false;
+    const buttonText = cleanText([...element.querySelectorAll('button, [role="button"]')]
+      .map((button) => button.innerText || button.textContent || '')
+      .join(' '));
+    return legalPattern.test(text)
+      || !/(?:提交|保存|暂存|取消|预览|下一步|上一步|submit|save|cancel|preview|next|back)/i.test(buttonText);
+  }
+
+  function semanticStructuralZone(zone) {
+    return ['head', 'header', 'nav', 'sidebar', 'footer'].includes(zone);
+  }
+
+  function semanticSurfaceZone(zone) {
+    return zone === 'overlay';
+  }
+
+  function semanticSurfaceTitle(zone) {
+    return zone === 'overlay' ? '浮层' : '';
+  }
+
+  function semanticLandmarkTitle(item) {
+    const zone = item?.zone || '';
+    if (zone === 'head') return '文档 head';
+    if (zone === 'header') return '页头';
+    if (zone === 'footer') return '页脚';
+    if (zone === 'sidebar') return '侧边栏';
+    if (zone === 'nav') {
+      const text = cleanText(item.text || '');
+      if (/首页\s*\/|breadcrumb|面包屑/i.test(`${text} ${semanticIdentity(item.element)}`)) return '面包屑导航';
+      if (/(?:申请信息|上传|个人信息|教育|工作|项目|实习|附件|授权|更新说明)/.test(text)) return '模块目录';
+      return '导航栏';
+    }
+    return semanticSurfaceTitle(zone) || zone || '';
+  }
+
+  function semanticPruneOverlappingStructures(candidates) {
+    const isWeakNavWrapper = (item) => {
+      if (!item || item.zone !== 'nav') return false;
+      const own = cleanText(item.ownText || '');
+      if (own) return false;
+      return candidates.some((other) => other !== item
+        && other.zone === 'nav'
+        && item.element.contains(other.element)
+        && other.interactiveCount >= Math.max(1, item.interactiveCount * 0.4));
+    };
+    return candidates.filter((item) => {
+      const structuralAncestor = candidates.find((other) => other !== item
+        && semanticStructuralZone(other.zone)
+        && other.element.contains(item.element));
+      if (structuralAncestor
+        && ['header', 'nav', 'sidebar', 'footer'].includes(structuralAncestor.zone)
+        && !isWeakNavWrapper(structuralAncestor)) return false;
+      const descendants = candidates.filter((other) => other !== item && item.element.contains(other.element));
+      if (isWeakNavWrapper(item)) return false;
+      if (['head', 'footer', 'nav'].includes(item.zone)) return true;
+      if (!descendants.length) return true;
+      const strongest = descendants
+        .slice()
+        .sort((left, right) => (
+          (right.controlCount * 4 + right.interactiveCount * 2 + right.text.length)
+          - (left.controlCount * 4 + left.interactiveCount * 2 + left.text.length)
+        ))[0];
+      if (!strongest) return true;
+      const own = cleanText(item.ownText || '');
+      const sameSignal = cleanText(item.text || '') === cleanText(strongest.text || '')
+        || (strongest.controlCount > 0 && strongest.controlCount >= Math.max(1, item.controlCount * 0.8));
+      if (item.zone === 'sidebar' && descendants.some((other) => other.zone === 'nav')) return false;
+      if (item.zone === 'header' && !own && sameSignal && descendants.some((other) => other.zone === 'nav')) return false;
+      return true;
+    });
+  }
+
+  function semanticTitleFromTitleNode(item) {
+    const direct = normalizeModuleTitleText(item.ownText);
+    if (semanticLooksLikeShortTitle(direct)) return direct;
+    for (const child of item.children) {
+      if (child.hidden || child.control || /(?:title_text|describe|description|help|tip|remark|note|unloadTip)/i.test(semanticIdentity(child.element))) continue;
+      const own = normalizeModuleTitleText(child.ownText);
+      if (semanticLooksLikeShortTitle(own)) return own;
+      const nested = semanticTitleFromTitleNode(child);
+      if (semanticLooksLikeShortTitle(nested)) return nested;
+    }
+    const text = normalizeModuleTitleText(item.text);
+    if (semanticLooksLikeShortTitle(text)) return text;
+    return semanticLooksLikeModuleTitle(text) ? text : '';
+  }
+
+  function semanticTitleFromNode(item) {
+    for (const attr of ['aria-label', 'data-title', 'title', 'name']) {
+      const text = normalizeModuleTitleText(item.element.getAttribute(attr) || '');
+      if (semanticLooksLikeModuleTitle(text)) return text;
+    }
+    const direct = normalizeModuleTitleText(item.ownText);
+    if (semanticLooksLikeModuleTitle(direct)) return direct;
+    if (item.heading) {
+      const text = semanticTitleFromTitleNode(item);
+      if (semanticLooksLikeModuleTitle(text)) return text;
+    }
+    for (const child of item.children) {
+      if (child.hidden) continue;
+      if (child.heading || /(?:title|heading|legend|label|send_title|section-title|module-title|blockTitle|divider-title)/i.test(semanticIdentity(child.element))) {
+        const text = semanticTitleFromTitleNode(child);
+        if (semanticLooksLikeShortTitle(text) || semanticLooksLikeModuleTitle(text)) return text;
+        const nested = semanticTitleFromNode(child);
+        if (nested) return nested;
+      }
+      if (child.controlCount) continue;
+    }
+    return '';
+  }
+
+  function buildPageSemanticTree() {
+    const root = document.documentElement || document.body;
+    const nodes = [];
+    const build = (element, parent, depth, inheritedZone) => {
+      const tag = element.tagName.toLowerCase();
+      const explicitZone = semanticExplicitZone(element);
+      const zone = semanticShouldUseExplicitZone(element, explicitZone, inheritedZone)
+        ? explicitZone
+        : (inheritedZone || 'body');
+      const hidden = semanticHidden(element) || Boolean(parent?.hidden);
+      const control = semanticControl(element);
+      const interactive = semanticInteractive(element, control);
+      const item = {
+        element,
+        parent,
+        children: [],
+        depth,
+        zone,
+        tag,
+        ownText: ownText(element),
+        text: '',
+        title: '',
+        hidden,
+        control,
+        interactive,
+        heading: /^h[1-6]$/.test(tag) || tag === 'legend' || element.getAttribute('role') === 'heading',
+        fieldLike: false,
+        titleLike: false,
+        moduleShellLike: false,
+        controlCount: 0,
+        interactiveCount: 0,
+        fieldLikeCount: 0,
+        titleLikeCount: 0,
+        moduleShellCount: 0,
+        zoneRoot: null
+      };
+      nodes.push(item);
+      for (const child of [...element.children]) {
+        item.children.push(build(child, item, depth + 1, zone));
+      }
+      item.text = cleanText([item.ownText, ...item.children.map((child) => child.text)].filter(Boolean).join(' ')).slice(0, 500);
+      const identity = semanticIdentity(element);
+      item.fieldLike = !hidden && !control && (
+        /(?:form[-_]?item|field|input[_-]?box|info[_-]?box|ant-form-item|el-form-item|ud-formily-item|rocket-form-field|apply-field)/i.test(identity)
+        || element.hasAttribute('data-form-field-name')
+        || element.hasAttribute('data-form-field-i18n-name')
+      );
+      item.titleLike = !hidden && !control && !item.children.some((child) => child.control)
+        && (item.heading || /(?:title|heading|legend|label|send_title|section-title|module-title|blockTitle|divider-title)/i.test(identity))
+        && semanticLooksLikeModuleTitle(item.ownText || item.text);
+      item.moduleShellLike = !hidden && !control && (
+        ['section', 'fieldset', 'form'].includes(tag)
+        || /(?:section|module|block|panel|card|send_box|createFormSection|applyFormModuleWrapper|cv-module|apply-block)/i.test(identity)
+      );
+      item.controlCount = (control ? 1 : 0) + item.children.reduce((sum, child) => sum + child.controlCount, 0);
+      item.interactiveCount = (interactive ? 1 : 0) + item.children.reduce((sum, child) => sum + child.interactiveCount, 0);
+      item.fieldLikeCount = (item.fieldLike ? 1 : 0) + item.children.reduce((sum, child) => sum + child.fieldLikeCount, 0);
+      item.titleLikeCount = (item.titleLike ? 1 : 0) + item.children.reduce((sum, child) => sum + child.titleLikeCount, 0);
+      item.moduleShellCount = (item.moduleShellLike ? 1 : 0) + item.children.reduce((sum, child) => sum + child.moduleShellCount, 0);
+      item.title = semanticTitleFromNode(item);
+      return item;
+    };
+    const tree = { root: build(root, null, 0, semanticExplicitZone(root) || 'document'), nodes };
+    assignSemanticNavZones(tree);
+    assignSemanticMainZone(tree);
+    assignSemanticZoneRoots(tree);
+    return tree;
+  }
+
+  function semanticLooksLikeModuleNav(item) {
+    if (!item || item.hidden || item.control || item.fieldLikeCount > 0) return false;
+    if (['html', 'body'].includes(item.tag)) return false;
+    if (!['document', 'body', 'main', 'sidebar'].includes(item.zone)) return false;
+    if (item.moduleShellLike && semanticModuleTitle(item)) return false;
+    if (semanticInsideContentModule(item)) return false;
+    const identity = semanticIdentity(item.element);
+    if (/(?:form|field|input|textarea|editor|upload|resumeEditForm|createFormSection)/i.test(identity)) return false;
+    const words = cleanText(item.text || '').match(MODULE_TITLE_WORDS_RE) || [];
+    const uniqueWords = new Set(words.map((word) => word.toLowerCase()));
+    return uniqueWords.size >= 3 && (item.interactiveCount >= 2 || item.titleLikeCount >= 2 || item.controlCount >= 1);
+  }
+
+  function semanticInsideContentModule(item) {
+    for (let parent = item?.parent; parent; parent = parent.parent) {
+      if (['head', 'header', 'nav', 'sidebar', 'footer', 'overlay'].includes(parent.zone)) return false;
+      if (parent.moduleShellLike && semanticModuleTitle(parent)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function assignSemanticNavZones(tree) {
+    const candidates = tree.nodes
+      .filter(semanticLooksLikeModuleNav)
+      .sort((left, right) => left.depth - right.depth);
+    for (const item of candidates) {
+      if (item.children.some((child) => child.zone === 'nav')) continue;
+      if (item.parent && item.parent.zone === 'nav') continue;
+      const mark = (node) => {
+        if (['document', 'body', 'main', 'sidebar'].includes(node.zone)) node.zone = 'nav';
+        node.children.forEach(mark);
+      };
+      mark(item);
+    }
+  }
+
+  function assignSemanticMainZone(tree) {
+    const candidates = tree.nodes
+      .filter((item) => ['body', 'main'].includes(item.zone)
+        && !['html', 'body'].includes(item.tag)
+        && !item.hidden
+        && item.controlCount >= 2)
+      .sort((left, right) => (
+        (right.controlCount * 4 + right.fieldLikeCount * 3 + right.titleLikeCount * 2 - right.depth)
+        - (left.controlCount * 4 + left.fieldLikeCount * 3 + left.titleLikeCount * 2 - left.depth)
+      ));
+    const main = candidates[0];
+    if (!main) return;
+    const mark = (item) => {
+      if (item.zone === 'body') item.zone = 'main';
+      item.children.forEach(mark);
+    };
+    mark(main);
+  }
+
+  function assignSemanticZoneRoots(tree) {
+    const visit = (item, currentRoot) => {
+      const startsZone = !item.parent || item.parent.zone !== item.zone;
+      const nextRoot = startsZone ? item : currentRoot;
+      item.zoneRoot = nextRoot || item;
+      item.children.forEach((child) => visit(child, item.zoneRoot));
+    };
+    visit(tree.root, tree.root);
+  }
+
+  function cacheSemanticZoneMaps(tree) {
+    semanticZoneByElement = new WeakMap();
+    semanticZoneRootByElement = new WeakMap();
+    semanticLandmarkTitleByElement = new WeakMap();
+    for (const item of tree.nodes) {
+      semanticZoneByElement.set(item.element, item.zone);
+      semanticZoneRootByElement.set(item.element, item.zoneRoot?.element || item.element);
+      if (semanticStructuralZone(item.zone) && item.zoneRoot === item) {
+        semanticLandmarkTitleByElement.set(item.element, semanticLandmarkTitle(item));
+      }
+    }
+  }
+
+  function semanticStructureContextForElement(element) {
+    if (!(element instanceof Element)) return null;
+    for (let node = element; node instanceof Element; node = node.parentElement) {
+      const zone = semanticZoneByElement.get(node);
+      const root = semanticZoneRootByElement.get(node) || node;
+      const rootZone = semanticZoneByElement.get(root) || zone;
+      if (root instanceof Element && semanticStructuralZone(rootZone)) {
+        return {
+          zone: rootZone,
+          title: semanticLandmarkTitleByElement.get(root) || semanticLandmarkTitle({ zone: rootZone, text: cleanText(root.innerText || root.textContent), element: root })
+        };
+      }
+    }
+    return null;
+  }
+
+  function semanticSurfaceContextForElement(element) {
+    if (!(element instanceof Element)) return null;
+    for (let node = element; node instanceof Element; node = node.parentElement) {
+      const zone = semanticZoneByElement.get(node);
+      const root = semanticZoneRootByElement.get(node) || node;
+      const rootZone = semanticZoneByElement.get(root) || zone;
+      if (semanticSurfaceZone(rootZone)) {
+        return { zone: rootZone, title: semanticSurfaceTitle(rootZone) };
+      }
+    }
+    return null;
+  }
+
+  function semanticDirectTitleChild(item) {
+    for (const child of item.children) {
+      if (child.hidden) continue;
+      if (child.titleLike || child.heading || /(?:title|heading|legend|label|send_title|section-title|module-title|blockTitle|divider-title)/i.test(semanticIdentity(child.element))) {
+        if (child.title || semanticTitleFromTitleNode(child)) return child;
+      }
+      if (child.title && child.controlCount === 0) return child;
+    }
+    return null;
+  }
+
+  function semanticModuleTitle(item) {
+    if (item.title) return item.title;
+    const titleChild = semanticDirectTitleChild(item);
+    return titleChild?.title || '';
+  }
+
+  function semanticDescendantModuleShellCount(item, limit = 2) {
+    let count = 0;
+    const stack = [...item.children];
+    while (stack.length) {
+      const child = stack.pop();
+      if (!child || child.hidden || child.control) continue;
+      if (child.moduleShellLike && child.controlCount && semanticModuleTitle(child)) {
+        count += 1;
+        if (count >= limit) return count;
+        continue;
+      }
+      stack.push(...child.children);
+    }
+    return count;
+  }
+
+  function semanticHasModuleChild(item) {
+    let count = 0;
+    for (const child of item.children) {
+      if (!child.hidden && child.controlCount && semanticModuleTitle(child)) count += 1;
+    }
+    return count >= 2;
+  }
+
+  function semanticPageBlockRoots() {
+    let tree;
+    try {
+      tree = buildPageSemanticTree();
+    } catch {
+      semanticZoneByElement = new WeakMap();
+      semanticZoneRootByElement = new WeakMap();
+      semanticLandmarkTitleByElement = new WeakMap();
+      semanticTreeSnapshot = null;
+      return [];
+    }
+    cacheSemanticZoneMaps(tree);
+    const selected = [];
+    for (const item of tree.nodes) {
+      if (['html', 'head', 'body'].includes(item.tag) || item.hidden || item.control) continue;
+      if (['head', 'header', 'nav', 'sidebar', 'footer', 'overlay'].includes(item.zone)) continue;
+      const title = semanticModuleTitle(item);
+      if (!title) continue;
+      if (item.fieldLike) continue;
+      if (item.controlCount === 0 && item.interactiveCount === 0 && item.fieldLikeCount === 0) continue;
+      if (semanticDescendantModuleShellCount(item) >= 2) continue;
+      const titleChild = semanticDirectTitleChild(item);
+      if (!item.moduleShellLike && !titleChild) continue;
+      if (!item.moduleShellLike && item.controlCount === 0 && item.interactiveCount === 0) continue;
+      const isEmptyActionModule = Boolean(titleChild && item.interactiveCount > 0
+        && semanticLooksLikeModuleTitle(title)
+        && /(?:添加|新增|删除|编辑|保存|取消|修改)/i.test(item.text));
+      if (!item.moduleShellLike && item.controlCount < 2 && item.fieldLikeCount === 0 && !isEmptyActionModule) continue;
+      if (item.fieldLike && item.fieldLikeCount <= 1) continue;
+      if (semanticHasModuleChild(item) && !item.moduleShellLike) continue;
+      if (selected.some((ancestor) => ancestor.element.contains(item.element))) continue;
+      selected.push(item);
+    }
+    const roots = selected
+      .map((item) => {
+        semanticModuleTitleByElement.set(item.element, semanticModuleTitle(item));
+        return item.element;
+      })
+      .sort((left, right) => {
+        if (left === right) return 0;
+        const position = left.compareDocumentPosition(right);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+      });
+    semanticTreeSnapshot = summarizeSemanticTreeForCopy(tree, selected);
+    return roots;
+  }
+
+  function summarizeSemanticTreeForCopy(tree, selectedModules = []) {
+    const compactCounts = (counts) => {
+      const entries = Object.entries(counts).filter(([, value]) => Number(value) > 0);
+      return entries.length ? Object.fromEntries(entries) : undefined;
+    };
+    const compactObject = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => {
+      if (value === undefined || value === null || value === '') return false;
+      if (Array.isArray(value) && value.length === 0) return false;
+      if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) return false;
+      return true;
+    }));
+    const shortText = (value, maxLength = 120) => cleanText(value || '').slice(0, maxLength);
+    const noisyLabel = (value) => {
+      const text = shortText(value, 80);
+      return !text
+        || /^(?:\*+|required|invalid|error|请选择|请选择.*|请输入|请输入.*|必填项未填写\d*|必填|未填写|请选择|选择|0|\/\s*\d+|\d+\s*\/\s*\d+)$/i.test(text);
+    };
+    const directLabel = (item, maxDepth = 3) => {
+      if (!item || maxDepth < 0) return '';
+      for (const attr of ['aria-label', 'data-title', 'title', 'placeholder', 'name']) {
+        const text = shortText(item.element.getAttribute(attr) || '');
+        if (!noisyLabel(text)) return text;
+      }
+      const title = shortText(item.title || semanticModuleTitle(item) || '');
+      if (!noisyLabel(title)) return title;
+      const own = shortText(item.ownText || '');
+      if (!noisyLabel(own)) return own;
+      for (const child of item.children) {
+        if (child.hidden || child.control || child.interactive) continue;
+        const text = directLabel(child, maxDepth - 1);
+        if (!noisyLabel(text)) return text;
+      }
+      const fallback = shortText(item.text || '', 80);
+      return noisyLabel(fallback) ? '' : fallback;
+    };
+    const signalKind = (item) => {
+      if (item.fieldLike) return 'field';
+      if (semanticSurfaceZone(item.zone)) {
+        if (item.zoneRoot === item) return 'surface';
+        if (!item.control && !item.interactive) return '';
+      }
+      if (item.titleLike || item.heading) return 'title';
+      if (item.control) {
+        const tag = item.tag;
+        const role = String(item.element.getAttribute('role') || '').toLowerCase();
+        if (tag === 'button' || role === 'button' || /(?:button|btn|upload|remove|delete|add)/i.test(semanticIdentity(item.element))) return 'action';
+        return 'control';
+      }
+      if (item.interactive) return 'action';
+      if (semanticSurfaceZone(item.zone)) return 'surface';
+      return '';
+    };
+    const nodeIds = new WeakMap();
+    tree.nodes.forEach((item, index) => nodeIds.set(item, `n${index + 1}`));
+    const zones = {};
+    for (const item of tree.nodes) {
+      const zone = zones[item.zone] ||= {
+        nodeCount: 0,
+        controlCount: 0,
+        interactiveCount: 0,
+        fieldLikeCount: 0,
+        titleLikeCount: 0,
+        moduleShellCount: 0
+      };
+      zone.nodeCount += 1;
+      if (item.control) zone.controlCount += 1;
+      if (item.interactive) zone.interactiveCount += 1;
+      if (item.fieldLike) zone.fieldLikeCount += 1;
+      if (item.titleLike) zone.titleLikeCount += 1;
+      if (item.moduleShellLike) zone.moduleShellCount += 1;
+    }
+    for (const [zone, counts] of Object.entries(zones)) {
+      zones[zone] = { nodeCount: counts.nodeCount, ...(compactCounts({
+        controlCount: counts.controlCount,
+        interactiveCount: counts.interactiveCount,
+        fieldLikeCount: counts.fieldLikeCount,
+        titleLikeCount: counts.titleLikeCount,
+        moduleShellCount: counts.moduleShellCount
+      }) || {}) };
+    }
+    const structureBlockItems = semanticPruneOverlappingStructures(tree.nodes
+      .filter((item) => !item.hidden
+        && semanticStructuralZone(item.zone)
+        && item.zoneRoot === item
+        && !['html', 'body'].includes(item.tag)
+        && (item.text || item.controlCount || item.interactiveCount || item.tag === 'head')))
+      .filter((item) => !selectedModules.some((moduleItem) => moduleItem !== item && moduleItem.element.contains(item.element)));
+    const contentBlockItems = selectedModules.map((item) => ({
+      item,
+      kind: 'content',
+      title: semanticModuleTitle(item)
+    }));
+    const pageBlockEntries = [
+      ...structureBlockItems.map((item) => ({
+        item,
+        kind: item.zone,
+        title: semanticLandmarkTitle(item)
+      })),
+      ...contentBlockItems
+    ].sort((left, right) => {
+      if (left.item.element === right.item.element) return 0;
+      const position = left.item.element.compareDocumentPosition(right.item.element);
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    const pageBlockSet = new Set(pageBlockEntries.map((entry) => entry.item));
+    const collectSignals = (root, limit = 120) => {
+      const signals = [];
+      const seen = new Set();
+      let truncated = false;
+      const addSignal = (item, kind) => {
+        const label = directLabel(item);
+        if (!label) return;
+        const labelKey = cleanText(label).toLowerCase();
+        const dedupeKind = kind === 'control' ? 'action' : kind;
+        const key = ['surface', 'title', 'action'].includes(dedupeKind)
+          ? `${dedupeKind}|${labelKey}`
+          : `${dedupeKind}|${labelKey}|${nodeIds.get(item)}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const flags = compactObject({
+          floating: semanticSurfaceZone(item.zone) || undefined,
+          zoneRoot: semanticSurfaceZone(item.zone) && item.zoneRoot === item || undefined
+        });
+        const signal = compactObject({
+          kind,
+          label,
+          nodeId: nodeIds.get(item),
+          tag: item.tag,
+          path: domPath(item.element),
+          class: classSummary(item.element) || undefined,
+          flags,
+          counts: compactCounts({
+            controls: item.controlCount,
+            interactive: item.interactiveCount,
+            fields: item.fieldLikeCount,
+            titles: item.titleLikeCount
+          })
+        });
+        signals.push(signal);
+      };
+      const walk = (item) => {
+        if (!item || item.hidden || signals.length >= limit) {
+          if (signals.length >= limit) truncated = true;
+          return;
+        }
+        if (item !== root && pageBlockSet.has(item)) return;
+        if (item !== root) {
+          const kind = signalKind(item);
+          if (kind) {
+            addSignal(item, kind);
+            if (kind === 'field') return;
+          }
+        }
+        for (const child of item.children) walk(child);
+      };
+      for (const child of root.children) walk(child);
+      return { signals, truncated };
+    };
+    const pageBlocks = pageBlockEntries.map((entry, index) => {
+      const collected = collectSignals(entry.item);
+      const own = shortText(entry.item.ownText || '', 120);
+      return compactObject({
+        index: index + 1,
+        kind: entry.kind,
+        title: entry.title,
+        nodeId: nodeIds.get(entry.item),
+        zone: entry.item.zone,
+        path: domPath(entry.item.element),
+        class: classSummary(entry.item.element) || undefined,
+        ownText: own && own !== entry.title ? own : undefined,
+        counts: compactCounts({
+          controls: entry.item.controlCount,
+          interactive: entry.item.interactiveCount,
+          fields: entry.item.fieldLikeCount,
+          titles: entry.item.titleLikeCount,
+          moduleShells: entry.item.moduleShellCount
+        }),
+        items: collected.signals,
+        truncated: collected.truncated || undefined
+      });
+    });
+    const compactNodeCount = 1 + pageBlocks.length + pageBlocks.reduce((sum, block) => sum + (block.items?.length || 0), 0);
+    let truncated = false;
+    if (pageBlocks.some((block) => block.truncated)) truncated = true;
+
+    return {
+      version: VERSION,
+      page: { host: location.host, pathname: location.pathname, title: document.title },
+      rawDomNodeCount: tree.nodes.length,
+      nodeCount: compactNodeCount,
+      truncated,
+      zones,
+      tree: {
+        kind: 'page',
+        title: document.title || location.host,
+        children: pageBlocks
+      }
+    };
+  }
+
+  function titleCandidateText(node, maxLength = 120) {
+    if (!(node instanceof Element)) return '';
+    const own = normalizeModuleTitleText(ownText(node), maxLength);
+    if (own && (own.length <= 32 || looksLikeModuleTitleText(own))) return own;
+    for (const child of [...node.children]) {
+      if (!(child instanceof Element) || !visible(child) || hasInteractiveDescendant(child)) continue;
+      if (/title_text|describe|description|help|tip|remark|note/i.test(rawClassName(child))) continue;
+      const childOwn = normalizeModuleTitleText(ownText(child), maxLength);
+      if (childOwn && (childOwn.length <= 32 || looksLikeModuleTitleText(childOwn))) return childOwn;
+      const nested = titleCandidateText(child, maxLength);
+      if (nested) return nested;
+    }
+    const text = normalizeModuleTitleText(node.innerText || node.textContent || '', maxLength);
+    if (text.includes(' ')) {
+      const prefix = normalizeModuleTitleText(text.split(' ')[0], maxLength);
+      if (prefix && (prefix.length <= 32 || looksLikeModuleTitleText(prefix))) return prefix;
+    }
+    return looksLikeModuleTitleText(text) ? text : '';
+  }
+
+  function firstText(root, selectors, maxLength = 180) {
+    for (const selector of selectors) {
+      const node = root.querySelector(selector);
+      if (!node || node.contains(root)) continue;
+      const text = titleCandidateText(node, maxLength) || cleanText(node.innerText || node.textContent);
+      if (text) return text.slice(0, maxLength);
+    }
+    return '';
+  }
+
+  function cleanFieldTitleNodeText(node, maxLength = 120) {
+    if (!(node instanceof Element)) return '';
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll([
+      '[class*="error"]', '[class*="Error"]', '[class*="invalid"]', '[class*="Invalid"]',
+      '[class*="required"]', '[class*="Required"]', '[class*="asterisk"]', '[class*="Asterisk"]',
+      '[class*="describe"]', '[class*="Describe"]', '[class*="help"]', '[class*="Help"]',
+      '[class*="tip"]', '[class*="Tip"]', '[role="alert"]'
+    ].join(',')).forEach((child) => child.remove());
+    return normalizeFieldLabel(clone.textContent || '').slice(0, maxLength);
+  }
+
+  function firstFieldTitleText(root, selectors, maxLength = 120) {
+    for (const selector of selectors) {
+      const nodes = [...root.querySelectorAll(selector)];
+      for (const node of nodes) {
+        if (!node || node.contains(root)) continue;
+        const text = cleanFieldTitleNodeText(node, maxLength);
+        if (text) return text;
+      }
+    }
+    return '';
+  }
+
+  function pageBlockPriority(element) {
+    const classes = rawClassName(element);
+    const navId = element.getAttribute('data-nav-id') || '';
+    if (element.querySelector('#special_field_fast_upload_resume,[id*="fast_upload_resume"],[id*="upload_resume"]')) return 5;
+    if (/(?:^|\s)send_box(?:\s|$)/i.test(classes) && element.querySelector(':scope > .send_title')) return 5;
+    if (element.querySelector(':scope > [class*="sc-efQSVx"]')) return 4;
+    if (element.querySelector(':scope > [class*="divider-title_title"]')) return 4;
+    if (element.querySelector(':scope > [class*="title-wrapper"],:scope > [class*="modules-title"]')) return 4;
+    if (/(?:^|\s)cv-module(?:\s|$)/i.test(classes) && element.querySelector(':scope [class*="modules-title"]')) return 4;
+    if (/(?:^|\s)applyFormModuleWrapper-windows(?:\s|$)/i.test(classes)) return 4;
+    if (/apply-block/i.test(classes) || /^block[-_]/i.test(navId) || /[-_]block[-_]/i.test(navId)) return 4;
+    if (/createFormSection[-_]container/i.test(classes)) return 4;
+    if (/form[-_]?block|block[-_]?item|section[-_]?block|createFormSection/i.test(classes)) return 3;
+    if (/form[-_]?section|apply[-_]?section|section[-_]?item/i.test(classes)) return 2;
+    if (element.matches('fieldset,section,form,[role="region"]') && pageBlockTitle(element)) return 1;
+    return 0;
+  }
+
+  function pageBlockTitle(element) {
+    const semanticTitle = semanticModuleTitleByElement.get(element);
+    if (semanticTitle) return semanticTitle;
+    return firstText(element, [
+      ':scope > .send_title',
+      ':scope > [class*="send_title"]',
+      ':scope > [class*="divider-title_title"]',
+      ':scope > [class*="blockTitle"]',
+      ':scope > [class*="BlockTitle"]',
+      ':scope [id="special_field_fast_upload_resume"]',
+      ':scope [id*="fast_upload_resume"]',
+      ':scope [id*="upload_resume"]',
+      ':scope > [class*="sc-efQSVx"]',
+      ':scope [class*="modules-title"] [class*="title"]',
+      ':scope [class*="modules-title"]',
+      ':scope [class*="applyFormModuleWrapper-title"] [class*="applyFormModuleWrapper-text"]',
+      ':scope [class*="applyFormModuleWrapper-title"]',
+      ':scope [class*="applyFormModuleWrapper-text"]',
+      ':scope [class*="title-wrapper"] [class*="title"]',
+      ':scope [class*="createFormSection-title"]',
+      ':scope > [class*="sectionTitle"]',
+      ':scope > [class*="SectionTitle"]',
+      ':scope > legend',
+      ':scope > h1',
+      ':scope > h2',
+      ':scope > h3',
+      ':scope > h4',
+      ':scope > [role="heading"]',
+      ':scope > [class*="title"]',
+      ':scope > [class*="Title"]'
+    ]) || cleanText(element.getAttribute('aria-label') || element.getAttribute('data-title') || element.getAttribute('name') || '');
+  }
+
+  function pageBlockLooksLikeModule(element) {
+    const title = pageBlockTitle(element);
+    if (!title) return false;
+    if (globalThis.ResumeProfileSchema?.moduleSectionForTitle?.(title)) return true;
+    if (MODULE_TITLE_RE.test(title)) return true;
+    return /上传简历|快速解析|个人信息|基本信息|家庭|求职意向|教育|学历|实习|工作|经历|在校|项目|任务|语言|外语|获奖|证书|附件|其他信息|自我评价/i.test(title);
+  }
+
+  function pageBlockRootForCandidate(element) {
+    const identity = `${element.id || ''} ${rawClassName(element)}`;
+    if (/special_field_fast_upload_resume|fast_upload_resume|upload_resume/i.test(identity)) {
+      let node = element.parentElement;
+      for (let depth = 0; node instanceof Element && depth < 7; depth += 1, node = node.parentElement) {
+        if (node.querySelector('input[type="file"]')) return node;
+      }
+    }
+    if (/sc-efQSVx/.test(identity) && element.parentElement) return element.parentElement;
+    if (/ux-standard-form|(?:^|\s)form(?:\s|$)|form-item/i.test(identity) || element.matches?.('.ux-standard-form,.form[name],[class*="form-item"]')) {
+      let node = element;
+      for (let depth = 0; node instanceof Element && depth < 10; depth += 1, node = node.parentElement) {
+        if (node.querySelector(':scope > [class*="sc-efQSVx"],:scope > [class*="title-wrapper"],:scope > [class*="modules-title"]')) return node;
+      }
+    }
+    return element;
+  }
+
+  function hasInteractiveDescendant(element) {
+    return Boolean(element.querySelector(INTERACTIVE_SELECTOR));
+  }
+
+  function pageBlockRoots() {
+    const semanticRoots = semanticPageBlockRoots();
+    if (semanticRoots.length) return semanticRoots;
+    const selector = [
+      '[data-nav-id^="block-"]',
+      '[data-nav-id*="-block"]',
+      '#special_field_fast_upload_resume',
+      '[id*="fast_upload_resume"]',
+      '[id*="upload_resume"]',
+      '.send_box',
+      '[class*="send_box"]',
+      '[class*="sc-efQSVx"]',
+      '.ux-standard-form',
+      '.form[name]',
+      '[class*="cv-module"]',
+      '[class*="applyFormModuleWrapper-windows"]',
+      '[class*="apply-block"]',
+      '[class*="createFormSection-container"]',
+      '[class*="createFormSection"]',
+      '[class*="form-block"]',
+      '[class*="FormBlock"]',
+      '[class*="form-section"]',
+      '[class*="FormSection"]',
+      'fieldset',
+      'section',
+      'form',
+      'section[aria-label]',
+      '[role="region"][aria-label]'
+    ].join(',');
+    const candidates = [...new Set(queryAllDeep(selector).map(pageBlockRootForCandidate))]
+      .filter((element) => visible(element) && !element.closest(AUDIT_UI_SELECTOR)
+        && pageBlockPriority(element) > 0 && (hasInteractiveDescendant(element) || pageBlockTitle(element)));
+    const moduleLikeChildCount = (element) => candidates.filter((other) => other !== element
+      && element.contains(other) && pageBlockLooksLikeModule(other)).length;
+    return candidates
+      .filter((element) => {
+        const priority = pageBlockPriority(element);
+        const looksLikeModule = pageBlockLooksLikeModule(element);
+        const aggregateWrapper = moduleLikeChildCount(element) >= 2;
+        const hasBetterChild = candidates.some((other) => other !== element && element.contains(other)
+          && (
+            pageBlockPriority(other) > priority
+            || pageBlockPriority(other) === priority && (pageBlockLooksLikeModule(other) || !looksLikeModule)
+            || aggregateWrapper && pageBlockLooksLikeModule(other)
+          ));
+        const hasSameOrBetterParent = candidates.some((other) => other !== element && other.contains(element)
+          && !moduleLikeChildCount(other)
+          && (
+            pageBlockPriority(other) > priority && !looksLikeModule
+            || pageBlockPriority(other) === priority && pageBlockLooksLikeModule(other) && !looksLikeModule
+          ));
+        return !hasBetterChild && !hasSameOrBetterParent;
+      })
+      .sort((left, right) => {
+        if (left === right) return 0;
+        const position = left.compareDocumentPosition(right);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+      });
+  }
+
+  function fieldRootTitle(element) {
+    const attrTitle = normalizeFieldLabel([
+      element.getAttribute?.('data-form-field-i18n-name'),
+      element.getAttribute?.('data-form-field-title'),
+      element.getAttribute?.('data-form-field-label')
+    ].filter(Boolean).join(' '));
+    if (attrTitle) return attrTitle;
+    return firstFieldTitleText(element, [
+      ':scope [id="special_field_fast_upload_resume"]',
+      ':scope [id*="fast_upload_resume"]',
+      ':scope [id*="upload_resume"]',
+      ':scope > [class*="title-"]',
+      ':scope > [class*="Title-"]',
+      ':scope > [class*="form-item__title"]',
+      ':scope > [class*="FormItemTitle"]',
+      ':scope [class*="ud-formily-item-label"] label',
+      ':scope [class*="ud-formily-item-label"]',
+      ':scope [class*="form-item-label"] label',
+      ':scope [class*="form-item__text"]',
+      ':scope [class*="FormItemLabel"] label',
+      ':scope [class*="fieldName"]',
+      ':scope [class*="FieldName"]',
+      ':scope > [class*="title"]',
+      ':scope > [class*="Title"]',
+      ':scope > label',
+      ':scope > legend',
+      ':scope > dt',
+      ':scope > [role="heading"]'
+    ], 120) || directGenericTitleText(element, 120);
+  }
+
+  function inferredFieldRoot(element, block) {
+    const known = closestFieldContainer(element, 12) || element.closest('label');
+    if (known && block.contains(known)) return known;
+    const generic = closestGenericFieldRoot(element, block, 12);
+    if (generic) return generic;
+    if (element.matches('input[type="file"]') && block.querySelector('input[type="file"]')) return block;
+    return null;
+  }
+
+  function pageFieldRoots(block) {
+    const explicit = [...block.querySelectorAll([
+      '[class*="apply-field"]',
+      '.info_box',
+      '.ud-formily-item',
+      '[data-form-field-i18n-name]',
+      '[data-form-field-name]',
+      '[class*="form-item"]',
+      '[class*="FormItem"]',
+      '[class*="field-item"]',
+      '[class*="FieldItem"]'
+    ].join(','))].filter((element) => visible(element) && hasInteractiveDescendant(element) && isFieldContainerElement(element));
+    const roots = explicit.length ? explicit : [...block.querySelectorAll('input,textarea,select,[contenteditable]:not([contenteditable="false"]),button,[role="button"],[role="combobox"]')]
+      .map((element) => inferredFieldRoot(element, block))
+      .filter((element) => element instanceof Element && block.contains(element));
+    return [...new Set(roots)].filter((element) => !roots.some((other) => other !== element && element.contains(other)));
+  }
+
+  function fieldDescriptionText(field) {
+    const texts = [...field.querySelectorAll([
+      '[class*="describe"]',
+      '[class*="Describe"]',
+      '[class*="help"]',
+      '[class*="Help"]',
+      '[class*="tip"]',
+      '[class*="Tip"]',
+      'small'
+    ].join(','))]
+      .map((node) => cleanText(node.innerText || node.textContent))
+      .filter(Boolean);
+    return [...new Set(texts)].slice(0, 4);
+  }
+
+  function summarizeFieldInputs(field) {
+    return [...field.querySelectorAll('input,textarea,select,[role="combobox"],[contenteditable]:not([contenteditable="false"]),.phoenix-button')]
+      .slice(0, 20)
+      .map((element) => ({
+        tag: element.tagName.toLowerCase(),
+        type: element.type || '',
+        role: element.getAttribute('role') || '',
+        id: element.id || '',
+        name: element.getAttribute('name') || '',
+        placeholder: element.getAttribute('placeholder') || '',
+        accept: element.getAttribute('accept') || '',
+        autocomplete: element.getAttribute('autocomplete') || '',
+        readonly: Boolean(element.readOnly || element.getAttribute('aria-readonly') === 'true'),
+        disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true')
+      }));
+  }
+
+  function controlsInside(root, items) {
+    return items.filter((item) => {
+      const target = elementMap.get(item.ref);
+      const source = sourceElementMap.get(item.ref);
+      return target instanceof Element && root.contains(target)
+        || source instanceof Element && root.contains(source);
+    });
+  }
+
+  function parsePageBlocks(items) {
+    const blocks = pageBlockRoots().map((block, blockIndex) => {
+      const ref = `b${blockIndex + 1}`;
+      elementMap.set(ref, block);
+      const blockControls = controlsInside(block, items);
+      const fields = pageFieldRoots(block).map((field, fieldIndex) => {
+        const fieldControls = controlsInside(field, items);
+        if (!fieldControls.length) return null;
+        const label = fieldRootTitle(field) || fieldControls.find((item) => item.fieldLabel)?.fieldLabel
+          || fieldControls.find((item) => item.text)?.text || '';
+        const record = repeatRecordDetails(field);
+        return {
+          ref: `${ref}f${fieldIndex + 1}`,
+          label,
+          recordIndex: record.recordIndex,
+          recordTotal: record.recordTotal,
+          recordGroup: record.recordGroup,
+          required: Boolean(field.querySelector('[class*="required"],[aria-required="true"],input[required],textarea[required],select[required]')),
+          descriptions: fieldDescriptionText(field),
+          inputs: summarizeFieldInputs(field),
+          controlRefs: fieldControls.map((item) => item.ref),
+          controlKinds: [...new Set(fieldControls.map((item) => item.controlKind).filter(Boolean))],
+          operationGroups: [...new Set(fieldControls.map((item) => item.operationGroup).filter(Boolean))],
+          domPath: domPath(field),
+          class: classSummary(field)
+        };
+      }).filter(Boolean);
+      return {
+        ref,
+        navId: block.getAttribute('data-nav-id') || '',
+        title: pageBlockTitle(block) || `Block ${blockIndex + 1}`,
+        context: sectionContext(block),
+        fieldCount: fields.length,
+        requiredFieldCount: fields.filter((field) => field.required).length,
+        controlRefs: blockControls.map((item) => item.ref),
+        fields,
+        class: classSummary(block),
+        domPath: domPath(block)
+      };
+    });
+
+    const blockByRef = new Map(blocks.map((block) => [block.ref, block]));
+    const fieldByControlRef = new Map();
+    for (const block of blocks) {
+      for (const field of block.fields) {
+        for (const controlRef of field.controlRefs) fieldByControlRef.set(controlRef, { block, field });
+      }
+    }
+    for (const item of items) {
+      const target = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
+      const surface = semanticSurfaceContextForElement(target);
+      if (surface) {
+        item.surfaceZone = surface.zone;
+        item.surfaceTitle = surface.title;
+      }
+      const structure = semanticStructureContextForElement(target);
+      if (structure) {
+        item.structureZone = structure.zone;
+        item.structureTitle = structure.title;
+        item.blockTitle = structure.title;
+        item.moduleTitle = structure.title;
+        item.blockNavId = structure.zone;
+        item.fieldBlockLabel = '';
+        continue;
+      }
+      const fieldMatch = fieldByControlRef.get(item.ref);
+      if (fieldMatch) {
+        item.blockRef = fieldMatch.block.ref;
+        item.blockTitle = fieldMatch.block.title;
+        item.blockNavId = fieldMatch.block.navId;
+        item.fieldBlockLabel = fieldMatch.field.label;
+        item.recordIndex ||= fieldMatch.field.recordIndex || 0;
+        item.recordTotal ||= fieldMatch.field.recordTotal || 0;
+        item.repeatGroup ||= fieldMatch.field.recordGroup || '';
+        continue;
+      }
+      const block = blocks.find((candidate) => {
+        const blockElement = elementMap.get(candidate.ref);
+        return blockElement instanceof Element && target instanceof Element && blockElement.contains(target);
+      });
+      if (blockByRef.has(block?.ref)) {
+        item.blockRef = block.ref;
+        item.blockTitle = block.title;
+        item.blockNavId = block.navId;
+        item.fieldBlockLabel = '';
+      }
+    }
+    return blocks;
+  }
+
+  function summarizePageModules(blocks) {
+    return blocks.map((block) => {
+      const labelCounts = new Map();
+      for (const field of block.fields) {
+        const label = stripGeneratedOrdinal(field.label || '未命名字段');
+        field.label = label;
+        labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+      }
+      const seen = new Map();
+      const labels = [...labelCounts.entries()].map(([label, count]) => ({ label, count }));
+      for (const field of block.fields) {
+        const count = labelCounts.get(field.label) || 1;
+        const index = (seen.get(field.label) || 0) + 1;
+        seen.set(field.label, index);
+        field.repeatIndex = index;
+        field.repeatTotal = count;
+        field.displayLabel = count > 1 ? `${field.label}${index}` : field.label;
+      }
+      const structuralRecordCount = Math.max(0, ...block.fields.map((field) => field.recordTotal || 0));
+      const recordCount = structuralRecordCount || Math.max(0, ...labels.map((item) => item.count));
+      const repeatedLabels = labels.filter((item) => item.count > 1);
+      return {
+        ref: block.ref,
+        module: block.title,
+        field_count: block.fields.length,
+        record_count: recordCount,
+        repeated_label_count: repeatedLabels.length,
+        labels,
+        repeated_labels: repeatedLabels
+      };
+    });
+  }
+
+  function recordElement(element, index) {
+    const target = visualTarget(element);
+    const preliminaryText = directLabelText(element) || actionDescription(element);
+    const inferredContext = sectionContext(element);
+    const detectedRangeEndpoint = atsxPeriodEndpoint(element, inferredContext) || mokaYearMonthEndpoint(element, inferredContext);
+    const rangeEndpoint = detectedRangeEndpoint?.internal ? null : detectedRangeEndpoint;
+    const context = rangeEndpoint?.context || inferredContext;
+    const matchedKey = rangeEndpoint?.key || matchKey(preliminaryText, context);
+    const kind = controlKind(element, preliminaryText, matchedKey);
+    const family = elementKind(kind);
+    const inheritedLabelDetails = family === 'field' && !rangeEndpoint ? fieldLabelDetails(element, matchedKey) : null;
+    const compoundSemantic = family === 'field'
+      ? compoundSubControlSemantic(element, inheritedLabelDetails?.label || preliminaryText, matchedKey, kind)
+      : null;
+    const fieldText = family === 'field' ? (rangeEndpoint?.label || directLabelText(element)) : '';
+    const text = family === 'field'
+      ? fieldText || (['month-trigger', 'month-picker'].includes(kind) ? '年月选择器' : kind === 'date-picker' ? '日期选择器' : '')
+      : actionDescription(element);
+    const finalKey = family === 'field' ? (compoundSemantic?.key || rangeEndpoint?.key || matchKey(text, context)) : '';
+    const labelDetails = family === 'field'
+      ? compoundSemantic ? { label: compoundSemantic.label, source: compoundSemantic.source } : rangeEndpoint ? { label: rangeEndpoint.label, source: 'range-endpoint' } : fieldLabelDetails(element, finalKey)
+      : { label: '', source: '' };
+    const profileMapping = family === 'field'
+      ? resolveProfileMapping(labelDetails.label, finalKey, context)
+      : { path: '', candidates: [] };
+    const repeatBinding = repeatBindingDetails(element, profileMapping.path, context);
+    const recordBinding = repeatRecordDetails(element);
+    const action = actionType(element, family, kind, finalKey, text);
+    const state = editability(element, kind);
+    const safetyResult = safety(action, text);
+    const adaptationResult = adaptation(element, kind, action, state, safetyResult);
+    const interaction = interactionPlan(element, action, finalKey);
+    const classificationResult = classification(element, kind, action, finalKey, text);
+    const date = rangeEndpoint?.datePrecision
+      ? { precision: rangeEndpoint.datePrecision, mechanism: rangeEndpoint.dateMechanism }
+      : dateShape(element, kind, text);
+    const rect = target.getBoundingClientRect();
     const ref = `i${index + 1}`;
-    auditElementMap.set(ref, visualTarget);
+    elementMap.set(ref, target);
+    sourceElementMap.set(ref, element);
     return {
       ref,
-      status: capabilityResult.capability,
-      capability: capabilityResult.capability,
-      reason: capabilityResult.reason,
-      controlKind,
-      inputMode,
-      datePrecision: dateShape.precision,
-      dateMechanism: dateShape.mechanism,
-      requirement,
-      text: inferredText || description || '(无可读文字)',
-      visibleText: cleanText(element.innerText || element.textContent).slice(0, 180),
-      matchedKey,
-      mappingStatus: matchedKey ? 'mapped' : 'unmapped',
-      repeatedKind,
+      elementKind: family,
+      actionType: action,
+      operationGroup: operationGroup(action),
+      valueDomain: valueDomain(element, family, action, kind),
+      cardinality: cardinality(element, kind),
+      editability: state,
+      availability: /conditional|condition-field|depends-on/i.test(rawClassName(target)) ? 'conditional' : 'available',
+      semanticType: semanticType(element, finalKey, kind, text),
+      classification: classificationResult,
+      interaction,
+      adaptation: adaptationResult,
+      safety: safetyResult,
+      controlKind: kind,
+      mappingStatus: profileMapping.path ? 'mapped' : profileMapping.candidates.length ? 'ambiguous' : 'unmapped',
+      matchedKey: finalKey,
+      profilePath: profileMapping.path,
+      profilePathCandidates: profileMapping.candidates,
+      repeatSection: repeatBinding.repeatSection,
+      repeatIndex: repeatBinding.repeatIndex || recordBinding.recordIndex,
+      repeatGroup: repeatBinding.repeatGroup || recordBinding.recordGroup,
+      recordIndex: recordBinding.recordIndex,
+      recordTotal: recordBinding.recordTotal,
+      fieldLabel: labelDetails.label,
+      fieldLabelSource: labelDetails.source,
+      options: kind === 'radio-group' ? radioGroupOptions(element) : [],
+      compoundRole: compoundSemantic?.role || '',
+      subControlOf: compoundSemantic?.subControlOf || '',
+      currentValue: compoundSemantic?.valueText || '',
+      rangeRole: rangeEndpoint?.role || '',
+      rangeGroup: rangeEndpoint?.rangeGroup || '',
+      rangeIndex: rangeEndpoint?.rangeIndex || 0,
+      datePart: rangeEndpoint?.datePart || '',
+      requirement: family === 'field' ? requirement(element) : '',
+      datePrecision: date.precision,
+      dateMechanism: date.mechanism,
+      text: text || '(无可靠语义文字)',
       context,
       tag: element.tagName.toLowerCase(),
       type: element.type || '',
@@ -4400,819 +2958,801 @@
       ariaLabel: element.getAttribute('aria-label') || '',
       ariaLabelledby: element.getAttribute('aria-labelledby') || '',
       ariaExpanded: element.getAttribute('aria-expanded') || '',
-      readonly: Boolean(element.readOnly),
-      disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
-      class: classSummary(visualTarget),
-      domPath: auditDomPath(visualTarget),
-      sourceDomPath: visualTarget === element ? '' : auditDomPath(element),
-      bounds: { left: Math.round(rect.left), top: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) }
+      readonly: Boolean(element.readOnly || element.getAttribute('aria-readonly') === 'true'),
+      selectable: state === 'selectable',
+      disabled: state === 'disabled',
+      class: classSummary(target),
+      domPath: domPath(target),
+      sourceDomPath: target === element ? '' : domPath(element),
+      bounds: {
+        left: Math.round(rect.left), top: Math.round(rect.top),
+        width: Math.round(rect.width), height: Math.round(rect.height)
+      }
     };
+  }
+
+  function clearElementMarks() {
+    document.querySelectorAll(`.${OVERLAY_CLASS}`).forEach((overlay) => overlay.remove());
+    queryAllDeep(`[data-resume-page-audit-ref],.${MARK_CLASSES.join(',.')}`).forEach((element) => {
+      element.classList.remove(...MARK_CLASSES);
+      delete element.dataset.resumePageAuditRef;
+    });
+  }
+
+  function clearAudit() {
+    document.querySelector(PANEL_SELECTOR)?.remove();
+    clearElementMarks();
+  }
+
+  function choiceGroups() {
+    return queryAllDeep('fieldset,[role="radiogroup"],[role="group"],.phoenix-radio-group')
+      .filter(visible)
+      .map((group, index) => {
+        const phoenixOptions = radioGroupOptions(group);
+        const options = [...group.querySelectorAll('input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"]')].filter(visible);
+        if (phoenixOptions.length >= 2) {
+          return {
+            index,
+            title: fieldLabelDetails(group, matchKey(directLabelText(group), sectionContext(group))).label,
+            cardinality: 'single',
+            options: phoenixOptions.map((text) => ({ text, tag: 'div', role: '', type: 'radio' }))
+          };
+        }
+        if (options.length < 2) return null;
+        return {
+          index,
+          title: cleanText(group.querySelector('legend,[role="heading"],[class*="title"],[class*="label"]')?.textContent || group.getAttribute('aria-label') || ''),
+          cardinality: options.some((option) => String(option.type || '').toLowerCase() === 'checkbox' || option.getAttribute('role') === 'checkbox') ? 'multi' : 'single',
+          options: options.map((option) => ({ text: directLabelText(option), tag: option.tagName.toLowerCase(), role: option.getAttribute('role') || '', type: option.type || '' }))
+        };
+      }).filter(Boolean);
+  }
+
+  function pageLimitations() {
+    const limitations = [];
+    const iframes = queryAllDeep('iframe');
+    if (iframes.some((frame) => {
+      try { return frame.src && new URL(frame.src, location.href).origin !== location.origin; } catch { return true; }
+    })) limitations.push({ reasonCode: 'IFRAME_CROSS_ORIGIN', count: iframes.length, reason: '页面包含 iframe；跨域 iframe 内部字段无法由当前页面脚本读取' });
+    const shadowHosts = queryAllDeep('*').filter((element) => element.shadowRoot);
+    if (shadowHosts.length) limitations.push({ reasonCode: 'SHADOW_DOM', count: shadowHosts.length, reason: '已扫描开放 Shadow DOM；封闭 Shadow DOM 仍无法读取' });
+    const canvases = queryAllDeep('canvas').filter(visible);
+    if (canvases.length) limitations.push({ reasonCode: 'CANVAS_RENDERED', count: canvases.length, reason: '页面包含可见 Canvas，内部交互无法通过标准 DOM 解析' });
+    return limitations;
+  }
+
+  function dimensionCounts(items) {
+    return items.reduce((counts, item) => {
+      const dimensions = {
+        elementKind: item.elementKind,
+        operationGroup: item.operationGroup,
+        actionType: item.actionType,
+        valueDomain: item.valueDomain,
+        cardinality: item.cardinality,
+        editability: item.editability,
+        availability: item.availability,
+        adaptation: item.adaptation.status,
+        mapping: item.mappingStatus
+      };
+      for (const [axis, value] of Object.entries(dimensions)) {
+        counts[axis] ||= {};
+        counts[axis][value] = (counts[axis][value] || 0) + 1;
+      }
+      return counts;
+    }, {});
+  }
+
+  function mergeCompoundInteractions(items) {
+    const removedRefs = new Set();
+    let mergedOverlaps = 0;
+
+    // 年月面板通常挂在 body 的 Portal 中。优先按 data-cy，其次按屏幕距离与日期触发框合并。
+    const dateTriggers = items.filter((item) => item.elementKind === 'field' && ['date-trigger', 'month-trigger'].includes(item.controlKind));
+    for (const panel of items.filter((item) => item.elementKind === 'field' && ['date-picker', 'month-picker'].includes(item.controlKind))) {
+      const panelTarget = elementMap.get(panel.ref);
+      if (!(panelTarget instanceof Element) || !dateTriggers.length) continue;
+      const panelRect = panelTarget.getBoundingClientRect();
+      const panelCy = panelTarget.querySelector('[data-cy$="Dropdown"]')?.getAttribute('data-cy')
+        || panelTarget.getAttribute('data-cy') || '';
+      const exactTrigger = panelCy
+        ? dateTriggers.find((item) => {
+          const target = elementMap.get(item.ref);
+          return target?.getAttribute?.('data-cy') === panelCy.replace(/Dropdown$/, '');
+        })
+        : null;
+      const trigger = exactTrigger || [...dateTriggers].sort((left, right) => {
+        const leftRect = elementMap.get(left.ref)?.getBoundingClientRect?.();
+        const rightRect = elementMap.get(right.ref)?.getBoundingClientRect?.();
+        const distance = (rect) => rect
+          ? Math.abs(rect.left - panelRect.left) + Math.abs(rect.bottom - panelRect.top)
+          : Number.POSITIVE_INFINITY;
+        return distance(leftRect) - distance(rightRect);
+      })[0];
+      if (!trigger) continue;
+      trigger.controlKind = panel.controlKind;
+      trigger.actionType = 'select';
+      trigger.valueDomain = 'closed-local';
+      trigger.editability = 'selectable';
+      trigger.selectable = true;
+      trigger.datePrecision = panel.datePrecision;
+      trigger.dateMechanism = panel.dateMechanism;
+      trigger.interaction = { ...trigger.interaction, searchable: false, confirmationRequired: true };
+      trigger.classification = {
+        reasonCode: panel.controlKind === 'month-picker' ? 'READONLY_MONTH_PICKER_TRIGGER' : 'READONLY_DATE_PICKER_TRIGGER',
+        evidence: ['non-typing-trigger', panel.controlKind, 'selection-changes-value']
+      };
+      removedRefs.add(panel.ref);
+      mergedOverlaps += 1;
+    }
+
+    // Phoenix button 选择器的输入能力由打开后的完整弹层决定：有搜索框则可输入，否则只能点选。
+    const selectTriggers = items.filter((item) => item.elementKind === 'field' && item.controlKind === 'select-trigger');
+    const usedSelectTriggers = new Set();
+    for (const panel of items.filter((item) => item.elementKind === 'field'
+      && ['option-panel', 'searchable-option-panel'].includes(item.controlKind))) {
+      const panelTarget = elementMap.get(panel.ref);
+      if (!(panelTarget instanceof Element) || !selectTriggers.length) continue;
+      const panelRect = panelTarget.getBoundingClientRect();
+      const trigger = [...selectTriggers]
+        .filter((item) => !usedSelectTriggers.has(item.ref))
+        .sort((left, right) => {
+          const leftRect = elementMap.get(left.ref)?.getBoundingClientRect?.();
+          const rightRect = elementMap.get(right.ref)?.getBoundingClientRect?.();
+          const distance = (rect) => rect
+            ? Math.abs(rect.left - panelRect.left) + Math.abs(rect.bottom - panelRect.top)
+            : Number.POSITIVE_INFINITY;
+          return distance(leftRect) - distance(rightRect);
+        })[0];
+      if (!trigger) continue;
+      const searchable = panel.controlKind === 'searchable-option-panel';
+      trigger.controlKind = searchable ? 'autocomplete' : 'custom-select';
+      trigger.actionType = searchable ? 'select-search' : 'select';
+      trigger.valueDomain = 'closed-local';
+      trigger.editability = searchable ? 'editable' : 'selectable';
+      trigger.selectable = !searchable;
+      trigger.interaction = { ...trigger.interaction, searchable, confirmationRequired: true };
+      trigger.classification = {
+        reasonCode: searchable ? 'POPUP_SEARCHABLE_OPTIONS' : 'POPUP_FIXED_OPTIONS',
+        evidence: searchable
+          ? ['phoenix-button-trigger', 'popup-search-input', 'option-list']
+          : ['phoenix-button-trigger', 'fixed-option-list', 'no-search-input']
+      };
+      removedRefs.add(panel.ref);
+      usedSelectTriggers.add(trigger.ref);
+      mergedOverlaps += 1;
+    }
+
+    for (const field of items.filter((item) => item.elementKind === 'field')) {
+      if (removedRefs.has(field.ref)) continue;
+      const fieldTarget = elementMap.get(field.ref);
+      if (!(fieldTarget instanceof Element)) continue;
+      const relatedClicks = items.filter((item) => {
+        if (item.elementKind !== 'action' || item.actionType !== 'click' || removedRefs.has(item.ref)) return false;
+        const actionTarget = elementMap.get(item.ref);
+        return actionTarget instanceof Element && actionTarget !== fieldTarget
+          && (actionTarget.contains(fieldTarget) || fieldTarget.contains(actionTarget));
+      });
+      if (!relatedClicks.length) continue;
+
+      // 外层点击区域包住可写 input：这是一个“输入 + 候选列表确认”的复合控件，不能拆成点击和写入两条。
+      const wrapperClick = relatedClicks.some((item) => {
+        const actionTarget = elementMap.get(item.ref);
+        return actionTarget instanceof Element && actionTarget.contains(fieldTarget);
+      });
+      const preserveOpenText = wrapperClick
+        && field.actionType === 'write'
+        && field.controlKind === 'free-text'
+        && isOpenTextField(fieldTarget, field.matchedKey, `${field.text || ''} ${field.fieldLabel || ''} ${field.displayName || ''}`);
+      if (wrapperClick && field.actionType === 'write' && !preserveOpenText) {
+        field.actionType = 'select-search';
+        field.valueDomain = 'closed-local';
+        field.controlKind = 'autocomplete';
+        field.interaction = {
+          ...field.interaction,
+          searchable: true,
+          confirmationRequired: true
+        };
+        field.classification = {
+          reasonCode: 'TEXT_INPUT_WITH_CLICKABLE_LIST_TRIGGER',
+          evidence: ['editable-text-input', 'overlapping-click-wrapper', 'option-selection-required']
+        };
+        field.adaptation = {
+          status: 'partial',
+          reasonCode: 'DYNAMIC_OPTIONS',
+          reason: '可输入字段与候选列表触发区属于同一复合控件，最终值需要从列表确认'
+        };
+      } else if (preserveOpenText) {
+        field.valueDomain = 'open';
+        field.classification = {
+          ...field.classification,
+          reasonCode: field.classification?.reasonCode || 'OPEN_TEXT_SEMANTIC',
+          evidence: [...new Set([...(field.classification?.evidence || []), 'overlapping-click-wrapper-ignored'])]
+        };
+      } else if (wrapperClick && field.actionType === 'none' && field.readonly) {
+        field.actionType = 'select';
+        field.valueDomain = 'closed-local';
+        field.controlKind = 'custom-select';
+        field.editability = 'selectable';
+        field.selectable = true;
+        field.interaction = { ...field.interaction, searchable: false, confirmationRequired: true };
+        field.classification = {
+          reasonCode: 'READONLY_SELECTION_TRIGGER',
+          evidence: ['readonly-text-trigger', 'overlapping-click-wrapper', 'selection-changes-value']
+        };
+      }
+      for (const click of relatedClicks) removedRefs.add(click.ref);
+      mergedOverlaps += relatedClicks.length;
+    }
+    return {
+      items: items.filter((item) => !removedRefs.has(item.ref)),
+      mergedOverlaps
+    };
+  }
+
+  function enforceOperationInvariants(items) {
+    const selectionKinds = new Set([
+      'native-select', 'custom-select', 'native-date', 'date-trigger', 'date-picker',
+      'month-trigger', 'month-picker', 'radio', 'radio-group', 'checkbox', 'switch'
+    ]);
+    for (const item of items) {
+      if (item.elementKind !== 'field' || !item.readonly) continue;
+      const target = elementMap.get(item.ref);
+      const activationHandler = target instanceof Element
+        ? `${target.getAttribute('onfocus') || ''} ${target.getAttribute('onclick') || ''} ${target.getAttribute('onmousedown') || ''}`
+        : '';
+      if (!selectionKinds.has(item.controlKind) && !cleanText(activationHandler)) continue;
+      item.actionType = item.cardinality === 'multi' ? 'select-multi' : 'select';
+      item.valueDomain = 'closed-local';
+      item.editability = 'selectable';
+      item.selectable = true;
+      item.classification = {
+        reasonCode: 'READONLY_SELECTION_TRIGGER',
+        evidence: ['readonly-blocks-typing', 'selection-trigger-present', 'selection-changes-value']
+      };
+      if (item.adaptation.reasonCode === 'READONLY') {
+        item.adaptation = { status: 'adapted', reasonCode: '', reason: '' };
+      }
+    }
   }
 
   function diagnosePage() {
-    document.querySelector('.resume-autofill-audit')?.remove();
-    document.querySelectorAll('.resume-autofill-audit-target').forEach((element) => element.classList.remove('resume-autofill-audit-target'));
-    clearAuditAnnotations();
-    auditElementMap = new Map();
-    const allControls = [...document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"]')]
-      .filter((element, index, list) => list.indexOf(element) === index);
-    const controls = allControls
-      .slice(0, 600)
-      .map((element, index) => {
-        const ancestors = [];
-        let node = element.parentElement;
-        for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-          const explicit = node.querySelector(':scope > label, :scope > legend, :scope > dt, :scope > th, :scope > [class*="label"], :scope > [class*="Label"], :scope > [class*="title"], :scope > [class*="Title"]');
-          ancestors.push({
-            tag: node.tagName.toLowerCase(),
-            class: classSummary(node),
-            role: node.getAttribute('role') || '',
-            label: explicit?.textContent?.replace(/\s+/g, ' ').trim().slice(0, 120) || '',
-            directText: [...node.childNodes]
-              .filter((child) => child.nodeType === Node.TEXT_NODE)
-              .map((child) => child.textContent.trim()).filter(Boolean).join(' ').slice(0, 120)
-          });
-        }
-        const text = labelText(element);
-        const context = sectionContext(element);
-        const matchedKey = matchKey(text, context);
-        return {
-          index,
-          tag: element.tagName.toLowerCase(),
-          type: element.type || '',
-          name: element.name || '',
-          id: element.id || '',
-          placeholder: element.placeholder || '',
-          role: element.getAttribute('role') || '',
-          ariaLabel: element.getAttribute('aria-label') || '',
-          ariaLabelledby: element.getAttribute('aria-labelledby') || '',
-          readonly: Boolean(element.readOnly),
-          disabled: Boolean(element.disabled),
-          class: classSummary(element),
-          inferredText: text,
-          context,
-          matchedKey,
-          controlKind: auditControlKind(element, text, matchedKey),
-          visible: visible(element),
-          ancestors
-        };
-      });
-    const choiceGroups = customChoiceGroups().map(({ group, container, text, options }, index) => {
-      const context = sectionContext(container);
-      return {
-        index,
-        title: cleanText(text),
-        context,
-        matchedKey: matchKey(cleanText(text).toLowerCase(), context),
-        class: classSummary(group),
-        options: options.map((option) => ({
-          text: cleanText(option.textContent || option.value),
-          checked: customChoiceChecked(option),
-          class: classSummary(option)
-        }))
-      };
-    });
-
-    const semanticSelector = [
-      'input', 'textarea', 'select', '[contenteditable="true"]', 'button', 'a', 'summary',
+    clearAudit();
+    elementMap = new Map();
+    sourceElementMap = new Map();
+    semanticModuleTitleByElement = new WeakMap();
+    semanticZoneByElement = new WeakMap();
+    semanticZoneRootByElement = new WeakMap();
+    semanticLandmarkTitleByElement = new WeakMap();
+    semanticTreeSnapshot = null;
+    const selector = [
+      'input', 'textarea', 'select', '[contenteditable]:not([contenteditable="false"])', 'button', 'a', 'summary', 'canvas',
       '[role="button"]', '[role="link"]', '[role="textbox"]', '[role="combobox"]',
       '[role="radio"]', '[role="checkbox"]', '[role="switch"]', '[role="menuitem"]',
-      '[role="option"]', '[role="gridcell"]', '[role="treeitem"]', '[tabindex]', '[onclick]',
-      '[aria-haspopup]', '[data-action]', '[data-testid]', '.atsx-date-picker-period-month', '[class*="date-picker-period"]'
+      '[role="slider"]', '[role="spinbutton"]', '[role="tab"]', '[role="listbox"]', '[role="radiogroup"]',
+      '.phoenix-radio-group', '.phoenix-radio-group__radioItem', '.phoenix-radio',
+      '[tabindex]', '[onclick]', '[aria-haspopup]', '[aria-controls]', '[aria-expanded]', '[data-action]',
+      '.atsx-date-picker-period-month-label',
+      '.atsx-date-picker-dropdown',
+      '.phoenix-date-picker', '.phoenix-calendar-month-calendar',
+      '.phoenix-button', '.phoenix-button__wraper', '.phoenix-button__suffixIcon', '.phoenix-select', '.phoenix-selectList',
+      '.ud__select', '.ud__picker', '.ud__radio-group', '.ud__checkbox-group', '.atsx-upload',
+      '[class*="sd-panal-menu-wrapper"]', '[class*="sd-basic-year-container"]', '[class*="sd-basic-year-item"]',
+      '.createFormSection-addBtn', '[class*="addMore-plus"]', '[class*="addMore-add"]',
+      '.el-select', '.ant-select', '.arco-select', '.ivu-select', '.el-cascader', '.ant-cascader',
+      '.el-date-editor', '.ant-picker', '.arco-picker', '.el-upload', '.ant-upload'
     ].join(',');
-    const semanticCandidates = [...document.querySelectorAll(semanticSelector)];
-    const pointerCandidates = [...document.querySelectorAll('body *')].filter((element) => {
-      if (!visible(element) || element.closest('.resume-autofill-completion,.resume-autofill-audit')) return false;
-      const text = interactiveDescription(element);
-      return text && text.length <= 180 && getComputedStyle(element).cursor === 'pointer';
-    });
-    const rawInteractive = [...new Set([...semanticCandidates, ...pointerCandidates])]
-      .filter((element) => visible(element) && !element.closest('.resume-autofill-completion,.resume-autofill-audit'));
-    const seenVisualTargets = new Set();
-    const allInteractive = rawInteractive.filter((element) => {
-      const visualTarget = auditVisualTarget(element);
-      if (seenVisualTargets.has(visualTarget)) return false;
-      seenVisualTargets.add(visualTarget);
+    const allElements = queryAllDeep('*');
+    const semanticCandidates = queryAllDeep(selector);
+    const pointerPool = allElements.slice(0, MAX_POINTER_SCAN);
+    const pointerCandidates = pointerPool.filter((element) => visible(element)
+      && cleanText(element.innerText || element.textContent).length <= 180
+      && getComputedStyle(element).cursor === 'pointer');
+    const raw = [...new Set([...semanticCandidates, ...pointerCandidates])]
+      .filter((element) => visible(element) && !element.closest(AUDIT_UI_SELECTOR)
+        && !isAtsxPeriodInternalNoise(element)
+        && !isMokaYearMonthInternalNoise(element));
+    const canonicalCandidates = [...new Set(raw.map(canonicalInteractiveElement))];
+    const seen = new Set();
+    const interactive = canonicalCandidates.filter((element) => {
+      const target = visualTarget(element);
+      if (seen.has(target)) return false;
+      seen.add(target);
       return true;
     });
-    const auditLimit = 1200;
-    const interactiveElements = allInteractive.slice(0, auditLimit).map(auditElementRecord);
-
-    const textCandidates = [...document.querySelectorAll('label,legend,h1,h2,h3,h4,h5,h6,dt,th,[role="heading"],[aria-label]')]
-      .filter((element) => visible(element) && !element.closest('.resume-autofill-completion,.resume-autofill-audit'));
-    const semanticTexts = textCandidates.slice(0, 600).map((element, index) => {
-      const text = cleanText(`${element.getAttribute('aria-label') || ''} ${element.textContent}`).slice(0, 180);
+    const provisionalItems = interactive.slice(0, MAX_INTERACTIVE).map(recordElement);
+    const withoutWrapperContainers = provisionalItems.filter((item) => {
+      if (item.elementKind !== 'container') return true;
+      const container = elementMap.get(item.ref);
+      if (!(container instanceof Element)) return true;
+      return !provisionalItems.some((other) => {
+        if (other === item || other.elementKind === 'container') return false;
+        const child = elementMap.get(other.ref);
+        return child instanceof Element && child !== container && container.contains(child);
+      });
+    });
+    const mergedInteractions = mergeCompoundInteractions(withoutWrapperContainers);
+    const items = mergedInteractions.items.filter((item) => {
+      const reliableText = item.elementKind === 'field' ? item.fieldLabel || item.text : item.text;
+      return !isNoReliableText(reliableText);
+    });
+    enforceOperationInvariants(items);
+    for (const item of items) item.operationGroup = operationGroup(item.actionType);
+    assignFieldBindings(items);
+    const blocks = parsePageBlocks(items);
+    const moduleSummary = summarizePageModules(blocks);
+    const moduleByBlockRef = new Map(moduleSummary.map((module) => [module.ref, module]));
+    for (const item of items) {
+      const module = moduleByBlockRef.get(item.blockRef);
+      item.moduleTitle = module?.module || item.blockTitle || item.context || '';
+    }
+    inferCommonDateRanges(items);
+    assignFieldBindings(items);
+    remapFieldProfiles(items);
+    assignFieldBindings(items);
+    const textCandidates = queryAllDeep('label,legend,h1,h2,h3,h4,h5,h6,dt,th,[role="heading"],[aria-label]')
+      .filter((element) => visible(element) && !element.closest(AUDIT_UI_SELECTOR));
+    const semanticTexts = textCandidates.slice(0, MAX_SEMANTIC_TEXTS).map((element, index) => {
       const ref = `t${index + 1}`;
-      auditElementMap.set(ref, element);
-      return { ref, text: text || '(无可读文字)', tag: element.tagName.toLowerCase(), role: element.getAttribute('role') || '', class: classSummary(element), domPath: auditDomPath(element) };
-    }).filter((item) => item.text !== '(无可读文字)');
-
-    const auditCounts = interactiveElements.reduce((counts, item) => {
-      counts[item.status] = (counts[item.status] || 0) + 1;
-      return counts;
-    }, {});
+      elementMap.set(ref, element);
+      return {
+        ref,
+        text: cleanText(`${element.getAttribute('aria-label') || ''} ${element.textContent}`).slice(0, 180) || '(无可靠语义文字)',
+        tag: element.tagName.toLowerCase(),
+        role: element.getAttribute('role') || '',
+        class: classSummary(element),
+        domPath: domPath(element)
+      };
+    }).filter((item) => !isNoReliableText(item.text));
+    const limitations = pageLimitations();
     return {
-      version: CONTENT_SCRIPT_VERSION,
+      schemaVersion: 2,
+      version: VERSION,
+      mode: 'audit-only',
+      privacy: { readsInputValues: false, readsLocalResumeData: false, performsPageActions: false },
       page: { host: location.host, pathname: location.pathname, title: document.title },
       counts: {
-        controls: allControls.length,
-        inputs: document.querySelectorAll('input').length,
-        selects: document.querySelectorAll('select').length,
-        comboboxes: document.querySelectorAll('[role="combobox"]').length,
-        choiceGroups: choiceGroups.length,
-        shadowHosts: [...document.querySelectorAll('*')].filter((element) => element.shadowRoot).length,
-        interactive: allInteractive.length,
+        interactive: items.length,
+        rawInteractiveCandidates: raw.length,
+        collapsedDuplicates: Math.max(0, raw.length - items.length),
+        mergedInteractionOverlaps: mergedInteractions.mergedOverlaps,
         semanticTexts: textCandidates.length,
-        audit: auditCounts
+        blocks: blocks.length,
+        choiceGroups: choiceGroups().length,
+        iframes: queryAllDeep('iframe').length,
+        shadowHosts: allElements.filter((element) => element.shadowRoot).length,
+        dimensions: dimensionCounts(items)
       },
-      truncated: { controls: allControls.length > controls.length, interactive: allInteractive.length > auditLimit, semanticTexts: textCandidates.length > semanticTexts.length },
-      iframes: [...document.querySelectorAll('iframe')].map((frame) => ({
-        title: frame.title || '', name: frame.name || '', srcHost: (() => { try { return new URL(frame.src).host; } catch { return ''; } })()
+      truncated: {
+        interactive: interactive.length > MAX_INTERACTIVE,
+        semanticTexts: textCandidates.length > MAX_SEMANTIC_TEXTS,
+        pointerScan: allElements.length > MAX_POINTER_SCAN
+      },
+      limitations,
+      iframes: queryAllDeep('iframe').map((frame) => ({
+        title: frame.title || '',
+        name: frame.name || '',
+        srcHost: (() => { try { return new URL(frame.src, location.href).host; } catch { return ''; } })()
       })),
-      controls,
-      choiceGroups,
-      interactiveElements,
-      semanticTexts
+      controls: items.filter((item) => item.elementKind === 'field'),
+      blocks,
+      moduleSummary,
+      semanticTree: semanticTreeSnapshot,
+      pageStructure: { blocks },
+      fieldBindings: items.filter((item) => item.elementKind === 'field').map((item) => ({
+        ref: item.ref,
+        fieldLabel: item.fieldLabel,
+        displayName: item.displayName,
+        bindingKey: item.bindingKey,
+        fieldIndex: item.fieldIndex,
+        fieldCount: item.fieldCount,
+        matchedKey: item.matchedKey,
+        profilePath: item.profilePath,
+        profilePathCandidates: item.profilePathCandidates,
+        repeatSection: item.repeatSection,
+        repeatIndex: item.repeatIndex,
+        repeatGroup: item.repeatGroup,
+        recordIndex: item.recordIndex || 0,
+        recordTotal: item.recordTotal || 0,
+        blockRef: item.blockRef || '',
+        blockTitle: item.blockTitle || '',
+        moduleTitle: item.moduleTitle || '',
+        blockNavId: item.blockNavId || '',
+        fieldBlockLabel: item.fieldBlockLabel || '',
+        context: item.context,
+        operationGroup: item.operationGroup,
+        options: item.options,
+        compoundRole: item.compoundRole,
+        subControlOf: item.subControlOf,
+        currentValue: item.currentValue,
+        rangeRole: item.rangeRole,
+        rangeGroup: item.rangeGroup,
+        rangeIndex: item.rangeIndex,
+        datePart: item.datePart
+      })),
+      choiceGroups: choiceGroups(),
+      interactiveElements: items,
+      semanticTexts,
+      semanticTextsPurpose: '辅助识别文本；字段与代值名称请以 fieldBindings 或 controls[].displayName 为准'
     };
   }
 
+  function markItem(item) {
+    const target = elementMap.get(item.ref);
+    if (!(target instanceof Element) || !target.isConnected) return;
+    createOverlay(item.ref, false);
+  }
+
+  function positionOverlay(overlay, target) {
+    const rect = target.getBoundingClientRect();
+    overlay.style.left = `${Math.round(rect.left)}px`;
+    overlay.style.top = `${Math.round(rect.top)}px`;
+    overlay.style.width = `${Math.max(2, Math.round(rect.width))}px`;
+    overlay.style.height = `${Math.max(2, Math.round(rect.height))}px`;
+  }
+
+  function createOverlay(ref, targetMode) {
+    const target = elementMap.get(ref);
+    if (!(target instanceof Element) || !target.isConnected) return null;
+    const overlay = document.createElement('div');
+    overlay.className = `${OVERLAY_CLASS}${targetMode ? ` ${OVERLAY_TARGET_CLASS}` : ''}`;
+    overlay.dataset.resumePageAuditOverlayRef = ref;
+    positionOverlay(overlay, target);
+    document.documentElement.appendChild(overlay);
+    return overlay;
+  }
+
+  function syncOverlayPositions() {
+    overlaySyncFrame = 0;
+    document.querySelectorAll(`.${OVERLAY_CLASS}`).forEach((overlay) => {
+      const target = elementMap.get(overlay.dataset.resumePageAuditOverlayRef);
+      // 页面 hover 重渲染并替换节点时，保留最后位置，不让蓝框突然消失。
+      if (target instanceof Element && target.isConnected) positionOverlay(overlay, target);
+    });
+  }
+
+  function scheduleOverlaySync() {
+    if (overlaySyncFrame) return;
+    overlaySyncFrame = requestAnimationFrame(syncOverlayPositions);
+  }
+
+  window.addEventListener('scroll', scheduleOverlaySync, true);
+  window.addEventListener('resize', scheduleOverlaySync);
+
   function showAuditPanel(report) {
-    document.querySelector('.resume-autofill-audit')?.remove();
+    document.querySelector(PANEL_SELECTOR)?.remove();
+    const elementKindLabels = { field: '填写元素', action: '动作元素', container: '交互区域' };
+    const actionTypeLabels = {
+      write: '直接写入', 'select-search': '输入并从列表选择', select: '从列表选择', 'select-multi': '从列表多选',
+      'select-steps': '分步骤选择', toggle: '点击切换', adjust: '调节控件', upload: '上传文件',
+      'set-content': '写入富文本', none: '无需操作', click: '点击', submit: '提交/主操作', 'structure-add': '添加一组内容',
+      'structure-remove': '删除结构', expand: '展开', collapse: '折叠', navigate: '导航跳转',
+      reset: '点击重置', cancel: '点击取消/返回', 'other-action': '点击'
+    };
+    const operationGroupLabels = {
+      'direct-write': '直接写入',
+      'input-select': '输入并从列表选择',
+      'closed-select': '从列表选择',
+      click: '点击',
+      upload: '上传文件',
+      'no-action': '只读/禁用'
+    };
+    const mappingLabels = { mapped: '已映射', ambiguous: '待确认', unmapped: '未映射' };
+    const fieldItems = report.interactiveElements.filter((item) => item.elementKind === 'field');
+    const interactiveByRef = new Map(report.interactiveElements.map((item) => [item.ref, item]));
+    const mappingCounts = fieldItems.reduce((counts, item) => {
+      counts[item.mappingStatus] = (counts[item.mappingStatus] || 0) + 1;
+      return counts;
+    }, {});
+    const layoutIndexByRef = new Map((report.moduleSummary || []).map((layout, index) => [layout.ref, index]));
+    const layoutIndexByName = new Map((report.moduleSummary || []).map((layout, index) => [layout.module, index]));
+    const layoutNameForItem = (item) => item.structureTitle || item.moduleTitle || item.blockTitle || item.context || '';
+    const parentLayoutForItem = (item) => item.structureTitle || item.blockTitle || item.moduleTitle || item.context || '';
+    const attributesForItem = (item) => [
+      item.surfaceTitle,
+      layoutNameForItem(item) ? '' : '布局未识别'
+    ].filter(Boolean);
+    const siblingLayoutsForItem = (item) => {
+      if (item.structureTitle) return '';
+      const layoutName = layoutNameForItem(item);
+      if (!layoutName) return '';
+      const layouts = report.moduleSummary || [];
+      const index = layoutIndexByRef.has(item.blockRef)
+        ? layoutIndexByRef.get(item.blockRef)
+        : layoutIndexByName.get(layoutName);
+      if (index === undefined) return '';
+      return [
+        layouts[index - 1]?.module ? `前：${layouts[index - 1].module}` : '',
+        layouts[index + 1]?.module ? `后：${layouts[index + 1].module}` : ''
+      ].filter(Boolean).join('，');
+    };
+    const mappingTarget = (item) => {
+      if (item.elementKind !== 'field') return '非填写字段';
+      if (item.profilePath) return item.profilePath;
+      if (item.profilePathCandidates?.length) return item.profilePathCandidates.join(' / ');
+      return item.matchedKey || '未映射';
+    };
+    const compactItemPayload = (item) => ({
+      ref: item.ref,
+      label: item.elementKind === 'field' ? (item.displayName || item.fieldLabel || item.text) : item.text,
+      parentLayout: parentLayoutForItem(item),
+      layout: layoutNameForItem(item),
+      siblingLayouts: siblingLayoutsForItem(item),
+      category: elementKindLabels[item.elementKind] || item.elementKind,
+      attributes: attributesForItem(item),
+      operation: operationGroupLabels[item.operationGroup] || item.operationGroup || '',
+      actionType: actionTypeLabels[item.actionType] || item.actionType || '',
+      mappingStatus: item.elementKind === 'field' ? (mappingLabels[item.mappingStatus] || item.mappingStatus) : '非填写字段',
+      mappedField: item.elementKind === 'field' ? mappingTarget(item) : '',
+      matchedKey: item.matchedKey || '',
+      recordIndex: item.recordIndex || 0,
+      recordTotal: item.recordTotal || 0,
+      datePart: item.datePart === 'year' ? '年' : item.datePart === 'month' ? '月' : item.datePart || '',
+      rangeRole: item.rangeRole === 'start' ? '开始' : item.rangeRole === 'end' ? '结束' : item.rangeRole || ''
+    });
+    const copyText = async (value) => {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return;
+      }
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      textarea.style.top = '0';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const ok = document.execCommand('copy');
+      textarea.remove();
+      if (!ok) throw new Error('copy failed');
+    };
+    const copyRowInfo = (item, row) => {
+      const payload = compactItemPayload(item);
+      copyText(JSON.stringify(payload, null, 2)).then(() => {
+        row.dataset.copyState = 'copied';
+        window.setTimeout(() => {
+          if (row.isConnected) delete row.dataset.copyState;
+        }, 900);
+      }).catch(() => {
+        row.dataset.copyState = 'failed';
+        window.setTimeout(() => {
+          if (row.isConnected) delete row.dataset.copyState;
+        }, 900);
+      });
+    };
+    const copySemanticTree = (button) => {
+      const payload = report.semanticTree || {
+        version: report.version,
+        page: report.page,
+        error: 'semantic tree was not generated'
+      };
+      copyText(JSON.stringify(payload, null, 2)).then(() => {
+        const original = button.textContent;
+        button.textContent = '已复制';
+        window.setTimeout(() => {
+          if (button.isConnected) button.textContent = original;
+        }, 900);
+      }).catch(() => {
+        const original = button.textContent;
+        button.textContent = '复制失败';
+        window.setTimeout(() => {
+          if (button.isConnected) button.textContent = original;
+        }, 900);
+      });
+    };
+    const copyFilteredRows = (button) => {
+      const rows = [...list.querySelectorAll('[data-ref]')].filter((row) => !row.hidden);
+      const payload = rows
+        .map((row) => interactiveByRef.get(row.dataset.ref))
+        .filter(Boolean)
+        .map(compactItemPayload);
+      copyText(JSON.stringify(payload, null, 2)).then(() => {
+        const original = button.textContent;
+        button.textContent = payload.length ? `已复制 ${payload.length}` : '已复制 0';
+        window.setTimeout(() => {
+          if (button.isConnected) button.textContent = original;
+        }, 900);
+      }).catch(() => {
+        const original = button.textContent;
+        button.textContent = '复制失败';
+        window.setTimeout(() => {
+          if (button.isConnected) button.textContent = original;
+        }, 900);
+      });
+    };
+    const layoutLabels = Object.fromEntries([
+      ...(report.moduleSummary || []).map((layout) => layout.module),
+      ...report.interactiveElements.map(layoutNameForItem)
+    ].filter(Boolean).map((layout) => [layout, layout]));
+
     const panel = document.createElement('aside');
-    panel.className = 'resume-autofill-audit';
-    const statusLabels = {
-      'understood-supported': '已有交互处理器',
-      'understood-unsupported': '已识别但当前处理不了',
-      'not-understood': '交互方式未适配',
-      'safe-ignored': '安全忽略'
-    };
-    const modeLabels = {
-      'free-entry': '自由填写',
-      'type-then-select': '可输入，再从列表确认',
-      'select-only': '只能从列表选择',
-      date: '日期',
-      'file-upload': '文件上传',
-      'add-action': '添加按钮/添加类别',
-      'other-action': '其他按钮或交互'
-    };
-    const datePrecisionLabels = {
-      'year-month': '年月',
-      'year-month-day': '年月日',
-      'unknown-date': '日期精度待确认'
-    };
-    const dateMechanismLabels = {
-      'browser-native-picker': '浏览器原生日期选择器',
-      'separate-year-month-lists': '年/月分列下拉列表',
-      'separate-year-month-day-lists': '年/月/日分列下拉列表',
-      'period-month-two-end-lists': '起止时间：开始/结束分别选择年月',
-      'dropdown-or-calendar-panel': '下拉列表或日历面板',
-      'free-date-text': '可直接写入日期文字',
-      'custom-calendar-or-list': '自定义日期控件（需打开后确认）'
-    };
+    panel.className = 'resume-page-audit';
     const header = document.createElement('div');
-    header.className = 'resume-autofill-audit__header';
+    header.className = 'resume-page-audit__header';
     const title = document.createElement('div');
-    title.innerHTML = `<strong>页面识别审计</strong><small>版本 ${report.version} · 不包含输入值或本地资料</small>`;
+    title.innerHTML = `<strong>页面解析</strong><small>版本 ${report.version} · 默认只显示关键识别信息</small>`;
     const close = document.createElement('button');
     close.type = 'button';
     close.textContent = '×';
-    close.setAttribute('aria-label', '关闭识别审计');
-    close.addEventListener('click', () => {
-      panel.remove();
-      clearAuditAnnotations();
-    });
+    close.setAttribute('aria-label', '关闭页面解析');
+    close.addEventListener('click', clearAudit);
     header.append(title, close);
 
+    const dimensions = report.counts.dimensions;
     const summary = document.createElement('div');
-    summary.className = 'resume-autofill-audit__summary';
-    summary.textContent = `发现 ${report.counts.interactive} 个可见交互元素：已有交互处理器 ${report.counts.audit['understood-supported'] || 0}，已识别但当前处理不了 ${report.counts.audit['understood-unsupported'] || 0}，交互方式未适配 ${report.counts.audit['not-understood'] || 0}，安全忽略 ${report.counts.audit['safe-ignored'] || 0}。字段是否映射到本地资料只作为附加信息，不影响控件交互类型判断。`;
+    summary.className = 'resume-page-audit__summary';
+    summary.textContent = `发现 ${report.counts.interactive} 个可见交互元素：填写 ${dimensions.elementKind?.field || 0}，动作 ${dimensions.elementKind?.action || 0}，交互区域 ${dimensions.elementKind?.container || 0}。字段映射：已映射 ${mappingCounts.mapped || 0}，待确认 ${mappingCounts.ambiguous || 0}，未映射 ${mappingCounts.unmapped || 0}。`;
+    const highlightNotice = document.createElement('div');
+    highlightNotice.className = 'resume-page-audit__notice';
+    highlightNotice.textContent = '点击列表行会复制该行关键信息，并在原页面定位高亮该元素；不会填写、不提交。';
 
-    const legend = document.createElement('div');
-    legend.className = 'resume-autofill-audit__legend';
-    const filterOptions = [
-      ['all', '全部'], ['mode:free-entry', '自由填写'], ['mode:type-then-select', '输入后选列表'],
-      ['mode:select-only', '只能选择'], ['mode:date', '日期'], ['mode:file-upload', '文件上传'],
-      ['mode:add-action', '添加按钮'], ['cap:understood-unsupported', '当前处理不了'],
-      ['cap:not-understood', '交互未适配'], ['cap:safe-ignored', '安全忽略']
+    const axisValue = (item, axis) => {
+      if (axis === 'mappingStatus') return item.elementKind === 'field' ? item.mappingStatus : 'not-field';
+      if (axis === 'layoutTitle') return layoutNameForItem(item);
+      return item[axis];
+    };
+    const filterGroups = [
+      ['elementKind', '元素', elementKindLabels],
+      ['operationGroup', '操作', operationGroupLabels],
+      ['mappingStatus', '映射', mappingLabels],
+      ['layoutTitle', '布局', layoutLabels]
     ];
-    legend.innerHTML = filterOptions.map(([filter, label]) => {
-      const [axis, value] = filter.split(':');
-      const count = filter === 'all' ? report.interactiveElements.length
-        : report.interactiveElements.filter((item) => axis === 'mode' ? item.inputMode === value : item.capability === value).length;
-      const cssKind = filter.replace(':', '-');
-      return `<button type="button" data-audit-filter="${filter}" class="resume-autofill-audit__legend--${cssKind}${filter === 'all' ? ' is-active' : ''}">${label} ${count}</button>`;
-    }).join('');
+    const filters = document.createElement('div');
+    filters.className = 'resume-page-audit__filters';
+    for (const [axis, captionText, labels] of filterGroups) {
+      const group = document.createElement('div');
+      group.className = 'resume-page-audit__filter-group';
+      const caption = document.createElement('span');
+      caption.textContent = captionText;
+      group.appendChild(caption);
+      const all = document.createElement('button');
+      all.type = 'button';
+      all.className = 'is-active';
+      all.dataset.axis = axis;
+      all.dataset.value = axis === 'mappingStatus' ? '__field-all' : '';
+      const axisItems = axis === 'mappingStatus' ? fieldItems : report.interactiveElements;
+      all.textContent = `${axis === 'mappingStatus' ? '全部字段' : '全部'} ${axisItems.length}`;
+      group.appendChild(all);
+      for (const [value, label] of Object.entries(labels)) {
+        const count = axisItems.filter((item) => axisValue(item, axis) === value).length;
+        if (!count) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.axis = axis;
+        button.dataset.value = value;
+        button.textContent = `${label} ${count}`;
+        group.appendChild(button);
+      }
+      filters.appendChild(group);
+    }
 
     const toolbar = document.createElement('div');
-    toolbar.className = 'resume-autofill-audit__toolbar';
+    toolbar.className = 'resume-page-audit__toolbar';
     const search = document.createElement('input');
     search.type = 'search';
-    search.placeholder = '筛选文字、字段、类型、ref…';
-    const copy = document.createElement('button');
-    copy.type = 'button';
-    copy.textContent = '复制完整诊断';
-    copy.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
-        copy.textContent = '已复制';
-      } catch {
-        copy.textContent = '复制失败';
-      }
-    });
-    toolbar.append(search, copy);
+    search.placeholder = '搜索字段、布局、映射路径';
+    const copyTree = document.createElement('button');
+    copyTree.type = 'button';
+    copyTree.textContent = '复制结构树';
+    copyTree.title = '复制当前页面解析出的语义结构树 JSON';
+    copyTree.addEventListener('click', () => copySemanticTree(copyTree));
+    const copyFiltered = document.createElement('button');
+    copyFiltered.type = 'button';
+    copyFiltered.textContent = '复制筛选结果';
+    copyFiltered.title = '复制当前搜索和筛选后仍显示的元素 JSON';
+    copyFiltered.addEventListener('click', () => copyFilteredRows(copyFiltered));
+    toolbar.append(search, copyFiltered, copyTree);
 
     const list = document.createElement('div');
-    list.className = 'resume-autofill-audit__list';
+    list.className = 'resume-page-audit__list';
     for (const item of report.interactiveElements) {
-      const target = auditElementMap.get(item.ref);
-      const markKind = auditMarkKind(item);
-      if (target instanceof Element && target.isConnected) {
-        const supportedMarkKinds = new Set(['free-entry', 'type-then-select', 'select-only', 'date', 'file-upload', 'add-action', 'understood-unsupported', 'not-understood', 'safe-ignored']);
-        if (supportedMarkKinds.has(markKind)) target.classList.add(`resume-autofill-audit-mark--${markKind}`);
-        if (['understood-unsupported', 'not-understood', 'safe-ignored'].includes(item.capability)) {
-          target.classList.add(`resume-autofill-audit-status--${item.capability}`);
-        }
-        target.dataset.resumeAutofillAuditRef = item.ref;
-      }
       const row = document.createElement('button');
       row.type = 'button';
-      row.className = `resume-autofill-audit__row resume-autofill-audit__row--${item.status} resume-autofill-audit__row--kind-${markKind}`;
-      row.dataset.auditKind = markKind;
-      row.dataset.auditMode = item.inputMode;
-      row.dataset.auditCapability = item.capability;
-      row.dataset.search = `${item.ref} ${item.text} ${item.visibleText} ${item.matchedKey} ${item.mappingStatus} ${item.controlKind} ${item.inputMode} ${item.datePrecision} ${item.dateMechanism} ${item.requirement} ${item.reason} ${item.context} ${statusLabels[item.status]} ${modeLabels[item.inputMode]}`.toLowerCase();
-      const mapping = item.matchedKey ? ` → ${item.matchedKey}` : item.repeatedKind ? ` → 添加 ${item.repeatedKind}` : '';
-      const requirement = item.requirement === 'required' ? '<i>必填</i>' : item.requirement ? '<i>页面未标必填</i>' : '';
-      const dateDescription = item.datePrecision
-        ? ` · ${datePrecisionLabels[item.datePrecision] || item.datePrecision} · ${dateMechanismLabels[item.dateMechanism] || item.dateMechanism}`
-        : '';
-      row.innerHTML = `<span class="resume-autofill-audit__row-head"><b>${item.ref}</b><em>${statusLabels[item.status]}</em>${requirement}<code>${modeLabels[item.inputMode] || item.controlKind}${mapping}</code></span><span class="resume-autofill-audit__row-text"></span><span class="resume-autofill-audit__row-meta"></span><small></small>`;
-      row.querySelector('.resume-autofill-audit__row-text').textContent = item.text;
-      row.querySelector('.resume-autofill-audit__row-meta').textContent = `控件：${item.controlKind}${dateDescription} · 资料字段：${item.matchedKey || '未映射（不影响交互识别）'}${item.reason ? ` · 原因：${item.reason}` : ''}`;
-      row.querySelector('small').textContent = `${item.domPath}${item.sourceDomPath ? ` · 内部字段 ${item.sourceDomPath}` : ''}${item.context ? ` · 区块 ${item.context}` : ''}`;
+      row.className = `resume-page-audit__row resume-page-audit__row--${item.elementKind} resume-page-audit__row--${item.adaptation.status}`;
+      row.dataset.elementKind = item.elementKind;
+      row.dataset.operationGroup = item.operationGroup;
+      row.dataset.actionType = item.actionType;
+      row.dataset.adaptation = item.adaptation.status;
+      row.dataset.editability = item.editability;
+      row.dataset.mappingStatus = item.elementKind === 'field' ? item.mappingStatus : 'not-field';
+      row.dataset.layoutTitle = layoutNameForItem(item);
+      row.dataset.surfaceTitle = item.surfaceTitle || '';
+      row.dataset.ref = item.ref;
+      row.dataset.search = `${item.ref} ${item.text} ${item.fieldLabel || ''} ${item.displayName || ''} ${item.bindingKey || ''} ${layoutNameForItem(item)} ${parentLayoutForItem(item)} ${siblingLayoutsForItem(item)} ${attributesForItem(item).join(' ')} ${item.matchedKey || ''} ${item.profilePath || ''} ${(item.profilePathCandidates || []).join(' ')} ${item.controlKind || ''} ${operationGroupLabels[item.operationGroup] || ''} ${actionTypeLabels[item.actionType] || ''}`.toLowerCase();
+      const head = document.createElement('span');
+      head.className = 'resume-page-audit__row-head';
+      head.innerHTML = `<b>${item.ref}</b><em>${elementKindLabels[item.elementKind] || item.elementKind}</em>${item.elementKind === 'field' ? `<em>${mappingLabels[item.mappingStatus] || item.mappingStatus}</em>` : ''}<code>${operationGroupLabels[item.operationGroup] || item.operationGroup}</code>`;
+      const label = document.createElement('span');
+      label.className = 'resume-page-audit__row-text';
+      label.textContent = item.elementKind === 'field' ? (item.displayName || item.fieldLabel || item.text) : item.text;
+      const meta = document.createElement('span');
+      meta.className = 'resume-page-audit__row-meta';
+      meta.textContent = [
+        parentLayoutForItem(item) ? `父布局：${parentLayoutForItem(item)}` : '',
+        layoutNameForItem(item) ? `所属布局：${layoutNameForItem(item)}` : '',
+        siblingLayoutsForItem(item) ? `相邻布局：${siblingLayoutsForItem(item)}` : '',
+        attributesForItem(item).length ? `属性：${attributesForItem(item).join('，')}` : '',
+        `操作：${operationGroupLabels[item.operationGroup] || item.operationGroup || '未识别'}`,
+        actionTypeLabels[item.actionType] && actionTypeLabels[item.actionType] !== operationGroupLabels[item.operationGroup] ? `细分：${actionTypeLabels[item.actionType]}` : '',
+        item.elementKind === 'field' ? `映射：${mappingLabels[item.mappingStatus] || item.mappingStatus}` : '',
+        item.elementKind === 'field' ? `字段：${mappingTarget(item)}` : '',
+        item.recordTotal > 1 ? `记录：${item.recordIndex || '-'} / ${item.recordTotal}` : '',
+        item.datePart ? `日期部分：${item.datePart === 'year' ? '年' : item.datePart === 'month' ? '月' : item.datePart}` : '',
+        item.rangeRole ? `范围：${item.rangeRole === 'start' ? '开始' : item.rangeRole === 'end' ? '结束' : item.rangeRole}` : ''
+      ].filter(Boolean).join(' · ');
+      const path = document.createElement('small');
+      path.textContent = item.elementKind === 'field'
+        ? `页面标签：${item.fieldLabel || item.text || '-'}`
+        : `页面文字：${item.text || '-'}`;
+      row.append(head, label, meta, path);
       row.addEventListener('click', () => {
-        const target = auditElementMap.get(item.ref);
+        copyRowInfo(item, row);
+        const target = elementMap.get(item.ref);
         if (!(target instanceof Element) || !target.isConnected) return;
-        document.querySelectorAll('.resume-autofill-audit-target').forEach((element) => element.classList.remove('resume-autofill-audit-target'));
-        target.classList.add('resume-autofill-audit-target');
+        document.querySelectorAll(`.${OVERLAY_TARGET_CLASS}`).forEach((overlay) => overlay.remove());
         target.scrollIntoView({ block: 'center', inline: 'nearest' });
-        setTimeout(() => target.classList.remove('resume-autofill-audit-target'), 3500);
+        requestAnimationFrame(() => createOverlay(item.ref, true));
       });
       list.appendChild(row);
     }
 
-    const textDetails = document.createElement('details');
-    textDetails.className = 'resume-autofill-audit__texts';
-    const textSummary = document.createElement('summary');
-    textSummary.textContent = `页面语义文字 (${report.semanticTexts.length})`;
-    const textList = document.createElement('div');
-    for (const item of report.semanticTexts) {
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.dataset.search = `${item.ref} ${item.text} ${item.tag} ${item.role}`.toLowerCase();
-      row.textContent = `${item.ref} · ${item.text}`;
-      row.addEventListener('click', () => {
-        const target = auditElementMap.get(item.ref);
-        if (target instanceof Element) target.scrollIntoView({ block: 'center' });
-      });
-      textList.appendChild(row);
-    }
-    textDetails.append(textSummary, textList);
-    let activeFilter = 'all';
-    const applyAuditFilters = () => {
+    const activeFilters = {};
+    const applyFilters = () => {
       const query = search.value.trim().toLowerCase();
+      const hasExplicitFilter = Boolean(query) || Object.values(activeFilters).some(Boolean);
+      clearElementMarks();
       list.querySelectorAll('[data-search]').forEach((row) => {
-        const [axis, value] = activeFilter.split(':');
-        const categoryMatches = activeFilter === 'all'
-          || (axis === 'mode' ? row.dataset.auditMode === value : row.dataset.auditCapability === value);
-        const textMatches = !query || row.dataset.search.includes(query);
-        row.hidden = !(categoryMatches && textMatches);
+        const dimensionsMatch = Object.entries(activeFilters).every(([axis, value]) => {
+          if (!value) return true;
+          if (axis === 'mappingStatus' && value === '__field-all') return row.dataset.elementKind === 'field';
+          return row.dataset[axis] === value;
+        });
+        row.hidden = !(dimensionsMatch && (!query || row.dataset.search.includes(query)));
+        if (hasExplicitFilter && !row.hidden) markItem(interactiveByRef.get(row.dataset.ref));
       });
-      textDetails.hidden = activeFilter !== 'all';
     };
-    search.addEventListener('input', applyAuditFilters);
-    legend.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-audit-filter]');
+    search.addEventListener('input', applyFilters);
+    filters.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-axis]');
       if (!button) return;
-      activeFilter = button.dataset.auditFilter;
-      legend.querySelectorAll('[data-audit-filter]').forEach((item) => item.classList.toggle('is-active', item === button));
-      applyAuditFilters();
+      const axis = button.dataset.axis;
+      activeFilters[axis] = button.dataset.value;
+      filters.querySelectorAll(`[data-axis="${axis}"]`).forEach((item) => item.classList.toggle('is-active', item === button));
+      applyFilters();
     });
-    panel.append(header, summary, legend, toolbar, list, textDetails);
+    panel.append(header, summary, highlightNotice, filters, toolbar, list);
     document.documentElement.appendChild(panel);
     search.focus();
-    return report.counts;
   }
 
-  async function runResumeUploadOnly(resumeFile, overwrite) {
-    const result = {
-      resumeStored: Boolean(resumeFile?.base64),
-      fileName: resumeFile?.name || '',
-      totalFileInputs: document.querySelectorAll('input[type="file"]').length,
-      targetFound: false,
-      injected: false,
-      dropFallback: false,
-      accepted: false,
-      completed: false,
-      waitedMs: 0,
-      reason: ''
-    };
-    if (!resumeFile?.base64) {
-      result.reason = '扩展中没有保存简历附件，请先在“编辑我的资料”页面导入并保存 PDF。';
-      return result;
-    }
-    const targets = await findResumeUploadTargets(2500);
-    result.candidates = targets.map((descriptor, index) => ({
-      index,
-      kind: descriptor.kind,
-      text: descriptor.text.slice(0, 180),
-      accept: descriptor.element.getAttribute('accept') || '',
-      disabled: Boolean(descriptor.element.disabled)
-    }));
-    result.totalFileInputs = document.querySelectorAll('input[type="file"]').length;
-    result.targetFound = targets.length > 0;
-    if (!targets.length) {
-      const fileInputs = [...document.querySelectorAll('input[type="file"]')];
-      result.reason = fileInputs.length
-        ? '页面存在文件框，但其附近没有“上传简历/快速解析/Resume”等语义，为避免误传到头像或证件附件，脚本没有写入。'
-        : '当前页面没有发现 input[type=file]；上传组件可能在跨域 iframe、尚未展开或使用了封闭 Shadow DOM。';
-      return result;
-    }
-    for (const descriptor of targets) {
-      const target = descriptor.element;
-      result.targetKind = descriptor.kind;
-      result.targetText = descriptor.text.slice(0, 160);
-      if (!overwrite && target.files?.length) {
-        result.injected = true;
-        result.accepted = resumeUploadSuccessText(resumeFile);
-        result.completed = result.accepted;
-        result.reason = result.accepted ? '' : '文件框中已有文件，但没有观察到网站解析状态；如需重新上传，请勾选“覆盖页面中已有内容”。';
-        return result;
-      }
-      const state = await uploadResumeAndWait(target, resumeFile, overwrite);
-      result.injected ||= Boolean(state.injected);
-      result.dropFallback ||= Boolean(state.dropFallback);
-      result.waitedMs = Math.max(result.waitedMs, state.waitedMs || 0);
-      if (state.accepted) {
-        result.accepted = true;
-        result.completed = Boolean(state.completed);
-        result.reason = state.completed ? '' : '网站已响应文件，但 30 秒内没有稳定完成解析。';
-        return result;
-      }
-    }
-    result.reason = result.injected
-      ? 'PDF 已写入隐藏文件框并触发 input/change/drop，但网站没有产生可观察的上传或解析响应。该网站可能要求浏览器原生文件选择。'
-      : '找到了简历文件框，但无法把保存的 PDF 写入该控件。';
-    return result;
-  }
+  globalThis.ResumePageAuditApi = {
+    version: VERSION,
+    diagnosePage,
+    getTarget: (ref) => elementMap.get(ref) || null,
+    getSource: (ref) => sourceElementMap.get(ref) || null,
+    isVisible: visible,
+    cleanText
+  };
 
-  async function runAutofill(profile, overwrite) {
-    const runStarted = performance.now();
-    clearMarks();
-    semanticContainerCache = new WeakMap();
-    labelTextCache = new WeakMap();
-    sectionContextCache = new WeakMap();
-    interactionBlocked = '';
-    interactionWarnings = [];
-    const stats = {
-      filled: 0, existing: 0, unmatched: 0, missingData: 0, unsupported: 0, ignored: 0, aiReviewed: 0,
-      sectionsAdded: 0, sectionAddFailed: 0,
-      sectionPlan: [],
-      timings: {},
-      slowFields: [],
-      details: { unmatched: [], missingData: [], unsupported: [], existing: [], ignored: [] },
-      diagnostics: { unmatched: [], missingData: [], unsupported: [], existing: [], aiReview: [] },
-      diagnosticSignatures: new Set()
-    };
-
-    await ensureRepeatedSections(profile, stats);
-    stats.timings.sectionSetupMs = Math.round(performance.now() - runStarted);
-    // 新增经历会改变标题、字段与容器之间的结构关系。新增前计算过的语义容器和
-    // sectionContext 已经过期，必须在正式字段映射前重建，否则首段和新增段可能
-    // 落入不同 occurrence 计数器并重复使用第一条资料。
-    semanticContainerCache = new WeakMap();
-    labelTextCache = new WeakMap();
-    sectionContextCache = new WeakMap();
-
-    const logicalDateRangesStarted = performance.now();
-    await fillAtsxPeriodMonthRanges(profile, stats, overwrite);
-    stats.timings.logicalDateRangesMs = Math.round(performance.now() - logicalDateRangesStarted);
-
-    const elements = [];
-    const queuedElements = new WeakSet();
-    const enqueueControls = (root) => {
-      const candidates = [];
-      if (root instanceof Element && root.matches('input, textarea, select, [contenteditable="true"]')) candidates.push(root);
-      if (root?.querySelectorAll) candidates.push(...root.querySelectorAll('input, textarea, select, [contenteditable="true"]'));
-      for (const candidate of candidates) {
-        if (!queuedElements.has(candidate)) {
-          queuedElements.add(candidate);
-          elements.push(candidate);
-        }
-      }
-    };
-    enqueueControls(document);
-    const formObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) mutation.addedNodes.forEach((node) => enqueueControls(node));
-    });
-    formObserver.observe(document.documentElement, { childList: true, subtree: true });
-    const handledRadioNames = new Set();
-    const handledDateRangeHosts = new WeakSet();
-    const handledCompoundDateHosts = new WeakSet();
-    const handledCustomSelectTriggers = new WeakSet();
-    const countedUnmatchedTriggers = new WeakSet();
-    const processedCustomChoiceGroups = new WeakSet();
-    const fastProcessedControls = new WeakSet();
-    const occurrences = new Map();
-    const groupOccurrences = new Map();
-
-    await wait(30);
-    const choicesStarted = performance.now();
-    await fillCustomChoices(profile, stats, overwrite, processedCustomChoiceGroups, false);
-    stats.timings.initialChoicesMs = Math.round(performance.now() - choicesStarted);
-
-    const fastStarted = performance.now();
-    fastFillOrdinaryControls(profile, stats, overwrite, fastProcessedControls);
-    stats.timings.fastFieldsMs = Math.round(performance.now() - fastStarted);
-
-    const controlsStarted = performance.now();
-
-    for (let elementIndex = 0, idleRounds = 0; idleRounds < 2;) {
-      if (elementIndex >= elements.length) {
-        idleRounds += 1;
-        await wait(35);
-        continue;
-      }
-      idleRounds = 0;
-      const element = elements[elementIndex++];
-      const fieldStarted = performance.now();
-      if (fastProcessedControls.has(element)) continue;
-      if (!element.isConnected) continue;
-      const type = (element.type || '').toLowerCase();
-      if (type === 'file') {
-        continue;
-      }
-      if (element.disabled || ['hidden', 'password', 'submit', 'button', 'reset', 'image'].includes(type)) {
-        if (visible(element) && element.disabled && !['submit', 'button', 'reset', 'image'].includes(type)) {
-          markFillResult(element, IGNORED_CLASS);
-          stats.ignored += 1;
-          if (stats.details.ignored.length < 8) stats.details.ignored.push(`${readableField(labelText(element), element)}（控件已禁用）`);
-        }
-        continue;
-      }
-      if (!visible(element)) continue;
-      if (type === 'radio' && handledRadioNames.has(element.name)) continue;
-      const text = labelText(element);
-      const context = sectionContext(element);
-      const matchedKey = matchKey(text, context);
-      if (!matchedKey) {
-        if (text && !ignoredText.test(text)) {
-          const unmatchedTrigger = customSelectTrigger(element);
-          if (unmatchedTrigger && hasMeaningfulExistingValue(element, unmatchedTrigger, text, '')) {
-            markFillResult(unmatchedTrigger, EXISTING_CLASS);
-            stats.existing += 1;
-            const field = readableField(text, element);
-            const observed = controlReadback(element, unmatchedTrigger);
-            stats.details.existing.push(`${field}（页面已有非占位值，但字段未映射）`);
-            recordDiagnostic(stats, 'existing', {
-              field, observed, stage: '映射前检查',
-              reason: '自定义选择器显示了明确选中值（已排除“请选择”等占位文字），未开启覆盖'
-            });
-            continue;
-          }
-          if (unmatchedTrigger && countedUnmatchedTriggers.has(unmatchedTrigger)) continue;
-          if (unmatchedTrigger) countedUnmatchedTriggers.add(unmatchedTrigger);
-          markFillResult(element, UNMATCHED_CLASS);
-          stats.unmatched += 1;
-          if (stats.details.unmatched.length < 24) stats.details.unmatched.push(readableField(text, element));
-          recordDiagnostic(stats, 'unmatched', {
-            field: readableField(text, element), observed: controlReadback(element, unmatchedTrigger), stage: '字段语义映射',
-            reason: '页面控件可见且有标签，但标签没有命中任何本地资料字段规则；脚本因此不猜测填写'
-          });
-        } else if (text) {
-          markFillResult(element, IGNORED_CLASS);
-          stats.ignored += 1;
-          if (stats.details.ignored.length < 8) stats.details.ignored.push(`${readableField(text, element)}（安全忽略规则）`);
-        }
-        continue;
-      }
-      if (auxiliaryControl(element, text)) {
-        markFillResult(element, IGNORED_CLASS);
-        stats.ignored += 1;
-        if (stats.details.ignored.length < 8) stats.details.ignored.push(`${readableField(text, element)}（辅助控件）`);
-        continue;
-      }
-      const structuralRange = structuralDateRange(element);
-      if (structuralRange && DATE_RANGE_KINDS[matchedKey]) {
-        const rangeHost = semanticContainer(element) || structuralRange.root.parentElement || structuralRange.root;
-        if (handledDateRangeHosts.has(rangeHost)) continue;
-        handledDateRangeHosts.add(rangeHost);
-        const binding = dateBinding(element, matchedKey, groupOccurrences);
-        const fallbackOccurrence = binding?.occurrence || 0;
-        const [startKey, endKey] = DATE_RANGE_KINDS[matchedKey];
-        const educationResolution = educationMappedKey(startKey)
-          ? educationEntryResolution(profile, text, fallbackOccurrence)
-          : { explicit: false, index: fallbackOccurrence, label: '' };
-        const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
-        const startValue = occurrence >= 0 ? profileValue(profile, startKey, occurrence) : '';
-        const endValue = occurrence >= 0 ? profileValue(profile, endKey, occurrence) : '';
-        if (!startValue || !endValue) {
-          markFillResult(structuralRange.root, MISSING_CLASS);
-          stats.missingData += 1;
-          const missingKey = !startValue ? startKey : endKey;
-          if (stats.details.missingData.length < 8) stats.details.missingData.push(`${readableField(text, element)} → ${missingKey}`);
-          recordDiagnostic(stats, 'missingData', {
-            field: readableField(text, element), key: `${startKey}/${endKey}`,
-            target: `${startValue || '缺失'} → ${endValue || '缺失'}`, stage: '本地资料取值',
-            reason: educationResolution.explicit && occurrence < 0
-              ? `已识别为${educationResolution.label}日期，但本地资料中没有对应学历层级；未尝试操作页面`
-              : `已映射为日期范围，但第 ${occurrence + 1} 段资料的 ${missingKey} 为空；未尝试操作页面`
-          });
-          continue;
-        }
-        if (!overwrite && structuralRangeMatches(structuralRange, startValue, endValue)) {
-          markFillResult(structuralRange.root, EXISTING_CLASS);
-          stats.existing += 1;
-          const field = readableField(text, element);
-          stats.details.existing.push(`${field}（页面日期范围已匹配资料）`);
-          recordDiagnostic(stats, 'existing', {
-            field, key: `${startKey}/${endKey}`, target: `${startValue} → ${endValue}`,
-            observed: `${structuralRangeReading(structuralRange, 0) || '—'} → ${structuralRangeReading(structuralRange, 1) || '—'}`,
-            stage: '填写前检查', reason: '页面回读的起止日期已与目标资料匹配，且未开启覆盖'
-          });
-          continue;
-        }
-        const rangeResult = await fillStructuralDateRangeGroup(
-          rangeHost, structuralRange, startValue, endValue, [startKey, endKey], overwrite
-        );
-        const rangeElapsed = Math.round(performance.now() - fieldStarted);
-        if (rangeElapsed >= 100) {
-          stats.slowFields.push({
-            field: readableField(text, element),
-            key: `${startKey}/${endKey}`,
-            ms: rangeElapsed,
-            ok: Boolean(rangeResult.ok)
-          });
-          stats.slowFields.sort((left, right) => right.ms - left.ms);
-          stats.slowFields.length = Math.min(stats.slowFields.length, 8);
-        }
-        if (rangeResult.ok) {
-          markFillResult(structuralRange.root, FILLED_CLASS);
-          stats.filled += 1;
-        } else {
-          const failedElement = rangeResult.element || structuralRange.root || element;
-          markFillResult(failedElement, FAILED_CLASS);
-          stats.unsupported += 1;
-          if (stats.details.unsupported.length < 8) {
-            stats.details.unsupported.push(`${readableField(text, element)} → ${startKey}/${endKey}（${rangeResult.reason}）`);
-          }
-          recordDiagnostic(stats, 'unsupported', {
-            field: readableField(text, element), key: `${startKey}/${endKey}`, target: `${startValue} → ${endValue}`,
-            observed: `${structuralRangeReading(structuralRange, 0) || '—'} → ${structuralRangeReading(structuralRange, 1) || '—'}`,
-            stage: '日期范围回读验证', reason: rangeResult.reason || '网页未接受目标日期范围'
-          });
-        }
-        continue;
-      }
-      const compoundDate = compoundSingleDate(element, matchedKey);
-      if (compoundDate) {
-        const compoundHost = semanticContainer(element) || compoundDate.root.parentElement || compoundDate.root;
-        if (handledCompoundDateHosts.has(compoundHost)) continue;
-        handledCompoundDateHosts.add(compoundHost);
-        const binding = dateBinding(element, matchedKey, groupOccurrences);
-        const key = binding?.key || matchedKey;
-        const occurrenceKey = `${context || 'global'}:${key}`;
-        const fallbackOccurrence = binding?.occurrence ?? (occurrences.get(occurrenceKey) || 0);
-        const educationResolution = educationMappedKey(key)
-          ? educationEntryResolution(profile, text, fallbackOccurrence)
-          : { explicit: false, index: fallbackOccurrence, label: '' };
-        const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
-        const value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
-        if (!value) {
-          markFillResult(compoundDate.root, MISSING_CLASS);
-          stats.missingData += 1;
-          if (stats.details.missingData.length < 8) stats.details.missingData.push(`${readableField(text, element)} → ${key}`);
-          recordDiagnostic(stats, 'missingData', {
-            field: readableField(text, element), key, stage: '本地资料取值',
-            reason: educationResolution.explicit && occurrence < 0
-              ? `页面字段明确指定${educationResolution.label}，但本地资料中没有对应教育经历；未尝试操作页面`
-              : `页面字段已映射为 ${key}，但本地资料第 ${occurrence + 1} 个对应值为空；未尝试操作页面`
-          });
-          continue;
-        }
-        if (!binding && !educationResolution.explicit) {
-          occurrences.set(occurrenceKey, fallbackOccurrence + 1);
-        }
-        if (!overwrite && compoundSingleDateMatches(compoundDate, value)) {
-          markFillResult(compoundDate.root, EXISTING_CLASS);
-          stats.existing += 1;
-          const field = readableField(text, element);
-          const observed = compoundSingleDateReading(compoundDate);
-          stats.details.existing.push(`${field}（页面日期已匹配资料）`);
-          recordDiagnostic(stats, 'existing', {
-            field, key, target: value, observed, stage: '填写前检查',
-            reason: '页面回读的单日期年月日已与目标资料匹配，且未开启覆盖'
-          });
-          continue;
-        }
-        const compoundResult = await fillCompoundSingleDateGroup(compoundHost, compoundDate, value, key);
-        const compoundElapsed = Math.round(performance.now() - fieldStarted);
-        if (compoundElapsed >= 100) {
-          stats.slowFields.push({
-            field: readableField(text, element),
-            key,
-            ms: compoundElapsed,
-            ok: Boolean(compoundResult.ok)
-          });
-          stats.slowFields.sort((left, right) => right.ms - left.ms);
-          stats.slowFields.length = Math.min(stats.slowFields.length, 8);
-        }
-        if (compoundResult.ok) {
-          markFillResult(compoundDate.root, FILLED_CLASS);
-          stats.filled += 1;
-        } else {
-          const failedElement = compoundResult.element || compoundDate.root || element;
-          markFillResult(failedElement, FAILED_CLASS);
-          stats.unsupported += 1;
-          if (stats.details.unsupported.length < 8) {
-            stats.details.unsupported.push(`${readableField(text, element)} → ${key}（${compoundResult.reason}）`);
-          }
-          recordDiagnostic(stats, 'unsupported', {
-            field: readableField(text, element), key, target: value,
-            observed: compoundSingleDateReading(compoundDate) || '—',
-            stage: '单日期回读验证',
-            reason: compoundResult.reason || '网页未接受目标年月日'
-          });
-        }
-        continue;
-      }
-      const logicalTrigger = customSelectTrigger(element);
-      if (logicalTrigger && handledCustomSelectTriggers.has(logicalTrigger)) continue;
-      if (logicalTrigger) handledCustomSelectTriggers.add(logicalTrigger);
-      const binding = dateBinding(element, matchedKey, groupOccurrences);
-      const key = binding?.key || matchedKey;
-      if (type === 'checkbox' && /Date$|Date\b/.test(key)) {
-        markFillResult(element, IGNORED_CLASS);
-        stats.ignored += 1;
-        if (stats.details.ignored.length < 8) stats.details.ignored.push(`${readableField(text, element)}（日期附属复选框）`);
-        continue;
-      }
-      const occurrenceKey = `${context || 'global'}:${key}`;
-      const fallbackOccurrence = binding?.occurrence ?? (occurrences.get(occurrenceKey) || 0);
-      const educationResolution = educationMappedKey(key)
-        ? educationEntryResolution(profile, text, fallbackOccurrence)
-        : { explicit: false, index: fallbackOccurrence, label: '' };
-      const occurrence = educationResolution.explicit ? educationResolution.index : fallbackOccurrence;
-      let value = occurrence >= 0 ? profileValue(profile, key, occurrence, context) : '';
-      let aiGenerated = null;
-      // 本地没有自我评价/求职动机时，先保护页面已有内容；只有页面也为空
-      // 或用户明确开启覆盖时，才让 AI 基于去标识化经历信息生成正文。
-      if (!value && AI_GENERATED_TEXT_KEYS.has(key) && !logicalTrigger
-        && !overwrite && hasValue(element) && type !== 'radio' && type !== 'checkbox') {
-        markFillResult(element, EXISTING_CLASS);
-        stats.existing += 1;
-        const field = readableField(text, element);
-        const observed = controlReadback(element, null);
-        stats.details.existing.push(`${field}（页面已有：${diagnosticValue(observed)}）`);
-        recordDiagnostic(stats, 'existing', {
-          field, key, observed, stage: 'AI 生成前检查',
-          reason: '本地资料为空，但页面已有明确内容且未开启覆盖；保留页面内容，不调用 AI'
-        });
-        continue;
-      }
-      if (!value && AI_GENERATED_TEXT_KEYS.has(key) && !logicalTrigger && type !== 'radio' && type !== 'checkbox') {
-        aiGenerated = await requestAIGeneratedText(profile, key, text, element);
-        if (aiGenerated?.value) value = aiGenerated.value;
-      }
-      if (!value) {
-        markFillResult(logicalTrigger || element, MISSING_CLASS);
-        stats.missingData += 1;
-        if (stats.details.missingData.length < 8) stats.details.missingData.push(`${readableField(text, element)} → ${key}`);
-        recordDiagnostic(stats, 'missingData', {
-          field: readableField(text, element), key, stage: '本地资料取值',
-          reason: educationResolution.explicit && occurrence < 0
-            ? `页面字段明确指定${educationResolution.label}，但本地资料中没有对应教育经历；未尝试操作页面`
-            : aiGenerated?.error
-              ? `页面字段已映射为 ${key}，本地资料为空；AI 生成未完成：${aiGenerated.error}`
-            : `页面字段已映射为 ${key}，但本地资料第 ${occurrence + 1} 个对应值为空；未尝试操作页面`
-        });
-        continue;
-      }
-      if (!binding && !educationResolution.explicit && type !== 'radio' && type !== 'checkbox') {
-        occurrences.set(occurrenceKey, fallbackOccurrence + 1);
-      }
-      if (!overwrite && hasMeaningfulExistingValue(element, logicalTrigger, text, key) && type !== 'radio' && type !== 'checkbox') {
-        markFillResult(logicalTrigger || element, EXISTING_CLASS);
-        stats.existing += 1;
-        const field = readableField(text, element);
-        const observed = controlReadback(element, logicalTrigger);
-        stats.details.existing.push(`${field}（页面已有：${diagnosticValue(observed)}）`);
-        recordDiagnostic(stats, 'existing', {
-          field, key, target: value, observed, stage: '填写前检查',
-          reason: '检测到非空、非占位、非浏览器默认首项的页面值，且未开启覆盖'
-        });
-        continue;
-      }
-      let filled = false;
-      let fillSnapshot = null;
-      if (type === 'radio') {
-        const group = element.name ? [...document.querySelectorAll(`input[type="radio"][name="${CSS.escape(element.name)}"]`)] : [element];
-        filled = group.some((radio) => fillChoice(radio, value));
-        if (element.name) handledRadioNames.add(element.name);
-        if (filled) group.find((radio) => radio.checked)?.classList.add(FILLED_CLASS);
-      } else {
-        fillSnapshot = captureFillState(element, logicalTrigger || element);
-        if (aiGenerated) {
-          fillAIReviews.set(element, {
-            decision: '生成文本', target: '本地资料为空', observed: aiGenerated.value,
-            value: aiGenerated.value, reason: aiGenerated.reason
-          });
-        }
-        filled = await fillElement(element, value, key, binding?.part || '');
-        // 部分 React/Vue 组件已经成功更新可见值，却不会更新原始 input.value。
-        // 在判红前再做一次独立回读，只要可见选中值与目标匹配就按成功处理。
-        if (!filled && controlValueSatisfied(element, logicalTrigger, value, key, binding?.part || '')) {
-          filled = true;
-          fillFailureReasons.delete(element);
-        }
-        if (filled) markFillResult(element, FILLED_CLASS);
-      }
-      if (filled) {
-        stats.filled += 1;
-        const aiReview = fillAIReviews.get(element);
-        if (aiReview) {
-          stats.aiReviewed += 1;
-          recordDiagnostic(stats, 'aiReview', {
-            field: readableField(text, element), key, target: value,
-            observed: aiReview.observed || controlReadback(element, logicalTrigger),
-            stage: `AI 表单辅助：${aiReview.decision}`,
-            reason: `${aiReview.reason}${aiReview.value ? `；采用值：${aiReview.value}` : ''}`
-          });
-        }
-      }
-      else {
-        if (fillSnapshot) {
-          const rolledBack = await rollbackFailedControl(element, logicalTrigger || element, fillSnapshot);
-          if (!rolledBack) {
-            const prior = fillFailureReasons.get(element) || '控件没有接受目标值';
-            fillFailureReasons.set(element, `${prior}；失败后未能通过通用清除按钮完全恢复原状态`);
-          }
-        }
-        markFillResult(logicalTrigger || element, FAILED_CLASS);
-        stats.unsupported += 1;
-        const reason = fillFailureReasons.get(element);
-        if (stats.details.unsupported.length < 8) stats.details.unsupported.push(`${readableField(text, element)} → ${key}${reason ? `（${reason}）` : ''}`);
-        recordDiagnostic(stats, 'unsupported', {
-          field: readableField(text, element), key, target: value,
-          observed: fillFailureObserved.get(element) || controlReadback(element, logicalTrigger) || (fillSnapshot?.hadValue ? fillSnapshot.value : '回滚后为空'),
-          stage: '操作后回读验证',
-          reason: reason || '已尝试填写/点击，但控件可见值、选中状态或关闭状态没有达到成功条件'
-        });
-      }
-      const fieldElapsed = Math.round(performance.now() - fieldStarted);
-      if (fieldElapsed >= 100) {
-        stats.slowFields.push({ field: readableField(text, element), key, ms: fieldElapsed, ok: Boolean(filled) });
-        stats.slowFields.sort((left, right) => right.ms - left.ms);
-        stats.slowFields.length = Math.min(stats.slowFields.length, 8);
-      }
-    }
-    // Framework-rendered radio groups may appear after the ordinary input queue has
-    // already been scanned. Run the same structural pass again before disconnecting.
-    stats.timings.controlsMs = Math.round(performance.now() - controlsStarted);
-    const finalChoicesStarted = performance.now();
-    await wait(30);
-    await fillCustomChoices(profile, stats, overwrite, processedCustomChoiceGroups, true);
-    stats.timings.finalChoicesMs = Math.round(performance.now() - finalChoicesStarted);
-    formObserver.disconnect();
-
-    stats.blocked = '';
-    stats.interactionWarnings = [...interactionWarnings];
-    stats.timings.totalMs = Math.round(performance.now() - runStarted);
-    delete stats.diagnosticSignatures;
-    showCompletionPanel(stats);
-    return stats;
+  function normalizedMessageType(message) {
+    const type = cleanText(message?.type);
+    if (message?.protocol === MESSAGE_PROTOCOL && type.endsWith('_V2')) return type.replace(/_V2$/, '');
+    return type;
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.type === 'RESUME_AUTOFILL_UPLOAD_ONLY_V2') {
-      Promise.resolve(runResumeUploadOnly(message.resumeFile || null, Boolean(message.overwrite)))
-        .then(sendResponse)
-        .catch((error) => sendResponse({ resumeStored: false, targetFound: false, injected: false, accepted: false, completed: false, reason: error?.message || String(error) }));
-      return true;
-    }
-    if (message.type === 'RESUME_AUTOFILL_FILL') {
-      runAutofill(message.profile || {}, Boolean(message.overwrite)).then(sendResponse);
-      return true;
-    }
-    if (message.type === 'RESUME_AUTOFILL_CLEAR') {
-      clearMarks();
-      sendResponse({ ok: true });
-    }
-    if (message.type === 'RESUME_AUTOFILL_DIAGNOSE') sendResponse(diagnosePage());
-    if (message.type === 'RESUME_AUTOFILL_AUDIT_SHOW') {
+    if (globalThis.__resumePageAuditVersion !== VERSION) return;
+    const type = normalizedMessageType(message);
+    if (type === 'RESUME_PAGE_AUDIT_SHOW') {
       const report = diagnosePage();
       showAuditPanel(report);
-      sendResponse({ ok: true, counts: report.counts, truncated: report.truncated });
+      sendResponse(report);
+      return;
+    }
+    if (type === 'RESUME_PAGE_AUDIT_CLEAR') {
+      clearAudit();
+      sendResponse({ ok: true, version: VERSION });
     }
   });
 })();

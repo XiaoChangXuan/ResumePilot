@@ -1,208 +1,303 @@
-import { migrateLegacyResumeFile } from './resume-file-store.js';
-import { hasAIGatewayPermission, loadAIConfig, requestAIGatewayPermission } from './ai-client.js';
-
 const $ = (selector) => document.querySelector(selector);
-const resultEl = $('#result');
-const fillButton = $('#fillButton');
-const uploadResumeButton = $('#uploadResumeButton');
+const result = $('#result');
+const PAGE_MESSAGE_PROTOCOL = 2;
+const PAGE_SCRIPTS = ['profile-schema.js', 'content.js'];
+const FILL_SCRIPTS = ['profile-schema.js', 'content.js', 'complex-controls.js', 'autofill.js'];
+let lastLogUrl = '';
 
-function showResult(message, isError = false) {
-  resultEl.textContent = message;
-  resultEl.className = isError ? 'result error' : 'result show';
+function revokeLastLogUrl() {
+  if (!lastLogUrl) return;
+  URL.revokeObjectURL(lastLogUrl);
+  lastLogUrl = '';
 }
 
-async function getProfile() {
-  const { profile = {} } = await chrome.storage.local.get('profile');
-  return profile;
+function timestampForFile() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    '-',
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds())
+  ].join('');
 }
 
-async function ensureAIReviewPermission() {
-  const config = await loadAIConfig();
-  if (!config.model || !config.apiKey) return false;
-  if (await hasAIGatewayPermission()) return true;
-  return requestAIGatewayPermission();
+function makeLogUrl(text) {
+  revokeLastLogUrl();
+  const blob = new Blob([String(text || '')], { type: 'text/plain;charset=utf-8' });
+  lastLogUrl = URL.createObjectURL(blob);
+  return lastLogUrl;
 }
 
-async function getStoredResumeFile() {
-  const { record, legacyIncomplete } = await migrateLegacyResumeFile();
-  return { record, legacyIncomplete };
-}
-
-function encodeBase64(bytes) {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+function showResult({ message, error = false, info = false, logText = '', logName = 'resume-autofill-log.txt' }) {
+  result.textContent = '';
+  result.className = `result ${error ? 'error' : info ? 'info' : 'show'}`;
+  const line = document.createElement('div');
+  line.textContent = message;
+  result.appendChild(line);
+  if (logText) {
+    const linkLine = document.createElement('div');
+    const link = document.createElement('a');
+    link.href = makeLogUrl(logText);
+    link.download = logName;
+    link.textContent = '下载 txt 日志';
+    linkLine.appendChild(link);
+    result.appendChild(linkLine);
   }
-  return btoa(binary);
 }
 
-async function makeUploadPayload(record) {
-  const bytes = new Uint8Array(await record.blob.arrayBuffer());
-  if (!bytes.length) throw new Error('独立附件仓库中的文件为空，请重新导入 PDF');
-  return {
-    name: record.name,
-    type: record.type || record.blob.type || 'application/octet-stream',
-    size: bytes.length,
-    lastModified: record.lastModified,
-    base64: encodeBase64(bytes)
-  };
+function errorLog(title, error) {
+  return [
+    title,
+    `时间：${new Date().toLocaleString()}`,
+    '',
+    error?.stack || error?.message || String(error)
+  ].join('\n');
 }
 
-async function updateProfileStatus() {
-  const [profile, resumeState] = await Promise.all([
-    getProfile(),
-    getStoredResumeFile()
-  ]);
-  const { record: resumeFile, legacyIncomplete } = resumeState;
-  const coreFields = [profile.fullName, profile.phone, profile.email].filter(Boolean).length;
-  if (coreFields === 3) {
-    $('#profileStatus').textContent = `资料已就绪：${profile.fullName}`;
-    fillButton.disabled = false;
-  } else {
-    $('#profileStatus').textContent = '请先填写姓名、手机和邮箱';
-    $('#profileStatus').classList.add('warn');
-    fillButton.disabled = true;
-  }
-  const completeResume = Boolean(resumeFile?.name && resumeFile?.blob?.size > 0);
-  $('#resumeStatus').textContent = completeResume
-    ? `已保存附件：${resumeFile.name}（独立仓库 ${Math.ceil(resumeFile.blob.size / 1024)} KB）`
-    : legacyIncomplete?.name
-      ? `旧附件记录不完整：${legacyIncomplete.name}（请重新导入）`
-      : '未保存简历附件；仍可填写文字字段';
-  uploadResumeButton.disabled = !completeResume;
+function responseLog(title, summary, payload) {
+  return [
+    title,
+    `时间：${new Date().toLocaleString()}`,
+    '',
+    summary || '',
+    '',
+    '原始结果：',
+    JSON.stringify(payload || {}, null, 2)
+  ].join('\n');
 }
 
-async function getActiveTab() {
+async function activeHttpTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id || !/^https?:/i.test(tab.url || '')) {
+    throw new Error('请先打开一个普通 HTTP 或 HTTPS 网页。');
+  }
   return tab;
 }
 
-async function sendToPage(message) {
-  const tab = await getActiveTab();
-  if (!tab?.id || !/^https?:/i.test(tab.url || '')) {
-    throw new Error('当前页面不允许插件填写，请打开普通网页后重试。');
-  }
+async function injectPageScripts(tabId, scripts) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: scripts });
+  await chrome.scripting.insertCSS({ target: { tabId }, files: ['content.css'] });
+}
+
+async function sendToPage(message, scripts = PAGE_SCRIPTS) {
+  const tab = await activeHttpTab();
+  const pageMessage = {
+    ...message,
+    type: `${message.type}_V2`,
+    protocol: PAGE_MESSAGE_PROTOCOL
+  };
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, message);
-    if (response === undefined) throw new Error('页面中没有对应版本的填写脚本');
+    const response = await chrome.tabs.sendMessage(tab.id, pageMessage);
+    if (response === undefined) throw new Error('页面审计脚本尚未加载');
     return response;
   } catch {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-    await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['content.css'] });
-    return chrome.tabs.sendMessage(tab.id, message);
+    await injectPageScripts(tab.id, scripts);
+    const response = await chrome.tabs.sendMessage(tab.id, pageMessage);
+    if (response === undefined) throw new Error('Page audit script is not loaded or is out of date. Reload the extension and refresh the page.');
+    return response;
   }
 }
 
-uploadResumeButton.addEventListener('click', async () => {
-  uploadResumeButton.disabled = true;
-  fillButton.disabled = true;
-  uploadResumeButton.textContent = '正在上传并等待网站解析…';
-  showResult('阶段 1/5：正在读取本地保存的简历…');
+$('#profileButton').addEventListener('click', () => chrome.runtime.openOptionsPage());
+
+async function loadProfile() {
+  const key = globalThis.ResumeProfileSchema?.storageKey || 'resumeProfileV1';
+  const stored = await chrome.storage.local.get(key);
+  const record = stored[key];
+  const profile = record?.data && typeof record.data === 'object' ? record.data : record;
+  if (!profile || typeof profile !== 'object') throw new Error('还没有保存个人资料，请先点击“编辑我的个人资料”。');
+  return profile;
+}
+
+function reportSummary(report) {
+  const dimensions = report.counts?.dimensions || {};
+  const fieldItems = report.interactiveElements?.filter((item) => item.elementKind === 'field') || [];
+  const mappingCounts = fieldItems.reduce((counts, item) => {
+    counts[item.mappingStatus] = (counts[item.mappingStatus] || 0) + 1;
+    return counts;
+  }, {});
+  return [
+    `共发现 ${report.counts?.interactive || 0} 个可见交互元素。`,
+    `填写元素 ${dimensions.elementKind?.field || 0}，动作元素 ${dimensions.elementKind?.action || 0}，交互区域 ${dimensions.elementKind?.container || 0}。`,
+    `字段映射：已映射 ${mappingCounts.mapped || 0}，待确认 ${mappingCounts.ambiguous || 0}，未映射 ${mappingCounts.unmapped || 0}。`
+  ].join('\n');
+}
+
+function structureSummary(items = []) {
+  if (!items.length) return '没有需要补齐的重复经历模块。';
+  return items.map((item) => {
+    const status = item.status || 'unknown';
+    const detected = item.after ?? 0;
+    const planned = item.plannedAfter ?? detected;
+    const countText = planned > detected
+      ? `目标 ${item.desired ?? 0}，原有 ${item.before ?? 0}，检测到 ${detected}，顺序处理到 ${planned}`
+      : `目标 ${item.desired ?? 0}，原有 ${item.before ?? 0}，现在 ${detected}`;
+    const profileText = Number.isFinite(item.profileEffective) || Number.isFinite(item.profileTotal)
+      ? `，资料有效 ${item.profileEffective ?? 0}/${item.profileTotal ?? 0}`
+      : '';
+    const anchorText = item.profileAnchorValues?.length ? `，资料条目 ${item.profileAnchorValues.join('；')}` : '';
+    const sampleText = item.profileSampleFields?.length ? `，样例字段 ${item.profileSampleFields.join('；')}` : '';
+    const addText = item.addActionFound === true
+      ? `，添加按钮 ${item.addActionRef || '已匹配'}${item.addActionText ? `「${item.addActionText}」` : ''}`
+      : item.addActionFound === false
+        ? '，添加按钮 未匹配'
+        : '';
+    const reason = item.reason ? `：${item.reason}` : '';
+    return `${item.label || item.section}：${countText}${profileText}${anchorText}${sampleText}${addText}，状态 ${status}${reason}`;
+  }).join('\n');
+}
+
+function compactPopupText(value, limit = 90) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function dynamicNodeLine(node) {
+  const label = compactPopupText(node.text || node.value || node.placeholder || node.data || '', 70);
+  const score = Number.isFinite(node.score) ? `/${node.score}` : '';
+  const role = node.role ? ` ${node.role}` : '';
+  return `#${node.index} ${node.kind || node.tag}${role}${score}${label ? `「${label}」` : ''}`;
+}
+
+function dynamicDomText(dom) {
+  if (!dom || typeof dom !== 'object') return '';
+  const triggerText = dom.trigger ? dynamicNodeLine(dom.trigger) : '无触发器信息';
+  const roots = (dom.roots || []).slice(0, 3).map((root) => {
+    const nodes = (root.nodes || [])
+      .filter((node) => ['option', 'radio', 'checkbox', 'tab', 'input', 'button'].includes(node.kind))
+      .slice(0, 14)
+      .map(dynamicNodeLine)
+      .join('；');
+    const rootName = compactPopupText([root.role, root.classHint, root.text].filter(Boolean).join(' '), 110);
+    return `root${root.index} ${root.tag}${rootName ? `「${rootName}」` : ''}${nodes ? `\n  元素：${nodes}` : ''}`;
+  }).join('\n');
+  const candidates = (dom.candidates || []).slice(0, 8).map((item) => `${item[0]}(${item[1]})`).join('、');
+  return [
+    `目标：${dom.target || ''}${dom.key ? `，key：${dom.key}` : ''}`,
+    `触发：${triggerText}`,
+    roots,
+    candidates ? `候选评分：${candidates}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+function dynamicDomSummary(items = []) {
+  const failures = items.filter((item) => item.dynamicDom).slice(0, 3);
+  if (!failures.length) return '';
+  return failures.map((item, index) => [
+    `${index + 1}. ${item.field || item.ref} → ${item.profilePath || ''}（${item.status}${item.reason ? `：${item.reason}` : ''}）`,
+    dynamicDomText(item.dynamicDom)
+  ].join('\n')).join('\n\n');
+}
+
+function msText(ms) {
+  const value = Number(ms || 0);
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`;
+}
+
+function performanceSummary(performance) {
+  if (!performance || typeof performance !== 'object') return '';
+  const lines = [];
+  if (performance.stages?.length) {
+    lines.push(`阶段耗时：${performance.stages.map((stage) => `${stage.name} ${msText(stage.ms)}`).join('，')}`);
+  }
+  if (performance.fieldStats) {
+    const stats = performance.fieldStats;
+    lines.push(`字段扫描：页面字段 ${stats.totalControls || 0}，映射可填 ${stats.mappedFillable || 0}，未映射跳过 ${stats.unmappedSkipped || 0}`);
+  }
+  if (performance.byOperation?.length) {
+    lines.push(`操作耗时：${performance.byOperation.map((item) => `${item.operation || 'unknown'} ${item.count || 0}项/${msText(item.ms)}`).join('，')}`);
+  }
+  if (performance.slowFields?.length) {
+    lines.push(`最慢字段：\n${performance.slowFields.slice(0, 6).map((item) => `${item.field || item.ref} → ${item.profilePath || ''}（${item.operation || item.legacyType || ''}，${msText(item.ms)}，${item.status || ''}${item.reason ? `：${item.reason}` : ''}）`).join('\n')}`);
+  }
+  return lines.join('\n');
+}
+
+function fillSummary(response) {
+  if (response.canceled) {
+    const performance = performanceSummary(response.performance);
+    return [`已取消本次填写。`, response.message || '', performance ? `执行统计：\n${performance}` : ''].filter(Boolean).join('\n');
+  }
+  const totals = response.totals || {};
+  const lines = [
+    `填写完成：${response.complete ? '是' : '否'}`,
+    `字段：完成 ${totals.completed || 0}/${totals.required || 0}，实际写入 ${totals.filled || 0}，待审核 ${totals.manualReview || 0}，遗漏 ${totals.omitted || 0}`,
+    `经历段数：\n${structureSummary(response.structures || [])}`
+  ];
+  if (response.sequential?.length) lines.push(`顺序填写：\n${structureSummary(response.sequential)}`);
+  if (response.omissions?.length) {
+    lines.push(`前 8 个遗漏：\n${response.omissions.slice(0, 8).map((item) => `${item.field || item.ref} → ${item.profilePath || ''}（${item.status}${item.reason ? `：${item.reason}` : ''}）`).join('\n')}`);
+  }
+  const dynamic = dynamicDomSummary(response.omissions || []);
+  if (dynamic) lines.push(`动态弹层摘要：\n${dynamic}`);
+  const performance = performanceSummary(response.performance);
+  if (performance) lines.push(`执行统计：\n${performance}`);
+  return lines.join('\n');
+}
+
+$('#auditButton').addEventListener('click', async () => {
+  const button = $('#auditButton');
+  button.disabled = true;
+  button.textContent = '…';
   try {
-    const { record } = await getStoredResumeFile();
-    if (!record?.blob?.size) {
-      showResult('1. 本地简历：读取失败\n原因：独立附件仓库中没有完整文件；请在“编辑我的资料”中重新选择并导入 PDF。', true);
-      return;
-    }
-    const resumeFile = await makeUploadPayload(record);
-    showResult(`阶段 1/5：已读取 ${resumeFile.name}，正在定位网页上传框…`);
-    const summary = await sendToPage({
-      type: 'RESUME_AUTOFILL_UPLOAD_ONLY_V2',
-      resumeFile,
-      overwrite: $('#overwrite').checked
+    const report = await sendToPage({ type: 'RESUME_PAGE_AUDIT_SHOW' });
+    const summary = `${reportSummary(report)}\n详细结果已显示在网页右侧。`;
+    showResult({
+      message: '解析完成，详细结构已显示在页面右侧。',
+      info: true,
+      logText: responseLog('页面解析日志', summary, report),
+      logName: `resume-page-audit-${timestampForFile()}.txt`
     });
-    if (!summary.resumeStored) {
-      showResult(`1. 本地简历：传送到网页脚本失败\n原因：${summary.reason || '网页脚本没有收到附件正文。'}`, true);
-      return;
-    }
-    const stages = [
-      `1. 本地简历：${summary.resumeStored ? `已读取 ${summary.fileName || ''}` : '没有保存'}`,
-      `2. 文件上传框：${summary.targetFound ? `已找到${summary.targetKind === 'parse' ? '“快速解析简历”入口' : summary.targetKind === 'attachment' ? '“简历附件”入口' : '简历入口'}（页面共有 ${summary.totalFileInputs || 0} 个文件框）` : `未找到（页面共有 ${summary.totalFileInputs || 0} 个文件框）`}`,
-      `3. 放入文件：${summary.injected ? '成功' : '失败'}`,
-      `4. 触发网站：${summary.dropFallback ? '已追加拖拽 drop 事件' : summary.injected ? '已触发 input/change' : '未触发'}`,
-      `5. 网站解析：${summary.accepted ? (summary.completed ? `已响应并稳定（等待 ${Math.ceil((summary.waitedMs || 0) / 1000)} 秒）` : '已响应，但等待解析超时') : '没有观察到网站接收或解析'}`
-    ];
-    const candidates = (summary.candidates || []).length
-      ? `\n发现的上传入口：\n${summary.candidates.map((candidate) => `- ${candidate.kind === 'parse' ? '快速解析' : candidate.kind === 'attachment' ? '普通附件' : '简历'}：${candidate.text.slice(0, 80)}`).join('\n')}`
-      : '';
-    if (summary.accepted) {
-      showResult(`${stages.join('\n')}${candidates}\n\n现在可以点击“② 补充填写当前页面”。`);
-    } else {
-      const reason = summary.reason ? `\n原因：${summary.reason}` : '';
-      showResult(`${stages.join('\n')}${candidates}${reason}`, true);
-    }
   } catch (error) {
-    showResult(`上传流程失败：${error.message || error}`, true);
-  } finally {
-    const { record } = await getStoredResumeFile();
-    uploadResumeButton.disabled = !record?.blob?.size;
-    fillButton.disabled = false;
-    uploadResumeButton.textContent = '① 先上传并解析简历';
-  }
-});
-
-fillButton.addEventListener('click', async () => {
-  fillButton.disabled = true;
-  fillButton.textContent = '正在识别并填写…';
-  try {
-    const aiReviewEnabled = await ensureAIReviewPermission().catch(() => false);
-    const profile = await getProfile();
-    const summary = await sendToPage({
-      type: 'RESUME_AUTOFILL_FILL',
-      profile,
-      overwrite: $('#overwrite').checked
+    showResult({
+      message: '页面解析失败，详细原因已写入日志。',
+      error: true,
+      logText: errorLog('页面解析失败', error),
+      logName: `resume-page-audit-error-${timestampForFile()}.txt`
     });
-    const examples = [];
-    if (summary.details?.unmatched?.length) examples.push(`资料字段未映射示例：${summary.details.unmatched.slice(0, 3).join('、')}`);
-    if (summary.details?.missingData?.length) examples.push(`本地资料缺失示例：${summary.details.missingData.slice(0, 3).join('、')}`);
-    if (summary.details?.unsupported?.length) examples.push(`实际处理失败示例：${summary.details.unsupported.slice(0, 3).join('、')}`);
-    if (summary.details?.ignored?.length) examples.push(`有意忽略示例：${summary.details.ignored.slice(0, 3).join('、')}`);
-    const sectionText = `${summary.sectionsAdded ? `已新增经历表单 ${summary.sectionsAdded} 段；` : ''}${summary.sectionAddFailed ? `仍缺少经历表单 ${summary.sectionAddFailed} 段；` : ''}`;
-    const sectionPlan = (summary.sectionPlan || []).length
-      ? `\n重复区块检查：${summary.sectionPlan.map((item) => `${item.label} 资料${item.desired}段/原有${item.existing}段/新增${item.added}段/最终${item.final}段`).join('；')}`
-      : '';
-    const timingText = summary.timings?.totalMs !== undefined
-      ? `\n耗时：总计 ${(summary.timings.totalMs / 1000).toFixed(1)} 秒（新增区块 ${(summary.timings.sectionSetupMs / 1000).toFixed(1)} 秒，快速字段 ${((summary.timings.fastFieldsMs || 0) / 1000).toFixed(1)} 秒，动态控件 ${(summary.timings.controlsMs / 1000).toFixed(1)} 秒）`
-      : '';
-    const slowText = (summary.slowFields || []).length
-      ? `\n最慢字段：${summary.slowFields.slice(0, 5).map((item) => `${item.field}→${item.key} ${(item.ms / 1000).toFixed(2)}秒${item.ok ? '' : '（失败）'}`).join('；')}`
-      : '';
-    showResult(`补填完成：绿色成功 ${summary.filled} 项（AI 辅助 ${summary.aiReviewed || 0} 项）；${sectionText}蓝色已有值 ${summary.existing} 项；紫色未映射 ${summary.unmatched} 项；黄色资料缺失 ${summary.missingData || 0} 项；红色处理失败 ${summary.unsupported || 0} 项；灰色有意忽略 ${summary.ignored || 0} 项。\nAI 表单辅助：${aiReviewEnabled ? '已启用' : '未配置或未授权'}。逐项的目标值、页面回读值和判定原因已显示在网页右下角诊断表。${sectionPlan}${timingText}${slowText}${examples.length ? `\n${examples.join('\n')}` : ''}`);
-  } catch (error) {
-    showResult(error.message || '填写失败，请刷新页面后重试。', true);
   } finally {
-    fillButton.disabled = false;
-    fillButton.textContent = '② 补充填写当前页面';
+    button.disabled = false;
+    button.textContent = '解';
   }
 });
 
-$('#optionsButton').addEventListener('click', () => chrome.runtime.openOptionsPage());
-$('#diagnoseButton').addEventListener('click', async () => {
+$('#fillButton').addEventListener('click', async () => {
+  const button = $('#fillButton');
+  button.disabled = true;
+  button.textContent = '正在填写…';
   try {
-    const audit = await sendToPage({ type: 'RESUME_AUTOFILL_AUDIT_SHOW' });
-    const counts = audit.counts?.audit || {};
-    showResult(`页面解析结果已显示在网页右侧，并已按输入方式给原控件着色。共发现 ${audit.counts?.interactive || 0} 个可见交互元素：已有交互处理器 ${counts['understood-supported'] || 0} 个、已识别但当前处理不了 ${counts['understood-unsupported'] || 0} 个、交互方式未适配 ${counts['not-understood'] || 0} 个、安全忽略 ${counts['safe-ignored'] || 0} 个。资料字段是否成功映射只作为附加信息；这个步骤不会填写或点击网页。`);
+    const profile = await loadProfile();
+    const overwrite = Boolean($('#overwriteInput')?.checked);
+    const response = await sendToPage({ type: 'RESUME_PROFILE_FILL_CURRENT_PAGE', profile, overwrite }, FILL_SCRIPTS);
+    if (!response?.ok) throw new Error(response?.error || '填写当前页面失败');
+    const summary = fillSummary(response);
+    const totals = response.totals || {};
+    const message = response.canceled
+      ? '已暂停/取消本次填写。'
+      : response.complete
+        ? `填写完成：${totals.completed || 0}/${totals.required || 0}。`
+        : `填写已结束，还有 ${totals.omitted || 0} 个字段需要检查。`;
+    showResult({
+      message,
+      error: !response.complete && !response.canceled,
+      logText: responseLog('当前页面填写日志', summary, response),
+      logName: `resume-autofill-${timestampForFile()}.txt`
+    });
   } catch (error) {
-    showResult(`显示识别审计失败：${error.message}`, true);
-  }
-});
-$('#copyDiagnoseButton').addEventListener('click', async () => {
-  try {
-    const diagnosis = await sendToPage({ type: 'RESUME_AUTOFILL_DIAGNOSE' });
-    await navigator.clipboard.writeText(JSON.stringify(diagnosis, null, 2));
-    showResult(`完整诊断已复制：检测到 ${diagnosis.counts.interactive} 个可见交互元素、${diagnosis.semanticTexts.length} 条语义文字、${diagnosis.iframes.length} 个 iframe。它不包含输入值和本地简历资料，可以直接粘贴给我分析。`);
-  } catch (error) {
-    showResult(`复制诊断信息失败：${error.message}`, true);
-  }
-});
-$('#clearButton').addEventListener('click', async () => {
-  try {
-    await sendToPage({ type: 'RESUME_AUTOFILL_CLEAR' });
-    showResult('已清除页面上的颜色标记，已写入的内容不会被删除。');
-  } catch (error) {
-    showResult(error.message, true);
+    showResult({
+      message: '填写当前页面失败，详细原因已写入日志。',
+      error: true,
+      logText: errorLog('填写当前页面失败', error),
+      logName: `resume-autofill-error-${timestampForFile()}.txt`
+    });
+  } finally {
+    button.disabled = false;
+    button.textContent = '填写当前页面';
   }
 });
 
-updateProfileStatus();
+window.addEventListener('unload', revokeLastLogUrl);

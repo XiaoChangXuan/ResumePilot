@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>校园招聘申请表</title>
+</head>
+<body>
+  <main>
+    <section class="apply-section" id="basic-section">
+      <h2>基本信息</h2>
+      <div class="form-item">
+        <label class="form-item-label" for="fullName">姓名</label>
+        <input id="fullName" name="candidateName" type="text" placeholder="请输入姓名">
+      </div>
+      <div class="form-item">
+        <span class="form-item-label">手机号码</span>
+        <div>
+          <input name="mobile" type="tel" placeholder="请输入手机号码">
+        </div>
+      </div>
+      <div class="form-item">
+        <span class="form-item-label">邮箱</span>
+        <input name="email" type="email" placeholder="请输入邮箱">
+      </div>
+      <div class="form-item">
+        <span class="form-item-label">性别</span>
+        <select name="gender">
+          <option value="">请选择</option>
+          <option value="male">男</option>
+          <option value="female">女</option>
+        </select>
+      </div>
+      <div class="form-item">
+        <span class="form-item-label">自我评价</span>
+        <textarea name="summary" placeholder="请输入自我评价"></textarea>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

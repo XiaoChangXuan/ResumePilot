@@ -11,6 +11,10 @@
 *.rtf
 *resume*.json
 *profile*.json
+resume-profile-*.json
+profile-export-*.json
+personal/
+downloads/
 
 # Browser, editor, and operating-system files
 .DS_Store
@@ -19,6 +23,13 @@ Thumbs.db
 .vscode/
 *.log
 *.tmp
+__pycache__/
+*.pyc
+.pytest_cache/
+.tmp/
+.uv-cache/
+.uv-python/
+backups/
 
 # Packaged extension output
 *.crx

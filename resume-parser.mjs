@@ -119,12 +119,17 @@ function parseProjects(text) {
   const sectionIndex = text.search(/科研与项目经历|项目经历|research\s+(?:and|&)\s+projects?/i);
   const source = sectionIndex >= 0 ? text.slice(sectionIndex) : text;
   const matches = projectMatches(source);
-  return matches.map((match, index) => ({
-    name: `${match.code}: ${match.title}`,
-    role: match.venue,
-    ...parseDateRange(match.rangeText),
-    description: compact(source.slice(match.end, matches[index + 1]?.index ?? source.length).replace(/\s+[\u4e00-\u9fa5·]{2,6}\s+邮箱\s*[:：].*$/s, ''))
-  }));
+  return matches.map((match, index) => {
+    const rawDescription = source.slice(match.end, matches[index + 1]?.index ?? source.length).replace(/\s+[\u4e00-\u9fa5·]{2,6}\s+邮箱\s*[:：].*$/s, '');
+    const link = rawDescription.match(/https?:\/\/[^\s，。；;]+/i)?.[0] || '';
+    return {
+      name: `${match.code}: ${match.title}`,
+      role: match.venue,
+      ...parseDateRange(match.rangeText),
+      link,
+      description: compact(rawDescription.replace(link, ' '))
+    };
+  });
 }
 
 function findName(text, email, phone) {

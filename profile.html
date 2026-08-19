@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>我的求职资料</title>
+  <link rel="stylesheet" href="profile.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <span class="eyebrow">LOCAL PROFILE</span>
+      <h1>我的求职资料</h1>
+      <p>统一保存一次，再映射到不同公司的字段名称。资料与附件只保存在当前浏览器。</p>
+    </div>
+    <div class="topbar-actions">
+      <span id="saveState" class="save-state">正在载入…</span>
+      <button id="saveButton" class="primary" type="button">保存全部资料</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <label class="search-label">搜索字段<input id="fieldSearch" type="search" placeholder="姓名、学校、证书…"></label>
+      <div id="profileStats" class="profile-stats"></div>
+      <nav id="sectionNav" aria-label="资料分类"></nav>
+      <div class="privacy-note">不会读取招聘页面中已经填写的值，也不会自动提交。证件号码等敏感资料仅保存在本机扩展存储。</div>
+    </aside>
+
+    <main>
+      <section class="intro-card">
+        <div><strong>统一资料模型</strong><p>页面上的“单位名称 / 公司名称”等不同叫法会映射到同一个资料字段；教育、工作、项目等使用数组保存。</p></div>
+        <button id="showAliases" type="button">查看映射规则</button>
+      </section>
+      <section class="profile-tools">
+        <div class="tool-panel">
+          <div>
+            <h2>解析 PDF</h2>
+            <p>从带文字层的 PDF 简历里提取个人资料，只填当前为空的字段。</p>
+          </div>
+          <label class="file-button">上传 PDF 解析资料<input id="resumePdfInput" type="file" accept=".pdf,application/pdf"></label>
+          <div id="parseResult" class="tool-state" aria-live="polite">尚未解析 PDF</div>
+          <details id="textPreview" class="text-preview" hidden>
+            <summary>查看解析出的原始文字</summary>
+            <pre></pre>
+          </details>
+        </div>
+        <div class="tool-panel">
+          <div>
+            <h2>上传简历</h2>
+            <p>保存一份主简历附件，用于后续招聘页面的简历上传字段。</p>
+          </div>
+          <label class="file-button">保存简历附件<input id="resumeAttachmentInput" type="file" accept=".pdf,.doc,.docx,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"></label>
+          <div id="resumeFileState" class="tool-state" aria-live="polite">尚未保存简历附件</div>
+        </div>
+      </section>
+      <form id="profileForm" autocomplete="off"></form>
+      <footer class="footer-actions">
+        <button id="saveFooter" class="primary" type="button">保存全部资料</button>
+        <button id="exportButton" type="button">导出 JSON</button>
+        <label class="file-button">导入 JSON<input id="importInput" type="file" accept="application/json,.json"></label>
+        <button id="clearButton" class="danger" type="button">清空资料与附件</button>
+      </footer>
+    </main>
+  </div>
+
+  <dialog id="aliasDialog">
+    <div class="dialog-head"><div><h2>字段映射规则</h2><p>公司页面文字 → 统一资料路径</p></div><button id="closeAliases" type="button" aria-label="关闭">×</button></div>
+    <input id="aliasSearch" type="search" placeholder="搜索页面字段或资料路径">
+    <div id="aliasList" class="alias-list"></div>
+  </dialog>
+
+  <template id="entryTemplate">
+    <article class="entry">
+      <div class="entry-head"><strong></strong><button class="remove-entry" type="button">删除</button></div>
+      <div class="field-grid"></div>
+    </article>
+  </template>
+
+  <script src="profile-schema.js"></script>
+  <script src="profile.js"></script>
+</body>
+</html>

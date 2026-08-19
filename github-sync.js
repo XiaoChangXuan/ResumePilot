@@ -74,7 +74,7 @@ function base64DecodeUtf8(value) {
 function buildSyncEnvelope(profile) {
   return {
     schemaVersion: 1,
-    source: 'resume-autofill-mvp',
+    source: 'ResumePilot',
     syncedAt: new Date().toISOString(),
     profile
   };

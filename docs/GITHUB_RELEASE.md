@@ -14,12 +14,12 @@ Topics:
 chrome-extension, edge-extension, resume, autofill, job-application, browser-extension, local-first
 ```
 
-## v0.0.1 Release
+## 0.0.1 Release
 
 Title:
 
 ```text
-ResumePilot v0.0.1
+0.0.1
 ```
 
 Body:

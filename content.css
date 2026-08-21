@@ -261,6 +261,64 @@
   animation: resume-page-audit-pulse .8s ease-in-out 3 alternate !important;
 }
 
+.resume-autofill-debug-overlay {
+  border-width: 3px !important;
+  background: transparent !important;
+  box-shadow: 0 0 0 2px rgba(15, 23, 42, .12), 0 8px 18px rgba(15, 23, 42, .16) !important;
+}
+
+.resume-autofill-debug-overlay__label {
+  position: absolute !important;
+  left: -3px !important;
+  top: -24px !important;
+  max-width: min(320px, 70vw) !important;
+  padding: 3px 7px !important;
+  border-radius: 4px !important;
+  color: #ffffff !important;
+  font: 700 11px/1.35 Inter, "PingFang SC", "Microsoft YaHei", sans-serif !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  pointer-events: none !important;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, .2) !important;
+}
+
+.resume-autofill-debug-overlay--success {
+  border-color: #16a34a !important;
+  background: rgba(22, 163, 74, .06) !important;
+}
+
+.resume-autofill-debug-overlay--success .resume-autofill-debug-overlay__label {
+  background: #15803d !important;
+}
+
+.resume-autofill-debug-overlay--mismatch {
+  border-color: #f59e0b !important;
+  background: rgba(245, 158, 11, .08) !important;
+}
+
+.resume-autofill-debug-overlay--mismatch .resume-autofill-debug-overlay__label {
+  background: #b45309 !important;
+}
+
+.resume-autofill-debug-overlay--failed {
+  border-color: #dc2626 !important;
+  background: rgba(220, 38, 38, .07) !important;
+}
+
+.resume-autofill-debug-overlay--failed .resume-autofill-debug-overlay__label {
+  background: #b91c1c !important;
+}
+
+.resume-autofill-debug-overlay--unmapped {
+  border-color: #9333ea !important;
+  background: rgba(147, 51, 234, .07) !important;
+}
+
+.resume-autofill-debug-overlay--unmapped .resume-autofill-debug-overlay__label {
+  background: #7e22ce !important;
+}
+
 @keyframes resume-page-audit-pulse {
   from { border-color: #2563eb; }
   to { border-color: #60a5fa; }

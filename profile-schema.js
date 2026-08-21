@@ -437,6 +437,11 @@
     return Boolean(prefix && String(path || '').startsWith(`${prefix}.`));
   }
 
+  function profileSectionFromPath(path) {
+    const match = String(path || '').match(/^([^[.]+)/);
+    return match ? match[1] : '';
+  }
+
   const aliasIndex = [];
   for (const section of sections) {
     for (const field of section.fields) {
@@ -459,6 +464,124 @@
     { pattern: /是否有亲友.*学员/i, path: 'qualifications.relativesAreStudents' }
   ];
 
+  function compactReason(reasons) {
+    return [...new Set(reasons.filter(Boolean))].join(' + ');
+  }
+
+  function resolveMapping(input = {}) {
+    const label = String(input.fieldLabel || input.label || '');
+    const matchedKey = String(input.matchedKey || '');
+    const context = String(input.context || '');
+    const moduleTitle = String(input.moduleTitle || '');
+    const signals = input.signals || {};
+    const normalized = normalizeAlias(label);
+    const signalText = [
+      signals.text,
+      signals.displayName,
+      signals.placeholder,
+      signals.ariaLabel,
+      signals.title,
+      signals.name,
+      signals.id,
+      signals.className
+    ].filter(Boolean).map(normalizeAlias).join(' ');
+    const contextSections = {
+      education: 'educationExperiences',
+      work: 'workExperiences',
+      project: 'projectExperiences',
+      campus: 'campusExperiences',
+      practice: 'practiceExperiences',
+      certificate: 'certificates',
+      award: 'awards',
+      language: 'languageSkills',
+      family: 'familyMembers',
+      publication: 'publications',
+      patent: 'patents',
+      skill: 'skills',
+      highSchool: 'highSchool',
+      attachments: 'attachments'
+    };
+    const moduleSection = moduleSectionForTitle(moduleTitle);
+    const effectiveSection = moduleSection || contextSections[context] || '';
+    const details = new Map();
+    const push = (path, score, reason) => {
+      if (!path) return;
+      const section = profileSectionFromPath(path);
+      const sectionMatched = !effectiveSection || section === effectiveSection;
+      const moduleAgnostic = /^(?:jobPreferences|attachments|linksAndSummary|qualifications)\./.test(path);
+      const adjustedScore = sectionMatched || moduleAgnostic ? score : Math.max(10, score - 24);
+      const previous = details.get(path);
+      if (!previous || adjustedScore > previous.score) {
+        details.set(path, { path, score: adjustedScore, reason });
+      } else if (previous && reason) {
+        previous.reason = compactReason([previous.reason, reason]);
+      }
+    };
+
+    const highestEducationDerived = {
+      degree: 'educationExperiences[highest].degree',
+      graduationDate: 'educationExperiences[highest].endDate',
+      studyMode: 'educationExperiences[highest].studyMode'
+    };
+    if (moduleSection === 'basic' && highestEducationDerived[matchedKey]) {
+      push(highestEducationDerived[matchedKey], 118, `derived-highest-education:${matchedKey}`);
+    }
+
+    const moduleAgnosticPaths = {
+      acceptsAdjustment: 'jobPreferences.acceptsAdjustment',
+      recruitmentSource: 'jobPreferences.recruitmentSource'
+    };
+    if (moduleAgnosticPaths[matchedKey]) push(moduleAgnosticPaths[matchedKey], 112, `module-agnostic:${matchedKey}`);
+
+    const moduleOverride = effectiveSection && matchedKey
+      ? moduleFieldOverrides?.[effectiveSection]?.[matchedKey] || ''
+      : '';
+    if (moduleOverride) push(moduleOverride, 100, `module-override:${effectiveSection}:${matchedKey}`);
+
+    const legacyPath = legacyKeyToPath?.[matchedKey] || '';
+    if (legacyPath) push(legacyPath, 78, `legacy-key:${matchedKey}`);
+
+    if (normalized) {
+      for (const item of aliasIndex) {
+        if (item.normalized === normalized) {
+          push(item.path, item.section === effectiveSection ? 94 : 86, `alias-exact:${item.alias}`);
+        } else if (item.normalized && signalText.includes(item.normalized)) {
+          push(item.path, item.section === effectiveSection ? 72 : 58, `signal-alias:${item.alias}`);
+        }
+      }
+    }
+
+    for (const rule of patternRules) {
+      if (rule.pattern.test(label)) push(rule.path, 74, 'pattern-rule');
+    }
+
+    const uniqueDetails = [...details.values()].sort((left, right) => right.score - left.score);
+    const top = uniqueDetails[0];
+    const second = uniqueDetails[1];
+    const hasClearWinner = top && (
+      top.score >= 90
+      || (uniqueDetails.length === 1 && top.score >= 72)
+      || (top.score >= 78 && top.score - (second?.score || 0) >= 16)
+    );
+    const path = hasClearWinner ? top.path : '';
+    const evidence = top ? [
+      top.reason,
+      moduleSection ? `module:${moduleSection}` : '',
+      context ? `context:${context}` : '',
+      matchedKey ? `key:${matchedKey}` : '',
+      normalized ? `label:${normalized}` : ''
+    ].filter(Boolean) : [];
+
+    return {
+      path,
+      candidates: uniqueDetails.slice(0, 8).map((detail) => detail.path),
+      candidateDetails: uniqueDetails.slice(0, 8),
+      evidence,
+      score: top?.score || 0,
+      strategy: path ? 'schema-score' : uniqueDetails.length ? 'schema-score-ambiguous' : 'schema-score-unmapped'
+    };
+  }
+
   globalThis.ResumeProfileSchema = {
     schemaVersion: 1,
     storageKey: 'resumeProfileV1',
@@ -471,6 +594,7 @@
     moduleSectionForTitle,
     moduleSectionPrefix,
     profilePathInSection,
+    resolveMapping,
     normalizeAlias
   };
 })();

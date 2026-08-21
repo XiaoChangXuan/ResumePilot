@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '0.5.27';
+  const VERSION = '0.5.29';
   if (globalThis.ResumeComplexControls?.version === VERSION) return;
 
   const results = new WeakMap();
@@ -17,6 +17,49 @@
   ].join(',');
 
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function createTimingTrace(component = '') {
+    return { component, steps: [] };
+  }
+
+  function pushTimingStep(trace, name, started, extra = {}) {
+    if (!trace?.steps || !name) return;
+    const entry = {
+      name,
+      ms: Math.round(performance.now() - started)
+    };
+    for (const [key, value] of Object.entries(extra || {})) {
+      if (value !== undefined && value !== null && value !== '') entry[key] = value;
+    }
+    trace.steps.push(entry);
+    if (trace.steps.length > 80) trace.steps.splice(0, trace.steps.length - 80);
+  }
+
+  async function timedStep(trace, name, task, extra = {}) {
+    const started = performance.now();
+    try {
+      const value = await task();
+      pushTimingStep(trace, name, started, { ...extra, ok: Boolean(value) });
+      return value;
+    } catch (error) {
+      pushTimingStep(trace, name, started, { ...extra, ok: false, error: error?.message || String(error) });
+      throw error;
+    }
+  }
+
+  function timingPayload(trace) {
+    const steps = Array.isArray(trace?.steps) ? trace.steps.slice() : [];
+    if (!steps.length) return {};
+    return {
+      timingComponent: trace.component || '',
+      timingTotalMs: steps.reduce((sum, step) => sum + Number(step.ms || 0), 0),
+      timing: steps
+    };
+  }
+
+  function withTiming(result, trace) {
+    return trace?.steps?.length ? { ...result, ...timingPayload(trace) } : result;
+  }
 
   function clean(value) {
     return String(value || '').replace(/\*/g, ' ').replace(/\s+/g, ' ').trim();
@@ -868,6 +911,9 @@
       'svg[class*="RadioUnchecked"]',
       'svg[class*="CheckboxChecked"]',
       'svg[class*="CheckboxUnchecked"]',
+      '.phoenix-radio--checked',
+      '.phoenix-radio__circle-wrapper--checked',
+      '.phoenix-radio__dot--checked',
       '[class*="radio-checked"]',
       '[class*="radio-unchecked"]',
       '[class*="checkbox-checked"]',
@@ -917,9 +963,10 @@
     if (!(row instanceof Element)) return [];
     const mark = explicitRowMark(row);
     const markContainer = mark?.closest?.('label,[role="radio"],[role="checkbox"],[class*="icon-container"],[class*="radio"],[class*="checkbox"],[class*="Radio"],[class*="Checkbox"]');
-    const text = [...row.querySelectorAll('[class*="item-text-label"],[class*="area-text-label"],label,span,div')]
+    const phoenixRadio = row.querySelector?.('.phoenix-radio,.phoenix-radio__wrapper');
+    const text = [...row.querySelectorAll('.phoenix-radio__radio-text,[class*="item-text-label"],[class*="area-text-label"],label,span,div')]
       .find((node) => visible(node) && clean(node.textContent) && clean(node.textContent).length <= 80);
-    return [...new Set([mark, markContainer, row, text].filter((node) => node instanceof Element && visible(node)))];
+    return [...new Set([mark, markContainer, phoenixRadio, row, text].filter((node) => node instanceof Element && visible(node)))];
   }
 
   async function waitForPanelClosed(panel, timeout = 700) {
@@ -929,6 +976,35 @@
       await wait(45);
     }
     return !panel?.isConnected || !visible(panel);
+  }
+
+  function selectionSignature(session, element, trigger) {
+    const roots = session ? sessionPanelRoots(session) : [];
+    const options = session
+      ? collectOptions(trigger, session.beforeVisible || new Set(), roots)
+      : [];
+    const rootState = roots.slice(0, 6).map((root) => [
+      String(root.className || ''),
+      root.childElementCount,
+      clean(root.textContent || '').slice(0, 120)
+    ].join(':')).join('|');
+    const optionState = options.slice(0, 30).map((option) => optionText(option)).join('|');
+    return `${displayedValue(element, trigger)}||${rootState}||${optionState}`;
+  }
+
+  async function waitForSelectionSettled(session, element, value, key = '', option = null, beforeSignature = '', timeout = 360) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      if (value && choiceVerified(element, session.trigger, value, key)) return 'readback';
+      if (optionSelected(option)) return 'option-selected';
+      if (option instanceof Element && (!option.isConnected || !visible(option))) return 'option-detached';
+      const roots = sessionPanelRoots(session);
+      if (roots.length === 0 && Date.now() - started >= 35) return 'panel-closed';
+      const signature = selectionSignature(session, element, session.trigger);
+      if (beforeSignature && signature !== beforeSignature && Date.now() - started >= 35) return 'dom-changed';
+      await wait(35);
+    }
+    return '';
   }
 
   async function fillSearchConfirmSelect(session, element, value, key = '') {
@@ -1284,13 +1360,14 @@
         match = exactOption(options, path[level]);
       }
       if (!match.option) return remember(element, { ok: false, type: session.type, stage: '候选匹配', reason: `${path[level]}：${match.reason}`, candidates: options.slice(0, 20).map((node) => optionText(node)) });
+      const beforeClick = selectionSignature(session, element, session.trigger);
       click(match.option);
       clickedOptions.push(match.option);
       selected.push(optionText(match.option));
-      await wait(260);
+      await waitForSelectionSettled(session, element, path[level], key, match.option, beforeClick, 420);
       if (level < path.length - 1 && !(await refreshedOptions(session)).length) {
         click(session.trigger);
-        await wait(120);
+        await waitForSelectionSettled(session, element, path[level], key, null, beforeClick, 160);
       }
     }
     const readbackOk = choiceVerified(element, session.trigger, path.at(-1));
@@ -1332,12 +1409,14 @@
           }, value, 'rankingPercent'));
         }
         const selectedText = optionText(match.option);
+        const beforeClick = selectionSignature(session, element, session.trigger);
         click(match.option);
-        await wait(260);
+        const settleReason = await waitForSelectionSettled(session, element, value, 'rankingPercent', match.option, beforeClick, 360);
         const confirm = confirmationButton(session);
         if (confirm) {
+          const beforeConfirm = selectionSignature(session, element, session.trigger);
           click(confirm);
-          await wait(180);
+          await waitForSelectionSettled(session, element, value, 'rankingPercent', null, beforeConfirm, 360);
         }
         const readbackOk = choiceVerified(element, session.trigger, value, 'rankingPercent');
         const selectedStateOk = optionSelected(match.option);
@@ -1352,6 +1431,7 @@
           normalizedTarget: parsePercentValue(value) === null ? '' : `${Number(parsePercentValue(value).toFixed(4))}%`,
           actual: displayedValue(element, session.trigger),
           selected: selectedText,
+          settleReason,
           confidence: (match.score || 100) / 100,
           candidates: match.candidates || options.slice(0, 20).map((node) => optionText(node)),
           reason: ok ? '' : 'VERIFY_FAILED_AFTER_CANDIDATE_CLICK'
@@ -1382,7 +1462,7 @@
         let lastMatch = null;
         for (const term of terms) {
           nativeSet(element, term);
-          await wait(180);
+          await wait(80);
           const options = await refreshedOptions(session, 1000);
           lastOptions = options.length ? options : lastOptions;
           lastMatch = exactOption(lastOptions, value, key);
@@ -1398,10 +1478,11 @@
             candidates: lastOptions.slice(0, 20).map((node) => optionText(node))
           }, value, key));
         }
+        const beforeClick = selectionSignature(session, element, session.trigger);
         click(lastMatch.option);
         clickedOptions.push(lastMatch.option);
         selected.push(optionText(lastMatch.option));
-        await wait(260);
+        await waitForSelectionSettled(session, element, isLocation ? path.at(-1) || value : value, key, lastMatch.option, beforeClick, 420);
       } else {
         for (let level = 0; level < path.length; level += 1) {
           const targetValue = path[level];
@@ -1417,21 +1498,23 @@
               candidates: options.slice(0, 20).map((node) => optionText(node))
             }, value, key));
           }
+          const beforeClick = selectionSignature(session, element, session.trigger);
           click(match.option);
           clickedOptions.push(match.option);
           selected.push(optionText(match.option));
-          await wait(260);
+          await waitForSelectionSettled(session, element, targetValue, key, match.option, beforeClick, level < path.length - 1 ? 520 : 360);
           if (level < path.length - 1 && !(await refreshedOptions(session, 450)).length) {
             click(session.trigger);
-            await wait(120);
+            await waitForSelectionSettled(session, element, targetValue, key, null, beforeClick, 160);
           }
         }
       }
 
       const confirm = confirmationButton(session);
       if (confirm) {
+        const beforeConfirm = selectionSignature(session, element, session.trigger);
         click(confirm);
-        await wait(180);
+        await waitForSelectionSettled(session, element, isLocation ? path.at(-1) || value : value, key, null, beforeConfirm, 360);
       }
       const verifyValue = isLocation ? path.at(-1) || value : value;
       const readbackOk = choiceVerified(element, session.trigger, verifyValue, key) || choiceVerified(element, session.trigger, value, key);
@@ -2440,21 +2523,21 @@
     }) || null;
   }
 
-  async function fillAtsxPeriodMonthDate(element, date, key = '') {
+  async function fillAtsxPeriodMonthDate(element, date, key = '', trace = null) {
     if (date.day) return null;
     const target = atsxPeriodTarget(element, key);
     if (!target) return null;
     if (atsxPeriodLabelRead(target.label) === date.monthIso) {
       return remember(element, { ok: true, type: 'atsx-period-month', status: 'already_satisfied', actual: date.monthIso, reason: '' });
     }
-    const session = await probe(target.label, 800);
+    const session = await timedStep(trace, 'atsx.open-panel', () => probe(target.label, 800), { timeout: 800 });
     if (!session.ok) {
       session.close?.();
       return remember(element, withDynamicDom(session, { ok: false, type: 'atsx-period-month', reason: session.reason || 'ATSX 年月面板未打开' }, date.monthIso, key));
     }
     let ok = false;
     try {
-      const panel = await waitForAtsxPeriodMonthPanel(session, 900);
+      const panel = await timedStep(trace, 'atsx.wait-panel', () => waitForAtsxPeriodMonthPanel(session, 900), { timeout: 900 });
       if (!(panel instanceof Element)) {
         return remember(element, withDynamicDom(session, { ok: false, type: 'atsx-period-month', reason: 'ATSX 年月面板未出现' }, date.monthIso, key));
       }
@@ -2462,14 +2545,18 @@
       if (!(yearItem instanceof Element)) {
         return remember(element, withDynamicDom(session, { ok: false, type: 'atsx-period-month', reason: `ATSX 年份列没有找到 ${date.year}` }, date.year, key));
       }
-      click(yearItem);
-      await wait(90);
+      await timedStep(trace, 'atsx.click-year', async () => {
+        click(yearItem);
+        await wait(90);
+        return true;
+      });
       const monthItem = atsxPeriodMonthPanelItem(panel, 1, date.month);
       if (!(monthItem instanceof Element)) {
         return remember(element, withDynamicDom(session, { ok: false, type: 'atsx-period-month', reason: `ATSX 月份列没有找到 ${date.month.padStart?.(2, '0') || date.month}` }, date.month, key));
       }
-      await clickDateComponentPart(monthItem, () => atsxPeriodLabelRead(target.label) === date.monthIso || !panel.isConnected || !visible(panel), 900);
-      await waitUntil(() => atsxPeriodLabelRead(target.label) === date.monthIso || !panel.isConnected || !visible(panel), 900, 35);
+      const accepted = () => atsxPeriodLabelRead(target.label) === date.monthIso || !panel.isConnected || !visible(panel);
+      const clicked = await clickDateComponentPart(monthItem, accepted, 900, trace, 'atsx.click-month');
+      if (!clicked) await timedStep(trace, 'atsx.verify-month-short', () => waitUntil(accepted, 260, 35), { timeout: 260 });
       const actual = atsxPeriodLabelRead(target.label);
       ok = actual === date.monthIso;
       return remember(element, withDynamicDom(session, { ok, type: 'atsx-period-month', actual, selected: `${date.year}-${date.month.padStart(2, '0')}`, reason: ok ? '' : 'ATSX 年月已点击，但对应起止标签没有回读到目标值' }, date.monthIso, key));
@@ -2479,15 +2566,32 @@
     }
   }
 
-  async function clickDateComponentPart(target, accepted, timeout = 650) {
-    if (!(target instanceof Element) || !visible(target)) return false;
+  async function clickDateComponentPart(target, accepted, timeout = 650, trace = null, name = 'date.click-part', options = {}) {
+    const started = performance.now();
+    if (!(target instanceof Element) || !visible(target)) {
+      pushTimingStep(trace, name, started, { ok: false, phase: 'not-visible', timeout });
+      return false;
+    }
     click(target);
     await waitUntil(accepted, timeout, 35);
-    if (accepted()) return true;
+    if (accepted()) {
+      pushTimingStep(trace, name, started, { ok: true, phase: 'synthetic', timeout });
+      return true;
+    }
+    if (options.trusted === false) {
+      pushTimingStep(trace, name, started, { ok: false, phase: 'synthetic-timeout', timeout });
+      return false;
+    }
     const trusted = await trustedClick(target);
-    if (!trusted?.ok) return false;
-    await waitUntil(accepted, Math.max(timeout, 900), 35);
-    return Boolean(accepted());
+    if (!trusted?.ok) {
+      pushTimingStep(trace, name, started, { ok: false, phase: 'trusted-failed', timeout, error: trusted?.error || '' });
+      return false;
+    }
+    const trustedTimeout = Number.isFinite(Number(options.trustedTimeout)) ? Number(options.trustedTimeout) : Math.max(timeout, 900);
+    await waitUntil(accepted, trustedTimeout, 35);
+    const ok = Boolean(accepted());
+    pushTimingStep(trace, name, started, { ok, phase: 'trusted', timeout, trustedTimeout });
+    return ok;
   }
 
   function monthNumberFromText(text) {
@@ -2567,10 +2671,10 @@
     return false;
   }
 
-  async function fillPhoenixMonthPanelDate(element, date, session) {
+  async function fillPhoenixMonthPanelDate(element, date, session, trace = null) {
     if (date.day) return null;
     const trigger = session.trigger;
-    const panel = await waitForDatePanel(session, (root) => root.querySelector('.phoenix-calendar-month-panel-year-select-content'), 420);
+    const panel = await timedStep(trace, 'phoenix-month.wait-panel', () => waitForDatePanel(session, (root) => root.querySelector('.phoenix-calendar-month-panel-year-select-content'), 420), { timeout: 420 });
     if (!panel) return null;
     const targetYear = Number(date.year);
     const yearNumber = () => Number(clean(panel.querySelector('.phoenix-calendar-month-panel-year-select-content')?.textContent).match(/(?:19|20)\d{2}/)?.[0]);
@@ -2580,7 +2684,7 @@
       const before = yearNumber();
       const arrow = targetYear < before ? previousYear() : nextYear();
       if (!(arrow instanceof Element)) return false;
-      const changed = await clickDateComponentPart(arrow, () => yearNumber() && yearNumber() !== before, 420);
+      const changed = await clickDateComponentPart(arrow, () => yearNumber() && yearNumber() !== before, 420, trace, 'phoenix-month.change-year', { trustedTimeout: 260 });
       if (!changed) return false;
     }
     if (yearNumber() !== targetYear) return false;
@@ -2588,14 +2692,15 @@
       .find((node) => visible(node) && monthTextMatches(node.textContent, date.month));
     const monthCell = month?.closest('[role="gridcell"]') || month;
     if (!(monthCell instanceof Element)) return false;
-    await clickDateComponentPart(monthCell, () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel), 900);
-    await waitForPanelAccepted(panel, element, trigger, date, 900);
+    const accepted = () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
+    const clicked = await clickDateComponentPart(monthCell, accepted, 260, trace, 'phoenix-month.click-month', { trustedTimeout: 260 });
+    if (!clicked) await timedStep(trace, 'phoenix-month.verify-short', () => waitForPanelAccepted(panel, element, trigger, date, 260), { timeout: 260 });
     return dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
   }
 
-  async function fillSdBasicPanelDate(element, date, session) {
+  async function fillSdBasicPanelDate(element, date, session, trace = null) {
     const trigger = session.trigger;
-    const panel = await waitForDatePanel(session, (root) => root.querySelector('[class*="basic-selector-year"],[class*="basic-year-container"]'), 360);
+    const panel = await timedStep(trace, 'sd-basic.wait-panel', () => waitForDatePanel(session, (root) => root.querySelector('[class*="basic-selector-year"],[class*="basic-year-container"]'), 360), { timeout: 360 });
     if (!panel) return null;
     const targetYear = Number(date.year);
     const targetMonth = Number(date.month);
@@ -2607,7 +2712,7 @@
       const before = yearNumber();
       const arrow = targetYear < before ? previousYear() : nextYear();
       if (!(arrow instanceof Element)) return false;
-      const changed = await clickDateComponentPart(arrow, () => yearNumber() && yearNumber() !== before, 450);
+      const changed = await clickDateComponentPart(arrow, () => yearNumber() && yearNumber() !== before, 450, trace, 'sd-basic.change-year', { trustedTimeout: 260 });
       if (!changed) return false;
     }
     if (yearNumber() && yearNumber() !== targetYear) return false;
@@ -2616,14 +2721,19 @@
       .filter((node) => visible(node) && clean(node.textContent).length <= 10)
       .find((node) => monthTextMatches(node.textContent, targetMonth));
     if (monthCell) {
-      await clickDateComponentPart(
+      const accepted = () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
+      const clicked = await clickDateComponentPart(
         monthCell.closest('[role="gridcell"],[role="option"],button,li') || monthCell,
-        () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel),
-        900
+        accepted,
+        260,
+        trace,
+        'sd-basic.click-month',
+        { trustedTimeout: 260 }
       );
-      await wait(160);
+      if (!clicked) await timedStep(trace, 'sd-basic.verify-month-short', () => waitUntil(accepted, 260, 35), { timeout: 260 });
+      await timedStep(trace, 'sd-basic.month-settle', () => wait(120).then(() => true));
       if (!date.day) {
-        await waitForPanelAccepted(panel, element, trigger, date, 900);
+        await timedStep(trace, 'sd-basic.accept-month-short', () => waitForPanelAccepted(panel, element, trigger, date, 260), { timeout: 260 });
         return dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
       }
     } else {
@@ -2641,7 +2751,7 @@
         const targetIndex = targetYear * 12 + targetMonth;
         const arrow = targetIndex < currentIndex ? previousMonth() : nextMonth();
         if (!(arrow instanceof Element)) return false;
-        const changed = await clickDateComponentPart(arrow, () => `${yearNumber()}-${currentMonthNumber()}` !== before, 420);
+        const changed = await clickDateComponentPart(arrow, () => `${yearNumber()}-${currentMonthNumber()}` !== before, 420, trace, 'sd-basic.change-month', { trustedTimeout: 260 });
         if (!changed) return false;
       }
       if (!date.day) {
@@ -2650,7 +2760,7 @@
           .filter((node) => visible(node) && !/fade|disabled|outside|prev|next/i.test(String(node.className || '')))
           .find((node) => Number.isFinite(Number(clean(node.querySelector?.('[class*="basic-date-item"]')?.textContent || node.textContent))));
         if (!(submitDay instanceof Element)) return false;
-        await clickDateComponentPart(submitDay, () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel), 900);
+        await clickDateComponentPart(submitDay, () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel), 900, trace, 'sd-basic.submit-day');
         return dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
       }
     }
@@ -2660,18 +2770,18 @@
         .filter((node) => visible(node) && !/fade|disabled|outside|prev|next/i.test(String(node.className || '')))
         .find((node) => Number(clean(node.querySelector?.('[class*="basic-date-item"]')?.textContent || node.textContent)) === Number(date.day));
       if (!(dayCell instanceof Element)) return false;
-      await clickDateComponentPart(dayCell, () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel), 900);
-      await waitForPanelAccepted(panel, element, trigger, date, 900);
+      await clickDateComponentPart(dayCell, () => dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel), 900, trace, 'sd-basic.click-day');
+      await timedStep(trace, 'sd-basic.accept-day', () => waitForPanelAccepted(panel, element, trigger, date, 900), { timeout: 900 });
       return dateAccepted(element, trigger, date) || !panel.isConnected || !visible(panel);
     }
     return false;
   }
 
-  async function fillCalendarDate(element, date, session) {
+  async function fillCalendarDate(element, date, session, trace = null) {
     const trigger = session.trigger;
-    const phoenixMonth = await fillPhoenixMonthPanelDate(element, date, session);
+    const phoenixMonth = await fillPhoenixMonthPanelDate(element, date, session, trace);
     if (phoenixMonth !== null) return phoenixMonth;
-    const sdBasic = await fillSdBasicPanelDate(element, date, session);
+    const sdBasic = await fillSdBasicPanelDate(element, date, session, trace);
     if (sdBasic !== null) return sdBasic;
     if (date.day && await clickDateToken(trigger, /^$/, date.iso)) return dateRead(element, trigger) === date.iso;
     const headerPattern = /^((?:19|20)\d{2})\s*年?\s*(\d{1,2})\s*月$/;
@@ -2685,22 +2795,23 @@
       click(header);
       await wait(140);
     }
-    if (!await clickYearWithNavigation(session, date.year)) return false;
-    if (!await clickDateMonthToken(session, date.month)) return false;
+    if (!await timedStep(trace, 'calendar.select-year', () => clickYearWithNavigation(session, date.year))) return false;
+    if (!await timedStep(trace, 'calendar.select-month', () => clickDateMonthToken(session, date.month))) return false;
     if (date.day && !await clickDateToken(trigger, new RegExp(`^0?${date.day}(?:日|号)?$`), date.iso)) return false;
-    await waitUntil(() => dateAccepted(element, trigger, date), 900, 35);
+    await timedStep(trace, 'calendar.accept', () => waitUntil(() => dateAccepted(element, trigger, date), 900, 35), { timeout: 900 });
     return dateAccepted(element, trigger, date);
   }
 
   async function fillDate(element, value, key = '') {
     const date = parseDate(value);
     if (!date) return remember(element, { ok: false, type: 'date', reason: '资料中的日期格式无效' });
+    const trace = createTimingTrace('date');
     const initialTrigger = findTrigger(element) || element;
     if (dateAccepted(element, initialTrigger, date)) {
       return remember(element, { ok: true, type: 'date', status: 'already_satisfied', actual: dateRead(element, initialTrigger), reason: '' });
     }
-    const atsxPeriodMonth = await fillAtsxPeriodMonthDate(element, date, key);
-    if (atsxPeriodMonth) return atsxPeriodMonth;
+    const atsxPeriodMonth = await fillAtsxPeriodMonthDate(element, date, key, trace);
+    if (atsxPeriodMonth) return remember(element, withTiming(atsxPeriodMonth, trace));
     const compound = await fillCompoundDate(element, date, key);
     if (compound) return compound;
     if (element instanceof HTMLInputElement && element.type === 'date') {
@@ -2713,21 +2824,22 @@
       const ok = normalizeDate(element.value) === date.iso;
       return remember(element, { ok, type: 'text-date', actual: element.value, reason: ok ? '' : '文本日期框未接受目标格式' });
     }
-    const session = await probe(element, 650);
+    const session = await timedStep(trace, 'calendar.open-panel', () => probe(element, 650), { timeout: 650 });
     if (!session.ok) return remember(element, { ok: false, type: 'unknown-date', reason: session.reason });
-    const ok = await fillCalendarDate(element, date, session);
+    const ok = await fillCalendarDate(element, date, session, trace);
     return remember(element, { ok, type: 'calendar-date', actual: dateRead(element, session.trigger), reason: ok ? '' : '日历已操作，但回读日期与目标日期不一致' });
   }
 
   async function fillDate(element, value, key = '') {
     const date = parseDate(value);
     if (!date) return remember(element, { ok: false, type: 'date', reason: '资料中的日期格式无效' });
+    const trace = createTimingTrace('date');
     const initialTrigger = findTrigger(element) || element;
     if (dateAccepted(element, initialTrigger, date)) {
       return remember(element, { ok: true, type: 'date', status: 'already_satisfied', actual: dateRead(element, initialTrigger), reason: '' });
     }
-    const atsxPeriodMonth = await fillAtsxPeriodMonthDate(element, date, key);
-    if (atsxPeriodMonth) return atsxPeriodMonth;
+    const atsxPeriodMonth = await fillAtsxPeriodMonthDate(element, date, key, trace);
+    if (atsxPeriodMonth) return remember(element, withTiming(atsxPeriodMonth, trace));
     const compound = await fillCompoundDate(element, date, key);
     if (compound) return compound;
     if (element instanceof HTMLInputElement && element.type === 'month') {
@@ -2757,14 +2869,14 @@
       const ok = normalizeDate(element.value) === expected;
       return remember(element, { ok, type: 'text-date', actual: element.value, reason: ok ? '' : '文本日期框未接受目标格式' });
     }
-    const session = await probe(element, 800);
+    const session = await timedStep(trace, 'calendar.open-panel', () => probe(element, 800), { timeout: 800 });
     if (!session.ok) {
       session.close?.();
-      return remember(element, withDynamicDom(session, { ok: false, type: 'unknown-date', reason: session.reason }, date.monthIso, key));
+      return remember(element, withTiming(withDynamicDom(session, { ok: false, type: 'unknown-date', reason: session.reason }, date.monthIso, key), trace));
     }
     let finalOk = false;
     try {
-      const ok = await fillCalendarDate(element, date, session);
+      const ok = await fillCalendarDate(element, date, session, trace);
       const confirm = confirmationButton(session);
       if (confirm) {
         click(confirm);
@@ -2773,7 +2885,7 @@
       const actual = dateRead(element, session.trigger);
       const expected = date.day ? date.iso : date.monthIso;
       finalOk = ok || actual === expected;
-      return remember(element, withDynamicDom(session, {
+      return remember(element, withTiming(withDynamicDom(session, {
         ok: finalOk,
         type: 'calendar-date',
         status: finalOk ? 'success' : 'manual_required',
@@ -2781,7 +2893,7 @@
         actual,
         expected,
         reason: finalOk ? '' : '日历已操作，但回读日期与目标日期不一致，已保留页面值待人工审核'
-      }, expected, key));
+      }, expected, key), trace));
     } finally {
       if (!finalOk) dismissTransientPopup(element);
       session.close?.();

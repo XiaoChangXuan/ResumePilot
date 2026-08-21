@@ -38,6 +38,10 @@ function showResult({ message, error = false, info = false, logText = '', logNam
   const line = document.createElement('div');
   line.textContent = message;
   result.appendChild(line);
+  if (!logText) {
+    revokeLastLogUrl();
+    return;
+  }
   if (logText) {
     const linkLine = document.createElement('div');
     const link = document.createElement('a');
@@ -56,6 +60,14 @@ function errorLog(title, error) {
     '',
     error?.stack || error?.message || String(error)
   ].join('\n');
+}
+
+function errorSummary(error, limit = 160) {
+  const text = String(error?.message || error || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '未知错误';
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
 function responseLog(title, summary, payload) {
@@ -90,15 +102,25 @@ async function sendToPage(message, scripts = PAGE_SCRIPTS) {
     type: `${message.type}_V2`,
     protocol: PAGE_MESSAGE_PROTOCOL
   };
+  let firstError = null;
   try {
     const response = await chrome.tabs.sendMessage(tab.id, pageMessage);
     if (response === undefined) throw new Error('页面审计脚本尚未加载');
     return response;
-  } catch {
+  } catch (error) {
+    firstError = error;
     await injectPageScripts(tab.id, scripts);
-    const response = await chrome.tabs.sendMessage(tab.id, pageMessage);
-    if (response === undefined) throw new Error('Page audit script is not loaded or is out of date. Reload the extension and refresh the page.');
-    return response;
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, pageMessage);
+      if (response === undefined) throw new Error('Page audit script is not loaded or is out of date. Reload the extension and refresh the page.');
+      return response;
+    } catch (secondError) {
+      throw new Error([
+        '页面脚本通信失败',
+        `首次发送：${errorSummary(firstError)}`,
+        `注入后重试：${errorSummary(secondError)}`
+      ].join('；'));
+    }
   }
 }
 
@@ -198,6 +220,37 @@ function msText(ms) {
   return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`;
 }
 
+function fillProgressSummary(response = {}) {
+  const stats = response.progress?.currentEmpty;
+  if (stats && Number(stats.total || 0) > 0) {
+    const skipped = Number(stats.skipped || 0);
+    return `空值字段：已处理或跳过 ${stats.processed || 0}/${stats.total || 0}${skipped ? `，未映射跳过 ${skipped}` : ''}`;
+  }
+  if (stats && Number(stats.total || 0) === 0) return '空值字段：当前页没有需要补写的空值字段';
+  const totals = response.totals || {};
+  if (Number(totals.required || 0) > 0) return `字段：完成 ${totals.completed || 0}/${totals.required || 0}`;
+  return '字段：没有需要处理的字段';
+}
+
+function fillCompletionMessage(response = {}) {
+  if (response.canceled) return '已暂停/取消本次填写。';
+  const totals = response.totals || {};
+  const stats = response.progress?.currentEmpty;
+  if (response.complete) {
+    if (stats && Number(stats.total || 0) > 0) {
+      return `填写完成：已处理或跳过 ${stats.processed || 0}/${stats.total || 0}。`;
+    }
+    if (stats && Number(stats.total || 0) === 0) {
+      return '填写完成：当前页没有需要补写的空值字段。';
+    }
+    if (Number(totals.required || 0) > 0) {
+      return `填写完成：${totals.completed || 0}/${totals.required || 0}。`;
+    }
+    return '填写完成：当前页没有需要处理的字段。';
+  }
+  return `填写已结束，还有 ${totals.omitted || 0} 个字段需要检查。`;
+}
+
 function performanceSummary(performance) {
   if (!performance || typeof performance !== 'object') return '';
   const lines = [];
@@ -206,13 +259,65 @@ function performanceSummary(performance) {
   }
   if (performance.fieldStats) {
     const stats = performance.fieldStats;
-    lines.push(`字段扫描：页面字段 ${stats.totalControls || 0}，映射可填 ${stats.mappedFillable || 0}，未映射跳过 ${stats.unmappedSkipped || 0}`);
+    lines.push(`字段扫描：页面字段 ${stats.totalControls || 0}，映射可填 ${stats.mappedFillable || 0}，空值待填 ${stats.currentEmptyMapped || 0}，已有值跳过 ${stats.currentFilledMapped || 0}，未映射跳过 ${stats.unmappedSkipped || 0}`);
   }
   if (performance.byOperation?.length) {
     lines.push(`操作耗时：${performance.byOperation.map((item) => `${item.operation || 'unknown'} ${item.count || 0}项/${msText(item.ms)}`).join('，')}`);
   }
+  if (performance.byComponent?.length) {
+    lines.push(`组件耗时：\n${performance.byComponent.slice(0, 10).map((item) => {
+      const slowest = item.slowestField || item.slowestRef ? `，最慢 ${item.slowestField || item.slowestRef} ${msText(item.maxMs)}` : '';
+      return `${item.component || 'unknown'}（${item.operation || 'unknown'}）：${item.count || 0}项，总 ${msText(item.ms)}，平均 ${msText(item.avgMs)}${slowest}`;
+    }).join('\n')}`);
+  }
   if (performance.slowFields?.length) {
-    lines.push(`最慢字段：\n${performance.slowFields.slice(0, 6).map((item) => `${item.field || item.ref} → ${item.profilePath || ''}（${item.operation || item.legacyType || ''}，${msText(item.ms)}，${item.status || ''}${item.reason ? `：${item.reason}` : ''}）`).join('\n')}`);
+    lines.push(`最慢字段：\n${performance.slowFields.slice(0, 10).map((item) => `${item.field || item.ref} → ${item.profilePath || ''}（${item.controlKind || item.operation || item.legacyType || ''}，${msText(item.ms)}，${item.status || ''}${item.reason ? `：${item.reason}` : ''}）`).join('\n')}`);
+  }
+  if (performance.slowSteps?.length) {
+    lines.push(`最慢组件步骤：\n${performance.slowSteps.slice(0, 15).map((item) => {
+      const meta = [
+        item.phase ? `phase=${item.phase}` : '',
+        item.ok === undefined ? '' : `ok=${item.ok}`,
+        item.timeout ? `timeout=${item.timeout}` : '',
+        item.trustedTimeout ? `trustedTimeout=${item.trustedTimeout}` : '',
+        item.error ? `error=${item.error}` : ''
+      ].filter(Boolean).join(', ');
+      return `${item.field || item.ref || ''} → ${item.profilePath || ''} | ${item.component || item.controlKind || item.legacyType || item.operation || ''}.${item.step || ''} | ${msText(item.ms)}${meta ? ` | ${meta}` : ''}`;
+    }).join('\n')}`);
+  }
+  return lines.join('\n');
+}
+
+function debugTraceSummary(debug) {
+  if (!debug?.enabled) return '';
+  const entries = Array.isArray(debug.entries) ? debug.entries : [];
+  const fieldResults = entries.filter((item) => item.event === 'field-result');
+  const suspicious = fieldResults.filter((item) => !['filled', 'kept-existing'].includes(item.status || '')).slice(-12);
+  const recent = entries.slice(-24);
+  const lines = [
+    `Debug run: ${debug.runId || ''}`,
+    `Trace entries: ${entries.length}; field results: ${fieldResults.length}; suspicious: ${suspicious.length}`
+  ];
+  if (suspicious.length) {
+    lines.push('Suspicious fields:');
+    lines.push(suspicious.map((item) => [
+      item.stage || item.operation || '',
+      item.field || item.ref || '',
+      item.profilePath || '',
+      item.status || '',
+      item.reason || '',
+      item.ms ? `${item.ms}ms` : ''
+    ].filter(Boolean).join(' | ')).join('\n'));
+  }
+  if (recent.length) {
+    lines.push('Recent trace:');
+    lines.push(recent.map((item) => [
+      item.event,
+      item.stage || item.operation || '',
+      item.field || item.ref || '',
+      item.status || '',
+      item.reason || ''
+    ].filter(Boolean).join(' | ')).join('\n'));
   }
   return lines.join('\n');
 }
@@ -220,7 +325,8 @@ function performanceSummary(performance) {
 function fillSummary(response) {
   if (response.canceled) {
     const performance = performanceSummary(response.performance);
-    return [`已取消本次填写。`, response.message || '', performance ? `执行统计：\n${performance}` : ''].filter(Boolean).join('\n');
+    const debug = debugTraceSummary(response.debug);
+    return [`已取消本次填写。`, response.message || '', debug ? `Debug trace:\n${debug}` : '', performance ? `执行统计：\n${performance}` : ''].filter(Boolean).join('\n');
   }
   const totals = response.totals || {};
   const lines = [
@@ -228,12 +334,16 @@ function fillSummary(response) {
     `字段：完成 ${totals.completed || 0}/${totals.required || 0}，实际写入 ${totals.filled || 0}，待审核 ${totals.manualReview || 0}，遗漏 ${totals.omitted || 0}`,
     `经历段数：\n${structureSummary(response.structures || [])}`
   ];
+  const progress = fillProgressSummary(response);
+  if (progress) lines.splice(1, 0, progress);
   if (response.sequential?.length) lines.push(`顺序填写：\n${structureSummary(response.sequential)}`);
   if (response.omissions?.length) {
     lines.push(`前 8 个遗漏：\n${response.omissions.slice(0, 8).map((item) => `${item.field || item.ref} → ${item.profilePath || ''}（${item.status}${item.reason ? `：${item.reason}` : ''}）`).join('\n')}`);
   }
   const dynamic = dynamicDomSummary(response.omissions || []);
   if (dynamic) lines.push(`动态弹层摘要：\n${dynamic}`);
+  const debug = debugTraceSummary(response.debug);
+  if (debug) lines.push(`Debug trace:\n${debug}`);
   const performance = performanceSummary(response.performance);
   if (performance) lines.push(`执行统计：\n${performance}`);
   return lines.join('\n');
@@ -243,20 +353,22 @@ $('#auditButton').addEventListener('click', async () => {
   const button = $('#auditButton');
   button.disabled = true;
   button.textContent = '…';
+  const debug = Boolean($('#debugInput')?.checked);
   try {
     const report = await sendToPage({ type: 'RESUME_PAGE_AUDIT_SHOW' });
     const summary = `${reportSummary(report)}\n详细结果已显示在网页右侧。`;
     showResult({
       message: '解析完成，详细结构已显示在页面右侧。',
       info: true,
-      logText: responseLog('页面解析日志', summary, report),
+      logText: debug ? responseLog('页面解析日志', summary, report) : '',
       logName: `resume-page-audit-${timestampForFile()}.txt`
     });
   } catch (error) {
+    const reason = errorSummary(error);
     showResult({
-      message: '页面解析失败，详细原因已写入日志。',
+      message: debug ? `页面解析失败：${reason}。详细原因已写入日志。` : `页面解析失败：${reason}。`,
       error: true,
-      logText: errorLog('页面解析失败', error),
+      logText: debug ? errorLog('页面解析失败', error) : '',
       logName: `resume-page-audit-error-${timestampForFile()}.txt`
     });
   } finally {
@@ -265,33 +377,42 @@ $('#auditButton').addEventListener('click', async () => {
   }
 });
 
+$('#debugInput')?.addEventListener('change', async (event) => {
+  if (event.target.checked) return;
+  try {
+    await sendToPage({ type: 'RESUME_AUTOFILL_DEBUG_OVERLAY_CLEAR' }, PAGE_SCRIPTS);
+  } catch (_) {}
+});
+
 $('#fillButton').addEventListener('click', async () => {
   const button = $('#fillButton');
   button.disabled = true;
   button.textContent = '正在填写…';
+  let debug = Boolean($('#debugInput')?.checked);
   try {
     const profile = await loadProfile();
     const overwrite = Boolean($('#overwriteInput')?.checked);
-    const response = await sendToPage({ type: 'RESUME_PROFILE_FILL_CURRENT_PAGE', profile, overwrite }, FILL_SCRIPTS);
+    debug = Boolean($('#debugInput')?.checked);
+    const response = await sendToPage({ type: 'RESUME_PROFILE_FILL_CURRENT_PAGE', profile, overwrite, debug }, FILL_SCRIPTS);
+    if (!response?.ok && response?.debug?.enabled) {
+      const trace = debugTraceSummary(response.debug);
+      throw new Error([response.error || '填写当前页面失败', trace ? `Debug trace:\n${trace}` : ''].filter(Boolean).join('\n'));
+    }
     if (!response?.ok) throw new Error(response?.error || '填写当前页面失败');
     const summary = fillSummary(response);
-    const totals = response.totals || {};
-    const message = response.canceled
-      ? '已暂停/取消本次填写。'
-      : response.complete
-        ? `填写完成：${totals.completed || 0}/${totals.required || 0}。`
-        : `填写已结束，还有 ${totals.omitted || 0} 个字段需要检查。`;
+    const message = fillCompletionMessage(response);
     showResult({
       message,
       error: !response.complete && !response.canceled,
-      logText: responseLog('当前页面填写日志', summary, response),
+      logText: debug ? responseLog('当前页面填写日志', summary, response) : '',
       logName: `resume-autofill-${timestampForFile()}.txt`
     });
   } catch (error) {
+    const reason = errorSummary(error);
     showResult({
-      message: '填写当前页面失败，详细原因已写入日志。',
+      message: debug ? `填写当前页面失败：${reason}。详细原因已写入日志。` : `填写当前页面失败：${reason}。`,
       error: true,
-      logText: errorLog('填写当前页面失败', error),
+      logText: debug ? errorLog('填写当前页面失败', error) : '',
       logName: `resume-autofill-error-${timestampForFile()}.txt`
     });
   } finally {

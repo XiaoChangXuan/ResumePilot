@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ResumePilot 简历机器人",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "本地保存求职资料，解析招聘页面结构并安全填写当前页。",
   "icons": {
     "16": "icons/chrome-16.png",

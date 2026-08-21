@@ -14,6 +14,42 @@ Topics:
 chrome-extension, edge-extension, resume, autofill, job-application, browser-extension, local-first
 ```
 
+## 0.0.2 Release
+
+Title:
+
+```text
+0.0.2
+```
+
+Body:
+
+```markdown
+ResumePilot 0.0.2 focuses on reliability, debuggability, and safer incremental autofill.
+
+### Highlights
+
+- Added field-level timeout and module timeout behavior so stuck controls are skipped instead of blocking the whole run.
+- Improved pause/cancel UI feedback and removed the unsafe pause action from the completion state.
+- Added debug overlay mode for mapped success, mapped failure, value mismatch, and unmapped fields.
+- Added current-value detection and filtering so already-filled fields can be inspected and skipped.
+- Improved current-value detection for Phoenix select/date/radio widgets and Moka/SD year-month range widgets.
+- Added debug trace export with field timing and slow-step details when debug mode is enabled.
+- Improved progress calculation based on processed or skipped empty fields.
+- Reduced custom select/list latency by waiting for component state changes instead of fixed sleeps.
+- Preserved mismatched writes for manual review instead of reverting page values.
+
+### Architecture Direction
+
+This release starts moving the project toward a layered form interaction engine:
+
+HTML Parser -> Field Semantic Mapping -> Component Detector -> Component Adapter -> Interaction Runtime -> Verification.
+
+The component learning workflow is failure-driven:
+
+Failed component -> observe manual operation -> compare mature plugins -> extract state machine -> write Behavior Spec -> implement Adapter -> verify -> add regression sample.
+```
+
 ## 0.0.1 Release
 
 Title:

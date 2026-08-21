@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '0.9.43';
+  const VERSION = '0.9.49';
   const MESSAGE_PROTOCOL = 2;
   if (globalThis.__resumePageAuditVersion === VERSION) return;
   globalThis.__resumePageAuditVersion = VERSION;
@@ -9,6 +9,10 @@
   const TARGET_CLASS = 'resume-page-audit-target';
   const OVERLAY_CLASS = 'resume-page-audit-overlay';
   const OVERLAY_TARGET_CLASS = 'resume-page-audit-overlay--target';
+  const AUTOFILL_DEBUG_OVERLAY_CLASS = 'resume-autofill-debug-overlay';
+  const FILLABLE_FIELD_OPERATION_GROUPS = new Set(['direct-write', 'input-select', 'closed-select']);
+  const DEBUG_FILL_OPERATION_GROUPS = FILLABLE_FIELD_OPERATION_GROUPS;
+  const PLACEHOLDER_VALUE = /^(?:\u8bf7\u9009\u62e9|\u8bf7\u8f93\u5165|\u9009\u62e9|\u641c\u7d22|select|choose|yyyy|mm|dd|\u2014|-)?$/i;
   const MAX_INTERACTIVE = 1200;
   const MAX_SEMANTIC_TEXTS = 600;
   const MAX_POINTER_SCAN = 15000;
@@ -490,9 +494,54 @@
     }
   }
 
-  function resolveProfileMapping(fieldLabel, matchedKey, context = '', moduleTitle = '') {
+  function mappingSignalsForElement(element, extra = {}) {
+    if (!(element instanceof Element)) return extra;
+    const descendantWith = (selector, attr) => element.matches(selector)
+      ? element.getAttribute(attr) || ''
+      : element.querySelector(selector)?.getAttribute(attr) || '';
+    return {
+      ...extra,
+      placeholder: extra.placeholder || descendantWith('[placeholder]', 'placeholder'),
+      ariaLabel: extra.ariaLabel || descendantWith('[aria-label]', 'aria-label'),
+      title: extra.title || descendantWith('[title]', 'title'),
+      name: extra.name || descendantWith('[name]', 'name'),
+      id: extra.id || element.id || '',
+      className: extra.className || classSummary(element) || rawClassName(element) || ''
+    };
+  }
+
+  function resolveProfileMapping(fieldLabel, matchedKey, context = '', moduleTitle = '', signals = {}) {
     const profileSchema = globalThis.ResumeProfileSchema;
-    if (!profileSchema) return { path: '', candidates: [] };
+    if (!profileSchema) return { path: '', candidates: [], candidateDetails: [], evidence: [], score: 0, strategy: 'schema-missing' };
+    const makeResult = (path, candidates = [], evidence = [], baseScore = 0, strategy = '') => {
+      const unique = [...new Set(candidates.filter(Boolean))];
+      const score = path ? baseScore || 100 : unique.length ? Math.min(baseScore || 60, 75) : 0;
+      return {
+        path: path || '',
+        candidates: unique,
+        candidateDetails: unique.map((candidate, index) => ({
+          path: candidate,
+          score: candidate === path ? score : Math.max(10, score - ((index + 1) * 8)),
+          reason: candidate === path ? evidence.join(' + ') || 'selected' : evidence.join(' + ') || 'candidate'
+        })),
+        evidence,
+        score,
+        strategy: strategy || (path ? 'legacy-rule' : unique.length ? 'legacy-rule-ambiguous' : 'legacy-rule-unmapped')
+      };
+    };
+    if (typeof profileSchema.resolveMapping === 'function') {
+      const scored = profileSchema.resolveMapping({ fieldLabel, matchedKey, context, moduleTitle, signals });
+      if (scored?.path || scored?.candidates?.length) {
+        return {
+          path: scored.path || '',
+          candidates: scored.candidates || [],
+          candidateDetails: scored.candidateDetails || [],
+          evidence: scored.evidence || [],
+          score: scored.score || 0,
+          strategy: scored.strategy || (scored.path ? 'schema-score' : 'schema-score-ambiguous')
+        };
+      }
+    }
     const normalized = profileSchema.normalizeAlias(fieldLabel);
     let candidates = normalized ? profileSchema.aliasIndex
       .filter((item) => item.normalized === normalized)
@@ -506,21 +555,21 @@
     };
     const derivedPath = highestEducationDerived[matchedKey] || '';
     if (moduleSection === 'basic' && derivedPath) {
-      return { path: derivedPath, candidates: [derivedPath] };
+      return makeResult(derivedPath, [derivedPath], ['module-basic', 'derived-highest-education', matchedKey].filter(Boolean), 96);
     }
     const moduleAgnosticPaths = {
       acceptsAdjustment: 'jobPreferences.acceptsAdjustment',
       recruitmentSource: 'jobPreferences.recruitmentSource'
     };
     const moduleAgnosticPath = moduleAgnosticPaths[matchedKey] || '';
-    if (moduleAgnosticPath) return { path: moduleAgnosticPath, candidates: [moduleAgnosticPath] };
+    if (moduleAgnosticPath) return makeResult(moduleAgnosticPath, [moduleAgnosticPath], ['module-agnostic', matchedKey].filter(Boolean), 94);
     const moduleOverride = moduleSection && matchedKey
       ? profileSchema.moduleFieldOverrides?.[moduleSection]?.[matchedKey] || ''
       : '';
-    if (moduleOverride) return { path: moduleOverride, candidates: [moduleOverride] };
+    if (moduleOverride) return makeResult(moduleOverride, [moduleOverride], ['module-override', moduleSection, matchedKey].filter(Boolean), 93);
     if (moduleSection) {
       const contextual = candidates.filter((path) => profileSchema.profilePathInSection?.(path, moduleSection));
-      if (contextual.length === 1) return { path: contextual[0], candidates: contextual };
+      if (contextual.length === 1) return makeResult(contextual[0], contextual, ['exact-alias', 'module-section', moduleSection].filter(Boolean), 90);
       if (contextual.length) candidates = contextual;
     }
     const sectionByContext = {
@@ -532,17 +581,17 @@
     };
     const contextPrefix = sectionByContext[context];
     const contextual = contextPrefix ? candidates.filter((path) => path.startsWith(contextPrefix)) : [];
-    if (contextual.length === 1) return { path: contextual[0], candidates: contextual };
+    if (contextual.length === 1) return makeResult(contextual[0], contextual, ['exact-alias', 'context-prefix', context].filter(Boolean), 88);
     if (contextual.length) candidates = contextual;
     const legacyPath = profileSchema.legacyKeyToPath?.[matchedKey] || '';
     if (legacyPath && (!moduleSection || profileSchema.profilePathInSection?.(legacyPath, moduleSection))) {
-      return { path: legacyPath, candidates: [legacyPath] };
+      return makeResult(legacyPath, [legacyPath], ['legacy-key', matchedKey].filter(Boolean), 82);
     }
     const patternPath = profileSchema.patternRules?.find((rule) => rule.pattern.test(fieldLabel))?.path || '';
     if (patternPath && (!moduleSection || profileSchema.profilePathInSection?.(patternPath, moduleSection))) {
-      return { path: patternPath, candidates: [patternPath] };
+      return makeResult(patternPath, [patternPath], ['pattern-rule'].filter(Boolean), 76);
     }
-    return { path: candidates.length === 1 ? candidates[0] : '', candidates };
+    return makeResult(candidates.length === 1 ? candidates[0] : '', candidates, ['exact-alias'].filter(Boolean), candidates.length === 1 ? 72 : 60);
   }
 
   function moduleContextForTitle(moduleTitle) {
@@ -581,7 +630,12 @@
         : isRangeDateEndpoint && item.matchedKey
           ? item.matchedKey
           : matchKey(label, context) || item.matchedKey || '';
-      const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '');
+      const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '', mappingSignalsForElement(element, {
+        text: item.text || '',
+        displayName: item.displayName || '',
+        fieldLabel: item.fieldLabel || '',
+        profilePath: item.profilePath || ''
+      }));
       const repeatBinding = element instanceof Element
         ? repeatBindingDetails(element, profileMapping.path, context)
         : { repeatSection: '', repeatIndex: 0, repeatGroup: '' };
@@ -591,6 +645,10 @@
       if (!item.compoundRole && nearestLabel) item.fieldBlockLabel = nearestLabel;
       item.profilePath = profileMapping.path;
       item.profilePathCandidates = profileMapping.candidates;
+      item.profilePathCandidateDetails = profileMapping.candidateDetails;
+      item.mappingEvidence = profileMapping.evidence;
+      item.mappingScore = profileMapping.score;
+      item.mappingStrategy = profileMapping.strategy;
       item.mappingStatus = profileMapping.path ? 'mapped' : profileMapping.candidates.length ? 'ambiguous' : 'unmapped';
       item.repeatSection = repeatBinding.repeatSection;
       item.repeatIndex = repeatBinding.repeatIndex || item.recordIndex || (profileMapping.path.includes('[]') ? Number(item.fieldIndex || 0) : 0);
@@ -768,11 +826,16 @@
   }
 
   function setInferredDateEndpoint(item, role, datePart, groupKey, precision) {
+    const element = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
     const context = item.context || moduleContextForTitle(item.moduleTitle) || sectionContext(sourceElementMap.get(item.ref) || elementMap.get(item.ref)) || '';
     const key = rangeDateKeyForContext(role, context);
     const label = dateRangeLabelBase(item) || FIELD_LABEL_BY_KEY[key] || (role === 'start' ? FIELD_LABEL_BY_KEY.periodStartDate : FIELD_LABEL_BY_KEY.periodEndDate);
-    const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '');
-    const element = sourceElementMap.get(item.ref) || elementMap.get(item.ref);
+    const profileMapping = resolveProfileMapping(label, key, context, item.moduleTitle || '', mappingSignalsForElement(element, {
+      text: item.text || '',
+      displayName: item.displayName || '',
+      fieldLabel: item.fieldLabel || '',
+      profilePath: item.profilePath || ''
+    }));
     const repeatBinding = element instanceof Element
       ? repeatBindingDetails(element, profileMapping.path, context)
       : { repeatSection: '', repeatIndex: 0, repeatGroup: '' };
@@ -782,6 +845,10 @@
     item.matchedKey = key;
     item.profilePath = profileMapping.path;
     item.profilePathCandidates = profileMapping.candidates;
+    item.profilePathCandidateDetails = profileMapping.candidateDetails;
+    item.mappingEvidence = profileMapping.evidence;
+    item.mappingScore = profileMapping.score;
+    item.mappingStrategy = profileMapping.strategy;
     item.mappingStatus = profileMapping.path ? 'mapped' : profileMapping.candidates.length ? 'ambiguous' : 'unmapped';
     item.repeatSection = repeatBinding.repeatSection || item.repeatSection || '';
     item.repeatIndex = repeatBinding.repeatIndex || item.repeatIndex || item.recordIndex || 0;
@@ -1000,6 +1067,30 @@
       const wrappingLabel = option.closest('label')?.textContent || '';
       return cleanText(phoenixText || udText || labels || wrappingLabel || option.getAttribute('aria-label') || option.textContent);
     }).filter(Boolean))];
+  }
+
+  function phoenixRadioOptionText(option) {
+    if (!(option instanceof Element)) return '';
+    return cleanText(option.querySelector?.('.phoenix-radio__radio-text')?.textContent
+      || option.getAttribute?.('aria-label')
+      || option.textContent
+      || '');
+  }
+
+  function phoenixRadioSelectedText(element) {
+    if (!(element instanceof Element)) return '';
+    const group = element.matches?.('.phoenix-radio-group')
+      ? element
+      : element.closest?.('.phoenix-radio-group') || element.querySelector?.('.phoenix-radio-group');
+    if (!(group instanceof Element) || !visible(group)) return '';
+    const options = [...group.querySelectorAll('.phoenix-radio-group__radioItem,.phoenix-radio')];
+    const selected = options.find((option) => {
+      const className = rawClassName(option);
+      return /phoenix-radio--checked|phoenix-radio__circle-wrapper--checked|phoenix-radio__dot--checked/.test(className)
+        || option.getAttribute?.('aria-checked') === 'true'
+        || Boolean(option.querySelector?.('.phoenix-radio--checked,.phoenix-radio__circle-wrapper--checked,.phoenix-radio__dot--checked,[aria-checked="true"]'));
+    });
+    return phoenixRadioOptionText(selected);
   }
 
   function atsxPeriodEndpoint(element, fallbackContext = '') {
@@ -2870,6 +2961,172 @@
     });
   }
 
+  function selectedTextFromElement(element) {
+    if (!(element instanceof Element)) return '';
+    const phoenixRadioText = phoenixRadioSelectedText(element);
+    if (phoenixRadioText) return phoenixRadioText;
+    const selector = [
+      '[aria-checked="true"]',
+      '[aria-selected="true"]',
+      'input:checked',
+      'option:checked',
+      '.is-selected',
+      '.is-active',
+      '.selected',
+      '.checked',
+      '[class*="selected"]',
+      '[class*="Selected"]',
+      '[class*="checked"]',
+      '[class*="Checked"]',
+      '[class*="in-checked-path"]'
+    ].join(',');
+    const selected = element.matches(selector) ? element : element.querySelector(selector);
+    if (!selected || !visible(selected)) return '';
+    if (selected.matches?.('input[type="checkbox"],input[type="radio"]')) {
+      return cleanText(directLabelText(selected) || selected.value || 'checked');
+    }
+    return cleanText(selected.textContent || selected.value || selected.getAttribute?.('aria-label') || '');
+  }
+
+  function selectedValueCandidates(element) {
+    if (!(element instanceof Element)) return [];
+    const selector = [
+      '.phoenix-button__content',
+      '.phoenix-select__singleValue',
+      '.phoenix-select__multipleValue',
+      '.phoenix-select__tag',
+      '.phoenix-select__tipEle',
+      '.phoenix-select__calcEle',
+      '.phoenix-select__placeHolder',
+      '.ant-select-selection-item',
+      '.ant-select-selection-selected-value',
+      '.atsx-select-selection-item',
+      '.atsx-select-selection-selected-value',
+      '.el-select__selected-item',
+      '.el-select__tags-text',
+      '.el-cascader__tags .el-tag__content',
+      '.mtd-select-selected-value',
+      '.ud__select-selection-item',
+      '.ud__select-selected-item',
+      '[class*="display-value"]',
+      '[class*="DisplayValue"]',
+      '[class*="selected-value"]',
+      '[class*="SelectedValue"]',
+      '[class*="selectedValue"]',
+      '[class*="singleValue"]',
+      '[class*="SingleValue"]',
+      '[class*="selection-item"]',
+      '[class*="SelectionItem"]',
+      '[class*="selector-item"]',
+      '[class*="SelectorItem"]',
+      '[class*="select-selection-item"]',
+      '[class*="SelectSelectionItem"]'
+    ].join(',');
+    return [
+      ...(element.matches(selector) ? [element] : []),
+      ...element.querySelectorAll(selector)
+    ].filter((node, index, nodes) => nodes.indexOf(node) === index && visible(node));
+  }
+
+  function displayedValueFromElement(element) {
+    if (!(element instanceof Element)) return '';
+    const values = selectedValueCandidates(element)
+      .map((node) => cleanText(node.textContent || node.value || node.getAttribute?.('title') || node.getAttribute?.('aria-label') || ''))
+      .filter(Boolean);
+    return cleanText([...new Set(values)].join(' / '));
+  }
+
+  function directControlCurrentValue(element) {
+    if (!(element instanceof Element)) return '';
+    if (element.matches('select')) {
+      const selectedOptions = [...element.selectedOptions || []].map((option) => cleanText(option.textContent || option.value)).filter(Boolean);
+      return cleanText(selectedOptions.join(' / ') || element.value);
+    }
+    if (element.matches('input[type="checkbox"],input[type="radio"]')) {
+      return element.checked ? cleanText(directLabelText(element) || element.value || 'checked') : '';
+    }
+    if (element.matches('input,textarea')) return cleanText(element.value);
+    if (element.matches('[contenteditable]:not([contenteditable="false"])')) return cleanText(element.textContent);
+    return '';
+  }
+
+  function shouldReadSyntheticValueWithEmptyControls(element) {
+    const classes = rawClassName(element);
+    const role = String(element.getAttribute('role') || '').toLowerCase();
+    return role === 'combobox'
+      || element.getAttribute('aria-haspopup') === 'listbox'
+      || selectRoot(element) === element
+      || /select|cascader|dropdown|picker|calendar|date|phoenix|ant-select|el-select|mtd-select|ud__select|atsx-select|sd-Select/i.test(classes);
+  }
+
+  function hasScopedCurrentValueRoot(element) {
+    if (!(element instanceof Element)) return false;
+    const scopedRoot = selectRoot(element) || phoenixButtonSelectRoot(element) || radioGroupRoot(element);
+    if (!(scopedRoot instanceof Element)) return false;
+    const fieldRoot = currentFieldContainer(element);
+    return scopedRoot !== fieldRoot;
+  }
+
+  function rawCurrentControlValue(element) {
+    if (!(element instanceof Element)) return '';
+    const directValue = directControlCurrentValue(element);
+    if (directValue || element.matches('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return directValue;
+    const descendantControls = [...element.querySelectorAll('input,textarea,select,[contenteditable]:not([contenteditable="false"])')]
+      .filter((control) => control instanceof Element && control.type !== 'hidden');
+    const descendantInputValue = descendantControls
+      .map((control) => directControlCurrentValue(control))
+      .find(Boolean) || '';
+    if (descendantControls.length && !descendantInputValue && !shouldReadSyntheticValueWithEmptyControls(element)) return '';
+    return descendantInputValue
+      || selectedTextFromElement(element)
+      || displayedValueFromElement(element)
+      || cleanText(element.getAttribute('aria-valuetext') || element.getAttribute('data-value') || element.getAttribute('value') || '');
+  }
+
+  function normalizeCurrentControlValue(value, item = {}) {
+    const text = cleanText(value);
+    if (!text || PLACEHOLDER_VALUE.test(text)) return '';
+    const labels = [item.fieldLabel, item.displayName].map(cleanText).filter(Boolean);
+    if (labels.some((label) => label === text)) return '';
+    return text;
+  }
+
+  function readCurrentControlValue(item) {
+    const source = sourceElementMap.get(item.ref);
+    const target = elementMap.get(item.ref);
+    const useFieldContainer = !hasScopedCurrentValueRoot(source) && !hasScopedCurrentValueRoot(target);
+    const candidates = [...new Set([
+      source,
+      target,
+      source instanceof Element ? selectRoot(source) : null,
+      target instanceof Element ? selectRoot(target) : null,
+      source instanceof Element ? phoenixButtonSelectRoot(source) : null,
+      target instanceof Element ? phoenixButtonSelectRoot(target) : null,
+      useFieldContainer && source instanceof Element ? currentFieldContainer(source) : null,
+      useFieldContainer && target instanceof Element ? currentFieldContainer(target) : null
+    ].filter((candidate) => candidate instanceof Element))];
+    for (const candidate of candidates) {
+      const value = normalizeCurrentControlValue(rawCurrentControlValue(candidate), item);
+      if (value) return value;
+    }
+    return normalizeCurrentControlValue(item.currentValue || '', item);
+  }
+
+  function annotateCurrentValues(items) {
+    const stats = { fillable: 0, filled: 0, empty: 0 };
+    for (const item of items) {
+      if (item.elementKind !== 'field' || !FILLABLE_FIELD_OPERATION_GROUPS.has(item.operationGroup)) continue;
+      stats.fillable += 1;
+      const currentValue = readCurrentControlValue(item);
+      item.currentValue = currentValue;
+      item.hasCurrentValue = Boolean(currentValue);
+      item.currentValueState = currentValue ? 'filled' : 'empty';
+      if (currentValue) stats.filled += 1;
+      else stats.empty += 1;
+    }
+    return stats;
+  }
+
   function recordElement(element, index) {
     const target = visualTarget(element);
     const preliminaryText = directLabelText(element) || actionDescription(element);
@@ -2893,8 +3150,13 @@
       ? compoundSemantic ? { label: compoundSemantic.label, source: compoundSemantic.source } : rangeEndpoint ? { label: rangeEndpoint.label, source: 'range-endpoint' } : fieldLabelDetails(element, finalKey)
       : { label: '', source: '' };
     const profileMapping = family === 'field'
-      ? resolveProfileMapping(labelDetails.label, finalKey, context)
-      : { path: '', candidates: [] };
+      ? resolveProfileMapping(labelDetails.label, finalKey, context, '', mappingSignalsForElement(element, {
+        text,
+        displayName: labelDetails.label || text || '',
+        fieldLabel: labelDetails.label || '',
+        placeholder: element.getAttribute('placeholder') || ''
+      }))
+      : { path: '', candidates: [], candidateDetails: [], evidence: [], score: 0, strategy: '' };
     const repeatBinding = repeatBindingDetails(element, profileMapping.path, context);
     const recordBinding = repeatRecordDetails(element);
     const action = actionType(element, family, kind, finalKey, text);
@@ -2929,6 +3191,10 @@
       matchedKey: finalKey,
       profilePath: profileMapping.path,
       profilePathCandidates: profileMapping.candidates,
+      profilePathCandidateDetails: profileMapping.candidateDetails,
+      mappingEvidence: profileMapping.evidence,
+      mappingScore: profileMapping.score,
+      mappingStrategy: profileMapping.strategy,
       repeatSection: repeatBinding.repeatSection,
       repeatIndex: repeatBinding.repeatIndex || recordBinding.recordIndex,
       repeatGroup: repeatBinding.repeatGroup || recordBinding.recordGroup,
@@ -2982,6 +3248,7 @@
   function clearAudit() {
     document.querySelector(PANEL_SELECTOR)?.remove();
     clearElementMarks();
+    clearAutofillDebugOverlay();
   }
 
   function choiceGroups() {
@@ -3289,6 +3556,7 @@
     assignFieldBindings(items);
     remapFieldProfiles(items);
     assignFieldBindings(items);
+    const currentValueStats = annotateCurrentValues(items);
     const textCandidates = queryAllDeep('label,legend,h1,h2,h3,h4,h5,h6,dt,th,[role="heading"],[aria-label]')
       .filter((element) => visible(element) && !element.closest(AUDIT_UI_SELECTOR));
     const semanticTexts = textCandidates.slice(0, MAX_SEMANTIC_TEXTS).map((element, index) => {
@@ -3308,7 +3576,7 @@
       schemaVersion: 2,
       version: VERSION,
       mode: 'audit-only',
-      privacy: { readsInputValues: false, readsLocalResumeData: false, performsPageActions: false },
+      privacy: { readsInputValues: true, readsInputValuesScope: 'fillable-controls-only', readsLocalResumeData: false, performsPageActions: false },
       page: { host: location.host, pathname: location.pathname, title: document.title },
       counts: {
         interactive: items.length,
@@ -3328,6 +3596,7 @@
         pointerScan: allElements.length > MAX_POINTER_SCAN
       },
       limitations,
+      currentValueStats,
       iframes: queryAllDeep('iframe').map((frame) => ({
         title: frame.title || '',
         name: frame.name || '',
@@ -3348,6 +3617,10 @@
         matchedKey: item.matchedKey,
         profilePath: item.profilePath,
         profilePathCandidates: item.profilePathCandidates,
+        profilePathCandidateDetails: item.profilePathCandidateDetails || [],
+        mappingEvidence: item.mappingEvidence || [],
+        mappingScore: item.mappingScore || 0,
+        mappingStrategy: item.mappingStrategy || '',
         repeatSection: item.repeatSection,
         repeatIndex: item.repeatIndex,
         repeatGroup: item.repeatGroup,
@@ -3363,6 +3636,10 @@
         options: item.options,
         compoundRole: item.compoundRole,
         subControlOf: item.subControlOf,
+        ...(Object.prototype.hasOwnProperty.call(item, 'hasCurrentValue') ? {
+          hasCurrentValue: item.hasCurrentValue,
+          currentValueState: item.currentValueState || 'empty'
+        } : {}),
         currentValue: item.currentValue,
         rangeRole: item.rangeRole,
         rangeGroup: item.rangeGroup,
@@ -3401,6 +3678,136 @@
     return overlay;
   }
 
+  function clearAutofillDebugOverlay() {
+    document.querySelectorAll(`.${AUTOFILL_DEBUG_OVERLAY_CLASS}`).forEach((overlay) => overlay.remove());
+  }
+
+  function debugOverlayKindForStatus(status = '') {
+    const value = cleanText(status).toLowerCase();
+    if (['filled', 'kept-existing'].includes(value)) return 'success';
+    if (['write-verify-failed', 'existing-different', 'manual-review', 'filled-needs-review'].includes(value)
+      || /mismatch|different|review|verify/i.test(value)) return 'mismatch';
+    if (value === 'unmapped') return 'unmapped';
+    return 'failed';
+  }
+
+  function compactDebugOverlayText(value, limit = 80) {
+    const text = cleanText(value);
+    return text.length > limit ? `${text.slice(0, limit)}...` : text;
+  }
+
+  function debugOverlayStatusLabel(kind, status) {
+    if (kind === 'success') return 'OK';
+    if (kind === 'mismatch') return 'MISMATCH';
+    if (kind === 'unmapped') return 'UNMAPPED';
+    return cleanText(status) || 'FAILED';
+  }
+
+  function createAutofillDebugOverlay(ref, kind, label, title = '') {
+    const overlay = createOverlay(ref, false);
+    if (!overlay) return null;
+    overlay.classList.add(AUTOFILL_DEBUG_OVERLAY_CLASS, `${AUTOFILL_DEBUG_OVERLAY_CLASS}--${kind}`);
+    overlay.dataset.resumeAutofillDebugKind = kind;
+    overlay.title = title;
+    const badge = document.createElement('span');
+    badge.className = `${AUTOFILL_DEBUG_OVERLAY_CLASS}__label`;
+    badge.textContent = compactDebugOverlayText(label);
+    overlay.appendChild(badge);
+    return overlay;
+  }
+
+  function debugDetailKey(item = {}) {
+    return [
+      item.profilePath || '',
+      item.repeatIndex || 0,
+      item.operation || item.legacyType || item.operationGroup || '',
+      item.compoundRole || '',
+      item.matchedKey || '',
+      item.field || item.displayName || ''
+    ].join('|');
+  }
+
+  function showAutofillDebugOverlay(payload = {}) {
+    clearAutofillDebugOverlay();
+    const report = payload.report || {};
+    const controls = Array.isArray(report.controls) ? report.controls : [];
+    const details = Array.isArray(payload.details) ? payload.details : [];
+    const detailByRef = new Map();
+    const detailByKey = new Map();
+    for (const detail of details) {
+      if (!detail || typeof detail !== 'object') continue;
+      if (detail.ref) detailByRef.set(detail.ref, detail);
+      const key = debugDetailKey(detail);
+      const bucket = detailByKey.get(key) || [];
+      bucket.push(detail);
+      detailByKey.set(key, bucket);
+    }
+    const takeDetail = (item) => {
+      const byRef = detailByRef.get(item.ref);
+      if (byRef) return byRef;
+      const bucket = detailByKey.get(debugDetailKey(item));
+      return bucket?.shift?.() || null;
+    };
+    const usedRefs = new Set();
+    let success = 0;
+    let mismatch = 0;
+    let failed = 0;
+    let unmapped = 0;
+
+    for (const item of controls) {
+      if (!DEBUG_FILL_OPERATION_GROUPS.has(item.operationGroup)) continue;
+      if (!item.profilePath) {
+        const label = `${debugOverlayStatusLabel('unmapped')} ${item.displayName || item.fieldLabel || item.text || item.ref}`;
+        createAutofillDebugOverlay(item.ref, 'unmapped', label, `${item.ref}\n${item.operationGroup || ''}\nunmapped`);
+        usedRefs.add(item.ref);
+        unmapped += 1;
+        continue;
+      }
+      const detail = takeDetail(item);
+      const status = detail?.status || 'not-processed';
+      const kind = debugOverlayKindForStatus(status);
+      const field = detail?.field || item.displayName || item.fieldLabel || item.text || item.ref;
+      const label = `${debugOverlayStatusLabel(kind, status)} ${field}`;
+      const title = [
+        item.ref,
+        item.profilePath,
+        `status: ${status}`,
+        detail?.reason ? `reason: ${detail.reason}` : '',
+        detail?.desired ? `desired: ${detail.desired}` : '',
+        detail?.after ? `after: ${detail.after}` : ''
+      ].filter(Boolean).join('\n');
+      createAutofillDebugOverlay(item.ref, kind, label, title);
+      usedRefs.add(item.ref);
+      if (detail?.ref) usedRefs.add(detail.ref);
+      if (kind === 'success') success += 1;
+      else if (kind === 'mismatch') mismatch += 1;
+      else failed += 1;
+    }
+
+    for (const detail of details) {
+      if (!detail?.ref || usedRefs.has(detail.ref)) continue;
+      const kind = debugOverlayKindForStatus(detail.status);
+      const label = `${debugOverlayStatusLabel(kind, detail.status)} ${detail.field || detail.ref}`;
+      const title = [
+        detail.ref,
+        detail.profilePath,
+        `status: ${detail.status || ''}`,
+        detail.reason ? `reason: ${detail.reason}` : '',
+        detail.desired ? `desired: ${detail.desired}` : '',
+        detail.after ? `after: ${detail.after}` : ''
+      ].filter(Boolean).join('\n');
+      if (createAutofillDebugOverlay(detail.ref, kind, label, title)) {
+        usedRefs.add(detail.ref);
+        if (kind === 'success') success += 1;
+        else if (kind === 'mismatch') mismatch += 1;
+        else failed += 1;
+      }
+    }
+
+    scheduleOverlaySync();
+    return { ok: true, success, mismatch, failed, unmapped, total: success + mismatch + failed + unmapped };
+  }
+
   function syncOverlayPositions() {
     overlaySyncFrame = 0;
     document.querySelectorAll(`.${OVERLAY_CLASS}`).forEach((overlay) => {
@@ -3437,7 +3844,9 @@
       'no-action': '只读/禁用'
     };
     const mappingLabels = { mapped: '已映射', ambiguous: '待确认', unmapped: '未映射' };
+    const currentValueStateLabels = { filled: '已有值', empty: '空值' };
     const fieldItems = report.interactiveElements.filter((item) => item.elementKind === 'field');
+    const currentValueItems = fieldItems.filter((item) => Object.prototype.hasOwnProperty.call(item, 'hasCurrentValue'));
     const interactiveByRef = new Map(report.interactiveElements.map((item) => [item.ref, item]));
     const mappingCounts = fieldItems.reduce((counts, item) => {
       counts[item.mappingStatus] = (counts[item.mappingStatus] || 0) + 1;
@@ -3447,6 +3856,15 @@
     const layoutIndexByName = new Map((report.moduleSummary || []).map((layout, index) => [layout.module, index]));
     const layoutNameForItem = (item) => item.structureTitle || item.moduleTitle || item.blockTitle || item.context || '';
     const parentLayoutForItem = (item) => item.structureTitle || item.blockTitle || item.moduleTitle || item.context || '';
+    const hasCurrentValueAttribute = (item) => Object.prototype.hasOwnProperty.call(item, 'hasCurrentValue');
+    const currentValuePreview = (item, limit = 72) => {
+      const text = cleanText(item.currentValue || '');
+      return text.length > limit ? `${text.slice(0, limit)}...` : text;
+    };
+    const currentValueLabel = (item) => {
+      if (!hasCurrentValueAttribute(item)) return '';
+      return item.hasCurrentValue ? `当前已有：${currentValuePreview(item)}` : '当前为空';
+    };
     const attributesForItem = (item) => [
       item.surfaceTitle,
       layoutNameForItem(item) ? '' : '布局未识别'
@@ -3483,6 +3901,13 @@
       actionType: actionTypeLabels[item.actionType] || item.actionType || '',
       mappingStatus: item.elementKind === 'field' ? (mappingLabels[item.mappingStatus] || item.mappingStatus) : '非填写字段',
       mappedField: item.elementKind === 'field' ? mappingTarget(item) : '',
+      mappingScore: item.elementKind === 'field' ? item.mappingScore || 0 : undefined,
+      mappingStrategy: item.elementKind === 'field' ? item.mappingStrategy || '' : undefined,
+      mappingEvidence: item.elementKind === 'field' ? item.mappingEvidence || [] : undefined,
+      profilePathCandidateDetails: item.elementKind === 'field' ? item.profilePathCandidateDetails || [] : undefined,
+      hasCurrentValue: hasCurrentValueAttribute(item) ? item.hasCurrentValue : undefined,
+      currentValueState: item.currentValueState || undefined,
+      currentValue: hasCurrentValueAttribute(item) ? item.currentValue || '' : undefined,
       matchedKey: item.matchedKey || '',
       recordIndex: item.recordIndex || 0,
       recordTotal: item.recordTotal || 0,
@@ -3583,12 +4008,17 @@
     const summary = document.createElement('div');
     summary.className = 'resume-page-audit__summary';
     summary.textContent = `发现 ${report.counts.interactive} 个可见交互元素：填写 ${dimensions.elementKind?.field || 0}，动作 ${dimensions.elementKind?.action || 0}，交互区域 ${dimensions.elementKind?.container || 0}。字段映射：已映射 ${mappingCounts.mapped || 0}，待确认 ${mappingCounts.ambiguous || 0}，未映射 ${mappingCounts.unmapped || 0}。`;
+    if (report.currentValueStats?.fillable) {
+      const stats = report.currentValueStats;
+      summary.textContent += ` 当前可填字段：已有值 ${stats.filled || 0}，空 ${stats.empty || 0}。`;
+    }
     const highlightNotice = document.createElement('div');
     highlightNotice.className = 'resume-page-audit__notice';
     highlightNotice.textContent = '点击列表行会复制该行关键信息，并在原页面定位高亮该元素；不会填写、不提交。';
 
     const axisValue = (item, axis) => {
       if (axis === 'mappingStatus') return item.elementKind === 'field' ? item.mappingStatus : 'not-field';
+      if (axis === 'currentValueState') return item.currentValueState || 'not-fillable';
       if (axis === 'layoutTitle') return layoutNameForItem(item);
       return item[axis];
     };
@@ -3596,6 +4026,7 @@
       ['elementKind', '元素', elementKindLabels],
       ['operationGroup', '操作', operationGroupLabels],
       ['mappingStatus', '映射', mappingLabels],
+      ['currentValueState', '当前值', currentValueStateLabels],
       ['layoutTitle', '布局', layoutLabels]
     ];
     const filters = document.createElement('div');
@@ -3610,9 +4041,11 @@
       all.type = 'button';
       all.className = 'is-active';
       all.dataset.axis = axis;
-      all.dataset.value = axis === 'mappingStatus' ? '__field-all' : '';
-      const axisItems = axis === 'mappingStatus' ? fieldItems : report.interactiveElements;
-      all.textContent = `${axis === 'mappingStatus' ? '全部字段' : '全部'} ${axisItems.length}`;
+      const isMappingAxis = axis === 'mappingStatus';
+      const isCurrentValueAxis = axis === 'currentValueState';
+      all.dataset.value = isMappingAxis ? '__field-all' : isCurrentValueAxis ? '__current-value-all' : '';
+      const axisItems = isMappingAxis ? fieldItems : isCurrentValueAxis ? currentValueItems : report.interactiveElements;
+      all.textContent = `${isMappingAxis ? '全部字段' : isCurrentValueAxis ? '全部可填' : '全部'} ${axisItems.length}`;
       group.appendChild(all);
       for (const [value, label] of Object.entries(labels)) {
         const count = axisItems.filter((item) => axisValue(item, axis) === value).length;
@@ -3658,11 +4091,13 @@
       row.dataset.mappingStatus = item.elementKind === 'field' ? item.mappingStatus : 'not-field';
       row.dataset.layoutTitle = layoutNameForItem(item);
       row.dataset.surfaceTitle = item.surfaceTitle || '';
+      row.dataset.currentValueState = item.currentValueState || '';
       row.dataset.ref = item.ref;
-      row.dataset.search = `${item.ref} ${item.text} ${item.fieldLabel || ''} ${item.displayName || ''} ${item.bindingKey || ''} ${layoutNameForItem(item)} ${parentLayoutForItem(item)} ${siblingLayoutsForItem(item)} ${attributesForItem(item).join(' ')} ${item.matchedKey || ''} ${item.profilePath || ''} ${(item.profilePathCandidates || []).join(' ')} ${item.controlKind || ''} ${operationGroupLabels[item.operationGroup] || ''} ${actionTypeLabels[item.actionType] || ''}`.toLowerCase();
+      row.dataset.search = `${item.ref} ${item.text} ${item.fieldLabel || ''} ${item.displayName || ''} ${item.bindingKey || ''} ${layoutNameForItem(item)} ${parentLayoutForItem(item)} ${siblingLayoutsForItem(item)} ${attributesForItem(item).join(' ')} ${item.currentValue || ''} ${item.currentValueState || ''} ${item.matchedKey || ''} ${item.profilePath || ''} ${(item.profilePathCandidates || []).join(' ')} ${(item.mappingEvidence || []).join(' ')} ${(item.profilePathCandidateDetails || []).map((detail) => `${detail.path} ${detail.reason} ${detail.score}`).join(' ')} ${item.mappingScore || ''} ${item.mappingStrategy || ''} ${item.controlKind || ''} ${operationGroupLabels[item.operationGroup] || ''} ${actionTypeLabels[item.actionType] || ''}`.toLowerCase();
       const head = document.createElement('span');
       head.className = 'resume-page-audit__row-head';
-      head.innerHTML = `<b>${item.ref}</b><em>${elementKindLabels[item.elementKind] || item.elementKind}</em>${item.elementKind === 'field' ? `<em>${mappingLabels[item.mappingStatus] || item.mappingStatus}</em>` : ''}<code>${operationGroupLabels[item.operationGroup] || item.operationGroup}</code>`;
+      const currentValueBadge = hasCurrentValueAttribute(item) ? `<em>${item.hasCurrentValue ? '已有值' : '空值'}</em>` : '';
+      head.innerHTML = `<b>${item.ref}</b><em>${elementKindLabels[item.elementKind] || item.elementKind}</em>${item.elementKind === 'field' ? `<em>${mappingLabels[item.mappingStatus] || item.mappingStatus}</em>` : ''}${currentValueBadge}<code>${operationGroupLabels[item.operationGroup] || item.operationGroup}</code>`;
       const label = document.createElement('span');
       label.className = 'resume-page-audit__row-text';
       label.textContent = item.elementKind === 'field' ? (item.displayName || item.fieldLabel || item.text) : item.text;
@@ -3681,6 +4116,15 @@
         item.datePart ? `日期部分：${item.datePart === 'year' ? '年' : item.datePart === 'month' ? '月' : item.datePart}` : '',
         item.rangeRole ? `范围：${item.rangeRole === 'start' ? '开始' : item.rangeRole === 'end' ? '结束' : item.rangeRole}` : ''
       ].filter(Boolean).join(' · ');
+      if (item.elementKind === 'field') {
+        const mappingMeta = [
+          item.mappingScore ? `Mapping score: ${item.mappingScore}` : '',
+          item.mappingStrategy ? `Mapping strategy: ${item.mappingStrategy}` : '',
+          item.mappingEvidence?.length ? `Mapping evidence: ${item.mappingEvidence.join(', ')}` : ''
+        ].filter(Boolean).join(' | ');
+        if (mappingMeta) meta.textContent = [meta.textContent, mappingMeta].filter(Boolean).join(' | ');
+      }
+      if (currentValueLabel(item)) meta.textContent = [currentValueLabel(item), meta.textContent].filter(Boolean).join(' | ');
       const path = document.createElement('small');
       path.textContent = item.elementKind === 'field'
         ? `页面标签：${item.fieldLabel || item.text || '-'}`
@@ -3706,6 +4150,7 @@
         const dimensionsMatch = Object.entries(activeFilters).every(([axis, value]) => {
           if (!value) return true;
           if (axis === 'mappingStatus' && value === '__field-all') return row.dataset.elementKind === 'field';
+          if (axis === 'currentValueState' && value === '__current-value-all') return Boolean(row.dataset.currentValueState);
           return row.dataset[axis] === value;
         });
         row.hidden = !(dimensionsMatch && (!query || row.dataset.search.includes(query)));
@@ -3731,6 +4176,8 @@
     diagnosePage,
     getTarget: (ref) => elementMap.get(ref) || null,
     getSource: (ref) => sourceElementMap.get(ref) || null,
+    showAutofillDebugOverlay,
+    clearAutofillDebugOverlay,
     isVisible: visible,
     cleanText
   };
@@ -3746,13 +4193,19 @@
     const type = normalizedMessageType(message);
     if (type === 'RESUME_PAGE_AUDIT_SHOW') {
       const report = diagnosePage();
-      showAuditPanel(report);
+      if (message?.showPanel !== false) showAuditPanel(report);
       sendResponse(report);
       return;
     }
     if (type === 'RESUME_PAGE_AUDIT_CLEAR') {
       clearAudit();
       sendResponse({ ok: true, version: VERSION });
+      return;
+    }
+    if (type === 'RESUME_AUTOFILL_DEBUG_OVERLAY_CLEAR') {
+      clearAutofillDebugOverlay();
+      sendResponse({ ok: true, version: VERSION });
+      return;
     }
   });
 })();

@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '0.9.63';
+  const VERSION = '0.9.66';
   if (globalThis.__resumeProfileAutofillVersion === VERSION) return;
   globalThis.__resumeProfileAutofillVersion = VERSION;
 
@@ -27,6 +27,9 @@
   const auditApi = () => globalThis.ResumePageAuditApi;
   const PROGRESS_ROOT_ID = 'resume-autofill-progress-root';
   const PROGRESS_STYLE_ID = 'resume-autofill-progress-style';
+  const FIELD_TIMEOUT_MS = 10000;
+  const MODULE_TIMEOUT_MS = 10000;
+  const CANCEL_POLL_MS = 120;
   const WAITING_LINES = [
     '我在加速整理这一页。',
     '下拉框打开了，我会选完再走。',
@@ -133,9 +136,61 @@
   let progressLineIndex = 0;
   let progressLineBag = [];
   let cancelAutofillRequested = false;
+  let autofillAbortVersion = 0;
+  let debugTraceEnabled = false;
+  let debugTraceEntries = [];
+  let debugRunId = '';
+  globalThis.__resumeAutofillCancelRequested = () => Boolean(cancelAutofillRequested);
+  globalThis.__resumeAutofillAbortVersion = () => autofillAbortVersion;
 
   function clean(value) {
     return String(value || '').replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function compactDebugValue(value, limit = 120) {
+    const text = clean(value);
+    return text.length <= limit ? text : `${text.slice(0, limit)}...`;
+  }
+
+  function debugTrace(event, payload = {}) {
+    if (!debugTraceEnabled) return;
+    const entry = {
+      at: new Date().toISOString(),
+      ms: Math.round(performance.now()),
+      runId: debugRunId,
+      event,
+      ...payload
+    };
+    debugTraceEntries.push(entry);
+    if (debugTraceEntries.length > 1200) debugTraceEntries.splice(0, debugTraceEntries.length - 1200);
+    try {
+      console.debug('[resume-autofill]', event, entry);
+    } catch (_) {}
+  }
+
+  function debugFieldDetail(stage, detail = {}) {
+    debugTrace('field-result', {
+      stage,
+      ref: detail.ref || '',
+      field: detail.field || '',
+      profilePath: detail.profilePath || '',
+      operation: detail.operation || detail.legacyType || '',
+      status: detail.status || '',
+      reason: detail.reason || '',
+      before: compactDebugValue(detail.before),
+      desired: compactDebugValue(detail.desired),
+      after: compactDebugValue(detail.after || detail.afterAttempt || detail.selected),
+      ms: detail.ms || 0,
+      timing: Array.isArray(detail.timing) ? detail.timing.slice(0, 20) : []
+    });
+  }
+
+  function debugSnapshot() {
+    return {
+      enabled: debugTraceEnabled,
+      runId: debugRunId,
+      entries: debugTraceEntries.slice()
+    };
   }
 
   function normalized(value) {
@@ -324,14 +379,70 @@
     return clean(value);
   }
 
+  function phoenixRadioSelectedText(element) {
+    if (!(element instanceof Element)) return '';
+    const group = element.matches?.('.phoenix-radio-group')
+      ? element
+      : element.closest?.('.phoenix-radio-group') || element.querySelector?.('.phoenix-radio-group');
+    if (!(group instanceof Element)) return '';
+    const options = [...group.querySelectorAll('.phoenix-radio-group__radioItem,.phoenix-radio')];
+    const selected = options.find((option) => {
+      const className = String(option.className?.baseVal || option.className || '');
+      return /phoenix-radio--checked|phoenix-radio__circle-wrapper--checked|phoenix-radio__dot--checked/.test(className)
+        || option.getAttribute?.('aria-checked') === 'true'
+        || Boolean(option.querySelector?.('.phoenix-radio--checked,.phoenix-radio__circle-wrapper--checked,.phoenix-radio__dot--checked,[aria-checked="true"]'));
+    });
+    return clean(selected?.querySelector?.('.phoenix-radio__radio-text')?.textContent
+      || selected?.getAttribute?.('aria-label')
+      || selected?.textContent
+      || '');
+  }
+
   function existingControlValue(element) {
     if (!(element instanceof Element)) return '';
-    if (element.matches('input,textarea,select')) return clean(element.value);
+    if (element.matches('select')) {
+      const selectedOptions = [...element.selectedOptions || []].map((option) => clean(option.textContent || option.value)).filter(Boolean);
+      return clean(selectedOptions.join(' / ') || element.value);
+    }
+    if (element.matches('input[type="checkbox"],input[type="radio"]')) {
+      return element.checked ? clean(element.labels?.[0]?.textContent || element.value || 'checked') : '';
+    }
+    if (element.matches('input,textarea')) return clean(element.value);
     if (element.matches('[contenteditable]:not([contenteditable="false"])')) return clean(element.textContent);
-    const selected = element.querySelector('[aria-checked="true"],[aria-selected="true"],input:checked,option:checked,[class*="selected"],[class*="checked"]');
-    if (selected) return clean(selected.textContent || selected.value || '');
-    const displayed = element.querySelector('.phoenix-button__content,.phoenix-select__singleValue,[class*="display-value"],[class*="selected-value"]');
-    const value = clean(displayed?.textContent || '');
+    const phoenixRadioText = phoenixRadioSelectedText(element);
+    if (phoenixRadioText && !PLACEHOLDER_VALUE.test(phoenixRadioText)) return phoenixRadioText;
+    const descendantValue = [...element.querySelectorAll('input,textarea,select')]
+      .map((control) => existingControlValue(control))
+      .find(Boolean) || '';
+    if (descendantValue && !PLACEHOLDER_VALUE.test(descendantValue)) return descendantValue;
+    const selected = element.querySelector('[aria-checked="true"],[aria-selected="true"],input:checked,option:checked,[class*="selected"],[class*="Selected"],[class*="checked"],[class*="Checked"]');
+    const selectedValue = clean(selected?.textContent || selected?.value || selected?.getAttribute?.('aria-label') || '');
+    if (selectedValue && !PLACEHOLDER_VALUE.test(selectedValue)) return selectedValue;
+    const displayed = element.querySelector([
+      '.phoenix-button__content',
+      '.phoenix-select__singleValue',
+      '.phoenix-select__multipleValue',
+      '.phoenix-select__tag',
+      '.phoenix-select__tipEle',
+      '.phoenix-select__calcEle',
+      '.phoenix-select__placeHolder',
+      '.ant-select-selection-item',
+      '.ant-select-selection-selected-value',
+      '.atsx-select-selection-item',
+      '.atsx-select-selection-selected-value',
+      '.el-select__selected-item',
+      '.el-select__tags-text',
+      '[class*="display-value"]',
+      '[class*="DisplayValue"]',
+      '[class*="selected-value"]',
+      '[class*="SelectedValue"]',
+      '[class*="selectedValue"]',
+      '[class*="singleValue"]',
+      '[class*="SingleValue"]',
+      '[class*="selection-item"]',
+      '[class*="SelectionItem"]'
+    ].join(','));
+    const value = clean(displayed?.textContent || displayed?.getAttribute?.('title') || displayed?.getAttribute?.('aria-label') || '');
     return PLACEHOLDER_VALUE.test(value) ? '' : value;
   }
 
@@ -342,22 +453,85 @@
       || target?.querySelector?.('input:not([type="hidden"]),textarea,[contenteditable]:not([contenteditable="false"])') || null;
   }
 
+  function dispatchAutofillMouseActivation(element, options = {}) {
+    if (!(element instanceof Element)) return;
+    const common = { bubbles: true, cancelable: true, composed: true, view: window, button: 0 };
+    if (typeof PointerEvent === 'function') {
+      element.dispatchEvent(new PointerEvent('pointerdown', { ...common, pointerType: 'mouse', buttons: 1 }));
+      element.dispatchEvent(new PointerEvent('pointerup', { ...common, pointerType: 'mouse', buttons: 0 }));
+    }
+    element.dispatchEvent(new MouseEvent('mousedown', { ...common, buttons: 1 }));
+    element.dispatchEvent(new MouseEvent('mouseup', { ...common, buttons: 0 }));
+    if (options.click !== false) element.dispatchEvent(new MouseEvent('click', common));
+  }
+
+  function dispatchAutofillFocusEvent(element, type) {
+    if (!(element instanceof Element)) return;
+    try {
+      element.dispatchEvent(new FocusEvent(type, { bubbles: true, composed: true, relatedTarget: null }));
+    } catch (_) {
+      element.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
+    }
+  }
+
+  function dispatchAutofillTextCommit(element, value) {
+    if (!(element instanceof Element)) return;
+    try {
+      element.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: 'insertReplacementText',
+        data: String(value ?? '')
+      }));
+    } catch (_) {
+      element.dispatchEvent(new Event('beforeinput', { bubbles: true, cancelable: true, composed: true }));
+    }
+    try {
+      element.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        composed: true,
+        inputType: 'insertReplacementText',
+        data: String(value ?? '')
+      }));
+    } catch (_) {
+      element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    }
+    for (const type of ['keydown', 'keyup']) {
+      element.dispatchEvent(new KeyboardEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        key: 'Unidentified',
+        code: 'Unidentified'
+      }));
+    }
+    element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  }
+
   function setNativeValue(element, value) {
     if (!(element instanceof Element)) return false;
+    dispatchAutofillMouseActivation(element, { click: true });
+    try {
+      element.focus?.({ preventScroll: true });
+    } catch (_) {
+      element.focus?.();
+    }
+    dispatchAutofillFocusEvent(element, 'focusin');
     if (element.matches('[contenteditable]:not([contenteditable="false"])')) {
-      element.focus();
       element.textContent = value;
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
+      dispatchAutofillTextCommit(element, value);
+      element.dispatchEvent(new Event('blur', { bubbles: false, composed: true }));
+      dispatchAutofillFocusEvent(element, 'focusout');
       return true;
     }
     if (!element.matches('input,textarea')) return false;
     const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-    element.focus();
     setter ? setter.call(element, value) : (element.value = value);
-    element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+    dispatchAutofillTextCommit(element, value);
+    element.dispatchEvent(new Event('blur', { bubbles: false, composed: true }));
+    dispatchAutofillFocusEvent(element, 'focusout');
     return true;
   }
 
@@ -601,10 +775,14 @@
   function requestAutofillCancel() {
     if (cancelAutofillRequested) return;
     cancelAutofillRequested = true;
+    autofillAbortVersion += 1;
     const root = document.getElementById(PROGRESS_ROOT_ID);
     const button = root?.querySelector('.resume-autofill-cancel');
     if (button) {
       button.disabled = true;
+      button.dataset.state = 'cancelling';
+      button.setAttribute('aria-label', '正在停止填写');
+      button.setAttribute('title', '正在停止填写');
     }
     updateProgress({
       percent: Number(root?.querySelector('.resume-autofill-progress-percent')?.dataset.percent || 0),
@@ -622,6 +800,63 @@
     throw error;
   }
 
+  function cancellationError(stage = '') {
+    const error = new Error(stage ? `Autofill cancelled: ${stage}` : 'Autofill cancelled');
+    error.name = 'ResumeAutofillCancelled';
+    return error;
+  }
+
+  function timeoutError(label, timeoutMs) {
+    const error = new Error(`${label || 'operation'} timed out after ${timeoutMs}ms`);
+    error.name = 'ResumeAutofillTimeout';
+    error.timeoutMs = timeoutMs;
+    return error;
+  }
+
+  function isCancellationError(error) {
+    return error?.name === 'ResumeAutofillCancelled';
+  }
+
+  function isTimeoutError(error) {
+    return error?.name === 'ResumeAutofillTimeout';
+  }
+
+  async function withAutofillTimeout(task, timeoutMs, label = 'operation') {
+    if (cancelAutofillRequested) throw cancellationError(label);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutTimer = 0;
+      let pollTimer = 0;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutTimer);
+        clearTimeout(pollTimer);
+        fn(value);
+      };
+      const pollCancel = () => {
+        if (settled) return;
+        if (cancelAutofillRequested) {
+          finish(reject, cancellationError(label));
+          return;
+        }
+        pollTimer = setTimeout(pollCancel, CANCEL_POLL_MS);
+      };
+      timeoutTimer = setTimeout(() => {
+        finish(reject, timeoutError(label, timeoutMs));
+      }, timeoutMs);
+      pollTimer = setTimeout(pollCancel, CANCEL_POLL_MS);
+      Promise.resolve()
+        .then(task)
+        .then((value) => finish(resolve, value), (error) => finish(reject, error));
+    });
+  }
+
+  function setImportantDisplay(element, value) {
+    if (!(element instanceof HTMLElement)) return;
+    element.style.setProperty('display', value, 'important');
+  }
+
   function updateProgress({ percent = 0, title = '我在处理', detail = '', state = 'running', line = '' } = {}) {
     clearTimeout(progressHideTimer);
     const root = ensureProgressRoot();
@@ -630,7 +865,7 @@
     root.dataset.state = state;
     root.querySelector('.resume-autofill-progress-title').textContent = title;
     root.querySelector('.resume-autofill-progress-line').textContent = state === 'running' ? '' : progressText;
-    root.querySelector('.resume-autofill-progress-detail').textContent = state === 'running' ? progressText : detail;
+    root.querySelector('.resume-autofill-progress-detail').textContent = state === 'running' ? (detail || progressText) : detail;
     root.querySelector('.resume-autofill-progress-bar').style.setProperty('width', `${safePercent}%`, 'important');
     const percentNode = root.querySelector('.resume-autofill-progress-percent');
     percentNode.textContent = `${safePercent}%`;
@@ -639,16 +874,23 @@
     const closeButton = root.querySelector('.resume-autofill-close');
     if (cancelButton) {
       if (state === 'running') {
-        cancelButton.style.display = '';
+        setImportantDisplay(cancelButton, 'inline-grid');
         cancelButton.disabled = false;
+        delete cancelButton.dataset.state;
+        cancelButton.setAttribute('aria-label', '暂停/取消本次填写');
+        cancelButton.setAttribute('title', '暂停/取消本次填写');
       } else if (state === 'cancelling' || state === 'cancelled') {
-        cancelButton.style.display = '';
+        setImportantDisplay(cancelButton, state === 'cancelling' ? 'inline-grid' : 'none');
         cancelButton.disabled = true;
+        cancelButton.dataset.state = state;
+        cancelButton.setAttribute('aria-label', '正在停止填写');
+        cancelButton.setAttribute('title', '正在停止填写');
       } else {
-        cancelButton.style.display = 'none';
+        setImportantDisplay(cancelButton, 'none');
+        cancelButton.disabled = true;
       }
     }
-    if (closeButton) closeButton.style.display = ['done', 'error', 'cancelled'].includes(state) ? '' : 'none';
+    if (closeButton) setImportantDisplay(closeButton, ['done', 'error', 'cancelling', 'cancelled'].includes(state) ? 'inline-block' : 'none');
   }
 
   function finishProgress({ title = '处理完成', detail = '当前页面填写流程已结束。', state = 'done' } = {}) {
@@ -895,6 +1137,53 @@
     };
   }
 
+  function timeoutRepeatRecord(config, recordIndex, started, options = {}) {
+    const detail = {
+      ref: '',
+      field: `${config.label}${recordIndex}`,
+      profilePath: `${config.section}[]`,
+      repeatSection: config.section,
+      repeatIndex: recordIndex,
+      desired: '',
+      status: 'timeout-skipped',
+      reason: `Repeat record timed out after ${MODULE_TIMEOUT_MS}ms`,
+      operation: 'repeat-section',
+      ms: Math.round(performance.now() - started)
+    };
+    const phases = emptyFillPhases(started);
+    phases.directWrite = phaseFromDetails('direct-write', [detail], started);
+    return {
+      section: config.section,
+      label: config.label,
+      recordIndex,
+      mode: options.allowSingleEditor ? 'single-editor' : 'visible-record',
+      status: 'timeout-skipped',
+      reason: `Repeat record timed out after ${MODULE_TIMEOUT_MS}ms`,
+      attempted: 1,
+      completed: 0,
+      omitted: 1,
+      filled: 0,
+      ms: Math.round(performance.now() - started),
+      phases,
+      report: auditApi().diagnosePage()
+    };
+  }
+
+  async function fillRepeatRecordWithTimeout(profile, initialReport, config, recordIndex, overwrite, options = {}) {
+    const started = performance.now();
+    try {
+      return await withAutofillTimeout(
+        () => fillRepeatRecord(profile, initialReport, config, recordIndex, overwrite, options),
+        MODULE_TIMEOUT_MS,
+        `${config.label}${recordIndex}`
+      );
+    } catch (error) {
+      if (isCancellationError(error)) throw error;
+      if (isTimeoutError(error)) return timeoutRepeatRecord(config, recordIndex, started, options);
+      throw error;
+    }
+  }
+
   async function clickRepeatAction(report, config, finder, missingStatus, failedStatus) {
     throwIfCancelled(`点击${config.label}操作`);
     const action = finder(report, config);
@@ -967,7 +1256,7 @@
         }
 
         const targetRecordIndex = grew ? growth.count : recordIndex;
-        const run = await fillRepeatRecord(profile, report, config, targetRecordIndex, overwrite, {
+        const run = await fillRepeatRecordWithTimeout(profile, report, config, targetRecordIndex, overwrite, {
           allowSingleEditor: !grew,
           onProgress: (info) => options.onProgress?.({
             ...info,
@@ -978,6 +1267,11 @@
         recordRuns.push(run);
         result.records.push({ recordIndex: targetRecordIndex, status: run.status, attempted: run.attempted, completed: run.completed, omitted: run.omitted });
         report = run.report;
+        if (run.status === 'timeout-skipped') {
+          result.status = 'record-timeout-skipped';
+          result.reason = `${config.label}${targetRecordIndex} timed out after ${MODULE_TIMEOUT_MS}ms`;
+          break;
+        }
 
         const afterSave = await clickRepeatAction(report, config, findSaveAction, 'save-not-found', 'save-click-failed');
         result.actions.push({ stage: 'save-after-fill', ...afterSave, report: undefined });
@@ -1031,9 +1325,23 @@
     }, { filled: 0, completed: 0, required: 0, omitted: 0, attempted: 0, manualReview: 0 });
   }
 
-  function phaseFields(report, operationGroup, options = {}) {
+  function isMappedFillTarget(item = {}) {
+    if (!item.profilePath || !FILL_OPERATION_GROUPS.has(item.operationGroup)) return false;
+    if (item.elementKind && item.elementKind !== 'field') return false;
+    if (Object.prototype.hasOwnProperty.call(item, 'mappingStatus') && item.mappingStatus !== 'mapped') return false;
+    return true;
+  }
+
+  function isExecutableFillTarget(item = {}, options = {}) {
     const filter = typeof options.filter === 'function' ? options.filter : () => true;
-    return (report.controls || []).filter((field) => field.operationGroup === operationGroup && field.profilePath && filter(field));
+    if (!isMappedFillTarget(item) || !filter(item)) return false;
+    if (!options.includeFilledCurrentValues && !isCurrentEmptyControl(item)) return false;
+    return true;
+  }
+
+  function phaseFields(report, operationGroup, options = {}) {
+    return (report.controls || [])
+      .filter((field) => field.operationGroup === operationGroup && isExecutableFillTarget(field, options));
   }
 
   function fieldOrder(item = {}) {
@@ -1042,9 +1350,8 @@
   }
 
   function orderedFillFields(report, options = {}) {
-    const filter = typeof options.filter === 'function' ? options.filter : () => true;
     return (report.controls || [])
-      .filter((field) => FILL_OPERATION_GROUPS.has(field.operationGroup) && field.profilePath && filter(field))
+      .filter((field) => isExecutableFillTarget(field, options))
       .sort((left, right) => fieldOrder(left) - fieldOrder(right));
   }
 
@@ -1119,8 +1426,7 @@
     if (status === 'filled' && !equivalentValue(after, value, item, item.matchedKey || '')) {
       status = 'write-verify-failed';
       reason = `readback mismatch after write: "${after}"`;
-      setNativeValue(input, '');
-      restored = true;
+      markManualReview(input, source, target, reason);
     }
     return {
       ref: item.ref,
@@ -1133,26 +1439,66 @@
       after,
       restored,
       operation: 'direct-write',
+      controlKind: item.controlKind || '',
       ms: Math.round(performance.now() - fieldStarted)
     };
   }
 
-  function directWritePhase(profile, report, overwrite, options = {}) {
+  function timeoutDirectWriteDetail(profile, item, valueItem, occurrenceByPath, started) {
+    const value = profileRecordValue(profile, item.profilePath, valueItem, occurrenceByPath);
+    return {
+      ref: item.ref,
+      field: item.displayName,
+      profilePath: item.profilePath,
+      repeatIndex: valueItem.repeatIndex,
+      desired: value,
+      status: 'timeout-skipped',
+      reason: `Field timed out after ${FIELD_TIMEOUT_MS}ms`,
+      after: '',
+      restored: false,
+      operation: 'direct-write',
+      controlKind: item.controlKind || '',
+      ms: Math.round(performance.now() - started)
+    };
+  }
+
+  async function fillDirectWriteFieldWithTimeout(profile, item, valueItem, occurrenceByPath, overwrite) {
+    const started = performance.now();
+    try {
+      return await withAutofillTimeout(
+        () => fillDirectWriteField(profile, item, valueItem, occurrenceByPath, overwrite),
+        FIELD_TIMEOUT_MS,
+        item.displayName || item.ref || 'direct-write'
+      );
+    } catch (error) {
+      if (isCancellationError(error)) throw error;
+      if (isTimeoutError(error)) return timeoutDirectWriteDetail(profile, item, valueItem, occurrenceByPath, started);
+      throw error;
+    }
+  }
+
+  async function directWritePhase(profile, report, overwrite, options = {}) {
     const started = performance.now();
     const occurrenceByPath = new Map();
     const details = [];
     for (const item of phaseFields(report, 'direct-write', options)) {
       const valueItem = valueItemForPhase(item, options);
-      details.push(fillDirectWriteField(profile, item, valueItem, occurrenceByPath, overwrite));
+      const detail = await fillDirectWriteFieldWithTimeout(profile, item, valueItem, occurrenceByPath, overwrite);
+      debugFieldDetail('direct-write', detail);
+      details.push(detail);
     }
     return phaseFromDetails('direct-write', details, started);
   }
 
-  function reacquireControl(original, operationGroup) {
+  function reacquireControl(original, operationGroup, options = {}) {
     const report = auditApi().diagnosePage();
-    const fields = (report.controls || []).filter((item) => item.operationGroup === operationGroup && item.profilePath === original.profilePath);
+    const fields = (report.controls || []).filter((item) => {
+      if (item.operationGroup !== operationGroup || item.profilePath !== original.profilePath) return false;
+      return isExecutableFillTarget(item, options);
+    });
     return fields.sort((left, right) => {
-      const score = (item) => (original.repeatIndex && item.repeatIndex === original.repeatIndex ? 16 : 0)
+      const score = (item) => (original.ref && item.ref === original.ref ? 32 : 0)
+        + (original.repeatIndex && item.repeatIndex === original.repeatIndex ? 16 : 0)
         + (original.repeatGroup && item.repeatGroup === original.repeatGroup ? 12 : 0)
         + (original.bindingKey && item.bindingKey === original.bindingKey ? 8 : 0)
         + (original.rangeRole && item.rangeRole === original.rangeRole ? 4 : 0)
@@ -1176,10 +1522,16 @@
     const aliases = legacyChoiceAliases(value).map(normalized);
     const option = nodes.find((node) => aliases.includes(normalized(node.querySelector?.('.phoenix-radio__radio-text')?.textContent || node.labels?.[0]?.textContent || node.getAttribute?.('aria-label') || node.textContent || node.value)));
     if (!option) return { ok: false, type: 'choice-group', reason: '旧版单选逻辑没有找到完全匹配项', candidates: nodes.map((node) => clean(node.textContent || node.value)).filter(Boolean).slice(0, 20) };
-    const clickTarget = option.closest('label,.phoenix-radio-group__radioItem,[role="radio"]') || option.labels?.[0] || option;
+    const clickTarget = option.querySelector?.('.phoenix-radio,.phoenix-radio__wrapper')
+      || option.closest('label,.phoenix-radio-group__radioItem,[role="radio"]')
+      || option.labels?.[0]
+      || option;
     safeClick(clickTarget);
     await wait(300);
-    const checked = clickTarget.matches('[aria-checked="true"]') || clickTarget.querySelector('input:checked,[aria-checked="true"],[class*="checked"],[class*="selected"]');
+    const checked = clickTarget.matches('[aria-checked="true"],[class*="checked"],[class*="selected"]')
+      || clickTarget.querySelector('input:checked,[aria-checked="true"],[class*="checked"],[class*="selected"]')
+      || option.matches?.('[aria-checked="true"],[class*="checked"],[class*="selected"]')
+      || option.querySelector?.('input:checked,[aria-checked="true"],[class*="checked"],[class*="selected"]');
     return { ok: Boolean(checked) || !clickTarget.isConnected, type: 'choice-group', selected: clean(clickTarget.textContent), reason: checked || !clickTarget.isConnected ? '' : '已点击但没有检测到选中状态' };
   }
 
@@ -1273,10 +1625,13 @@
     return engine.fillSelect(control, value, key || '');
   }
 
-  async function fillSelectionField(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite) {
+  async function fillSelectionField(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite, options = {}) {
     throwIfCancelled(`填写${original.displayName || original.ref || ''}`);
     const fieldStarted = performance.now();
-    const item = reacquireControl(valueOriginal, operationGroup) || original;
+    const item = reacquireControl(valueOriginal, operationGroup, {
+      ...options,
+      includeFilledCurrentValues: Boolean(overwrite)
+    }) || original;
     const source = auditApi().getSource(item.ref);
     const target = auditApi().getTarget(item.ref);
     const originalValue = profileRecordValue(profile, original.profilePath, valueOriginal, occurrenceByPath);
@@ -1328,9 +1683,7 @@
       status = 'selection-failed';
       reason = result.reason || '旧版选择引擎未完成';
       afterAttempt = controlReadback(control, source, target) || clean((result.selected || []).join?.(' / ') || result.selected || result.actual || '');
-      restored = restoreSearchValue(control, before);
-      after = controlReadback(control, source, target);
-      if (restored) reason = `${reason}；已恢复填写前值${before ? `“${before}”` : '（原值为空）'}`;
+      after = afterAttempt;
     } else {
       after = controlReadback(control, source, target) || clean((result.selected || []).join?.(' / ') || result.selected || result.actual || '');
     }
@@ -1355,9 +1708,60 @@
       selected: clean((result.selected || []).join?.(' / ') || result.selected || result.actual || ''),
       candidateSample: result.candidates || [],
       dynamicDom: result.dynamicDom || null,
+      timingComponent: result.timingComponent || '',
+      timingTotalMs: result.timingTotalMs || 0,
+      timing: Array.isArray(result.timing) ? result.timing : [],
       operation: operationGroup,
+      controlKind: item.controlKind || original.controlKind || '',
       ms: Math.round(performance.now() - fieldStarted)
     };
+  }
+
+  function timeoutSelectionDetail(profile, original, valueOriginal, occurrenceByPath, operationGroup, started) {
+    const value = profileRecordValue(profile, original.profilePath, valueOriginal, occurrenceByPath);
+    return {
+      ref: original.ref,
+      field: original.displayName,
+      profilePath: original.profilePath,
+      matchedKey: original.matchedKey || '',
+      compoundRole: original.compoundRole || '',
+      repeatSection: original.repeatSection,
+      repeatIndex: valueOriginal.repeatIndex,
+      desired: value,
+      status: 'timeout-skipped',
+      reason: `Field timed out after ${FIELD_TIMEOUT_MS}ms`,
+      executed: false,
+      legacyType: '',
+      stage: 'timeout',
+      before: '',
+      afterAttempt: '',
+      after: '',
+      restored: false,
+      selected: '',
+      candidateSample: [],
+      dynamicDom: null,
+      timingComponent: '',
+      timingTotalMs: 0,
+      timing: [],
+      operation: operationGroup,
+      controlKind: original.controlKind || '',
+      ms: Math.round(performance.now() - started)
+    };
+  }
+
+  async function fillSelectionFieldWithTimeout(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite, options = {}) {
+    const started = performance.now();
+    try {
+      return await withAutofillTimeout(
+        () => fillSelectionField(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite, options),
+        FIELD_TIMEOUT_MS,
+        original.displayName || original.ref || operationGroup
+      );
+    } catch (error) {
+      if (isCancellationError(error)) throw error;
+      if (isTimeoutError(error)) return timeoutSelectionDetail(profile, original, valueOriginal, occurrenceByPath, operationGroup, started);
+      throw error;
+    }
   }
 
   async function legacySelectionPhase(profile, report, operationGroup, overwrite, options = {}) {
@@ -1368,7 +1772,9 @@
     for (const original of originals) {
       throwIfCancelled(`填写${original.displayName || original.ref || ''}`);
       const valueOriginal = valueItemForPhase(original, options);
-      details.push(await fillSelectionField(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite));
+      const detail = await fillSelectionFieldWithTimeout(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite, options);
+      debugFieldDetail(operationGroup, detail);
+      details.push(detail);
       await wait(180);
       throwIfCancelled(`填写${original.displayName || original.ref || ''}`);
     }
@@ -1383,25 +1789,61 @@
       'input-select': [],
       'closed-select': []
     };
-    const originals = orderedFillFields(initialReport, options);
+    const originals = orderedFillFields(initialReport, { ...options, includeFilledCurrentValues: Boolean(overwrite) });
     const total = originals.length;
+    debugTrace('fill-queue-ready', {
+      overwrite: Boolean(overwrite),
+      total,
+      emptyOnly: !overwrite,
+      skippedFilledByCurrentValue: overwrite ? 0 : (initialReport.controls || [])
+        .filter((field) => isMappedFillTarget(field))
+        .filter((field) => typeof options.filter === 'function' ? options.filter(field) : true)
+        .filter((field) => hasCurrentValueInfo(field) && !isCurrentEmptyControl(field))
+        .length
+    });
     for (const [index, original] of originals.entries()) {
       throwIfCancelled(`填写${original.displayName || original.ref || ''}`);
       const operationGroup = original.operationGroup;
       const valueOriginal = valueItemForPhase(original, options);
-      options.onProgress?.({
+      const progressInfo = {
         index: index + 1,
         total,
         operationGroup,
         field: original.displayName || original.fieldLabel || original.ref || '',
-        profilePath: original.profilePath || ''
+        profilePath: original.profilePath || '',
+        ref: original.ref || '',
+        progressKey: fieldProgressKey(original, options),
+        emptyProgressTarget: isCurrentEmptyFillTarget(original)
+      };
+      options.onProgress?.({
+        ...progressInfo,
+        stage: 'start'
       });
       if (operationGroup === 'direct-write') {
-        const item = reacquireControl(valueOriginal, operationGroup) || original;
-        detailsByGroup[operationGroup].push(fillDirectWriteField(profile, item, valueOriginal, occurrenceByPath, overwrite));
+        const item = reacquireControl(valueOriginal, operationGroup, {
+          ...options,
+          includeFilledCurrentValues: Boolean(overwrite)
+        }) || original;
+        const detail = await fillDirectWriteFieldWithTimeout(profile, item, valueOriginal, occurrenceByPath, overwrite);
+        attachProgressInfo(detail, progressInfo);
+        debugFieldDetail('direct-write', detail);
+        detailsByGroup[operationGroup].push(detail);
+        options.onProgress?.({
+          ...progressInfo,
+          stage: 'done',
+          status: detail.status || ''
+        });
         continue;
       }
-      detailsByGroup[operationGroup].push(await fillSelectionField(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite));
+      const detail = await fillSelectionFieldWithTimeout(profile, original, valueOriginal, occurrenceByPath, operationGroup, overwrite, options);
+      attachProgressInfo(detail, progressInfo);
+      debugFieldDetail(operationGroup, detail);
+      detailsByGroup[operationGroup].push(detail);
+      options.onProgress?.({
+        ...progressInfo,
+        stage: 'done',
+        status: detail.status || ''
+      });
       await wait(180);
       throwIfCancelled(`填写${original.displayName || original.ref || ''}`);
     }
@@ -1415,11 +1857,19 @@
   function reportFieldStats(report) {
     const controls = report?.controls || [];
     const fillable = controls.filter((item) => FILL_OPERATION_GROUPS.has(item.operationGroup));
+    const mappedFillable = fillable.filter(isMappedFillTarget);
+    const currentEmptyMapped = mappedFillable.filter(isCurrentEmptyFillTarget);
+    const currentFilledMapped = mappedFillable.filter((item) => hasCurrentValueInfo(item) && !isCurrentEmptyControl(item));
+    const ambiguousSkipped = fillable.filter((item) => item.mappingStatus === 'ambiguous').length;
+    const unmappedSkipped = fillable.filter((item) => item.mappingStatus === 'unmapped' || (!item.profilePath && item.mappingStatus !== 'ambiguous')).length;
     return {
       totalControls: controls.length,
       fillableControls: fillable.length,
-      mappedFillable: fillable.filter((item) => item.profilePath).length,
-      unmappedSkipped: fillable.filter((item) => !item.profilePath).length
+      mappedFillable: mappedFillable.length,
+      currentEmptyMapped: currentEmptyMapped.length,
+      currentFilledMapped: currentFilledMapped.length,
+      ambiguousSkipped,
+      unmappedSkipped
     };
   }
 
@@ -1434,6 +1884,89 @@
     ];
   }
 
+  function fieldProgressKey(item = {}, options = {}) {
+    return [
+      item.ref || '',
+      item.profilePath || '',
+      options.repeatSection || item.repeatSection || '',
+      options.repeatIndex || item.repeatIndex || '',
+      item.operationGroup || '',
+      item.compoundRole || '',
+      item.matchedKey || '',
+      item.field || item.displayName || ''
+    ].join('|');
+  }
+
+  function hasCurrentValueInfo(item = {}) {
+    return Object.prototype.hasOwnProperty.call(item, 'hasCurrentValue')
+      || Object.prototype.hasOwnProperty.call(item, 'currentValueState')
+      || Object.prototype.hasOwnProperty.call(item, 'currentValue');
+  }
+
+  function isCurrentEmptyFillTarget(item = {}) {
+    if (!isMappedFillTarget(item)) return false;
+    return isCurrentEmptyControl(item);
+  }
+
+  function isCurrentEmptyControl(item = {}) {
+    if (!FILL_OPERATION_GROUPS.has(item.operationGroup)) return false;
+    if (item.currentValueState === 'empty') return true;
+    if (item.currentValueState === 'filled') return false;
+    if (Object.prototype.hasOwnProperty.call(item, 'hasCurrentValue')) return !item.hasCurrentValue;
+    if (hasCurrentValueInfo(item)) return !clean(item.currentValue);
+    return true;
+  }
+
+  function currentEmptyFillTargets(report, options = {}) {
+    return (report?.controls || [])
+      .filter((field) => isExecutableFillTarget(field, options))
+      .sort((left, right) => fieldOrder(left) - fieldOrder(right));
+  }
+
+  function skippedEmptyReviewTargets(report, options = {}) {
+    const filter = typeof options.filter === 'function' ? options.filter : () => true;
+    return (report?.controls || [])
+      .filter((field) => FILL_OPERATION_GROUPS.has(field.operationGroup) && !isMappedFillTarget(field) && isCurrentEmptyControl(field) && filter(field))
+      .sort((left, right) => fieldOrder(left) - fieldOrder(right));
+  }
+
+  function attachProgressInfo(detail, progressInfo = {}) {
+    if (detail && typeof detail === 'object') {
+      detail.progressKey = progressInfo.progressKey || '';
+      detail.emptyProgressTarget = Boolean(progressInfo.emptyProgressTarget);
+    }
+    return detail;
+  }
+
+  function currentEmptyProgressStats(report, details = [], options = {}) {
+    const targets = currentEmptyFillTargets(report, options);
+    const total = targets.length;
+    const targetKeys = new Set(targets.map((item) => fieldProgressKey(item, options)));
+    const skippedTargets = skippedEmptyReviewTargets(report, options);
+    const processedKeys = new Set();
+    for (const detail of details) {
+      const key = detail?.progressKey || fieldProgressKey(detail || {}, options);
+      if (!key) continue;
+      if (targetKeys.has(key)) processedKeys.add(key);
+    }
+    const processed = Math.min(total, processedKeys.size);
+    return {
+      total,
+      processed,
+      skipped: skippedTargets.length,
+      remaining: Math.max(0, total - processed)
+    };
+  }
+
+  function currentEmptyProgressDetailText(stats = {}, totals = {}) {
+    const total = Number(stats.total || 0);
+    const processed = Number(stats.processed || 0);
+    const skipped = Number(stats.skipped || 0);
+    const skippedText = skipped ? `，未映射已跳过 ${skipped}` : '';
+    if (!total) return `当前页没有识别到需要补写的空值字段。实际写入 ${totals.filled || 0}，待审核 ${totals.manualReview || 0}，遗漏 ${totals.omitted || 0}。`;
+    return `空值字段已处理或跳过 ${processed}/${total}${skippedText}，实际写入 ${totals.filled || 0}，待审核 ${totals.manualReview || 0}，遗漏 ${totals.omitted || 0}。`;
+  }
+
   function operationPerformance(details = []) {
     const groups = new Map();
     for (const item of details) {
@@ -1444,6 +1977,37 @@
       groups.set(operation, entry);
     }
     return [...groups.values()].sort((left, right) => right.ms - left.ms);
+  }
+
+  function componentPerformance(details = []) {
+    const groups = new Map();
+    for (const item of details) {
+      const component = item.controlKind || item.legacyType || item.operation || 'unknown';
+      const entry = groups.get(component) || {
+        component,
+        operation: item.operation || '',
+        count: 0,
+        ms: 0,
+        maxMs: 0,
+        slowestField: '',
+        slowestRef: ''
+      };
+      const ms = Number(item.ms || 0);
+      entry.count += 1;
+      entry.ms += ms;
+      if (ms >= entry.maxMs) {
+        entry.maxMs = ms;
+        entry.slowestField = item.field || '';
+        entry.slowestRef = item.ref || '';
+      }
+      groups.set(component, entry);
+    }
+    return [...groups.values()]
+      .map((item) => ({
+        ...item,
+        avgMs: item.count ? Math.round(item.ms / item.count) : 0
+      }))
+      .sort((left, right) => right.ms - left.ms);
   }
 
   function slowFieldPerformance(details = []) {
@@ -1458,10 +2022,54 @@
         status: item.status,
         reason: item.reason || '',
         operation: item.operation || '',
+        controlKind: item.controlKind || '',
         legacyType: item.legacyType || '',
         stage: item.stage || '',
-        ms: item.ms
+        ms: item.ms,
+        timingComponent: item.timingComponent || '',
+        timingTotalMs: item.timingTotalMs || 0,
+        timing: Array.isArray(item.timing) ? item.timing.slice(0, 20) : []
       }));
+  }
+
+  function slowStepPerformance(details = []) {
+    const steps = [];
+    for (const item of details) {
+      const timing = Array.isArray(item.timing) ? item.timing : [];
+      for (const step of timing) {
+        const ms = Number(step?.ms || 0);
+        if (!ms) continue;
+        steps.push({
+          ref: item.ref,
+          field: item.field,
+          profilePath: item.profilePath,
+          operation: item.operation || '',
+          controlKind: item.controlKind || '',
+          legacyType: item.legacyType || '',
+          status: item.status || '',
+          component: item.timingComponent || item.controlKind || item.legacyType || '',
+          step: step.name || '',
+          ms,
+          ok: step.ok,
+          phase: step.phase || '',
+          timeout: step.timeout || 0,
+          trustedTimeout: step.trustedTimeout || 0,
+          error: step.error || ''
+        });
+      }
+    }
+    return steps
+      .sort((left, right) => Number(right.ms || 0) - Number(left.ms || 0))
+      .slice(0, 20);
+  }
+
+  function updateAutofillDebugOverlay(report, details = []) {
+    const api = auditApi();
+    if (!debugTraceEnabled) {
+      api?.clearAutofillDebugOverlay?.();
+      return null;
+    }
+    return api?.showAutofillDebugOverlay?.({ report, details, runId: debugRunId }) || null;
   }
 
   function progressRange(start, end, title) {
@@ -1477,8 +2085,37 @@
     };
   }
 
-  async function runAutofill(profile, overwrite = false) {
+  function currentEmptyProgress(report, options = {}, { start = 30, end = 90, title = '填写页面' } = {}) {
+    const targets = currentEmptyFillTargets(report, options);
+    const total = targets.length;
+    const targetKeys = new Set(targets.map((item) => fieldProgressKey(item, options)));
+    const completedKeys = new Set();
+    const labelFor = (info = {}) => clean(info.field || info.profilePath || info.ref || '');
+    return (info = {}) => {
+      const key = info.progressKey || '';
+      const isTarget = info.emptyProgressTarget === true || (key && targetKeys.has(key));
+      if (info.stage === 'done' && isTarget && key) completedKeys.add(key);
+      const done = Math.min(total, completedKeys.size);
+      const ratio = total ? done / total : 1;
+      const percent = start + (end - start) * ratio;
+      const current = labelFor(info);
+      const statusText = info.stage === 'done'
+        ? `已处理或跳过空值字段 ${done}/${total}`
+        : `空值字段 ${done}/${total}`;
+      const currentText = current ? `，当前：${current}` : '';
+      updateProgress({
+        percent,
+        title,
+        detail: total ? `${statusText}${currentText}` : '当前页没有识别到需要补写的空值字段。'
+      });
+    };
+  }
+
+  async function runAutofill(profile, overwrite = false, options = {}) {
     cancelAutofillRequested = false;
+    debugTraceEnabled = Boolean(options.debug);
+    debugTraceEntries = [];
+    debugRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     progressLineIndex = 0;
     progressLineBag = [];
     const started = performance.now();
@@ -1491,28 +2128,50 @@
     };
 
     try {
+      debugTrace('run-start', { version: VERSION, overwrite });
       updateProgress({ percent: 3, title: '准备开始', detail: '先看看当前页面能处理多少内容。' });
       const api = auditApi();
       if (!api?.diagnosePage || !api?.getSource) throw new Error('页面解析 API 尚未加载，请刷新页面后重试');
+      if (!debugTraceEnabled) api?.clearAutofillDebugOverlay?.();
       profile = profileData(profile);
       if (!profile || typeof profile !== 'object') throw new Error('没有收到个人资料');
+      debugTrace('profile-ready', { sections: Object.keys(profile).filter((key) => profile?.[key]).slice(0, 40) });
       throwIfCancelled('准备填写');
 
       updateProgress({ percent: 10, title: '解析页面', detail: '正在统计可处理的页面元素。' });
       let report = api.diagnosePage();
       const initialFieldStats = reportFieldStats(report);
+      debugTrace('page-diagnosed', {
+        controls: initialFieldStats.totalControls,
+        mappedFillable: initialFieldStats.mappedFillable,
+        currentEmptyMapped: initialFieldStats.currentEmptyMapped,
+        currentFilledMapped: initialFieldStats.currentFilledMapped,
+        ambiguousSkipped: initialFieldStats.ambiguousSkipped,
+        unmappedSkipped: initialFieldStats.unmappedSkipped,
+        currentValueStats: report.currentValueStats || null
+      });
       markStage('解析页面');
       throwIfCancelled('解析页面');
 
       updateProgress({ percent: 20, title: '准备经历段落' });
       const structures = await ensureRepeatSections(profile, report);
       report = structures.report;
+      debugTrace('repeat-sections-ready', {
+        sections: structures.details.map((item) => `${item.section}:${item.status}:${item.after || 0}/${item.desired || 0}`).join(', ')
+      });
       markStage('处理重复经历');
       throwIfCancelled('处理重复经历');
 
-      updateProgress({ percent: 30, title: '填写页面' });
+      const fillTargetReport = report;
+      const emptyProgressStart = currentEmptyProgressStats(fillTargetReport);
+      const fillProgress = currentEmptyProgress(fillTargetReport, {}, { start: 30, end: 90, title: '填写页面' });
+      updateProgress({
+        percent: 30,
+        title: '填写页面',
+        detail: emptyProgressStart.total ? `空值字段 0/${emptyProgressStart.total}` : '当前页没有识别到需要补写的空值字段。'
+      });
       const orderedFill = await sequentialFillControls(profile, report, overwrite, {
-        onProgress: progressRange(30, 90, '填写页面')
+        onProgress: fillProgress
       });
       report = orderedFill.report;
       markStage('填写可见字段');
@@ -1535,6 +2194,7 @@
         ...sequential.recordRuns.flatMap((run) => phaseOmissions(run.phases || {}))
       ];
       const details = allFillDetails(initialPhases, sequential.recordRuns);
+      const emptyProgress = currentEmptyProgressStats(fillTargetReport, details);
       markStage('汇总结果');
       const totalMs = Math.round(performance.now() - started);
       const response = {
@@ -1570,17 +2230,33 @@
           stages,
           fieldStats: initialFieldStats,
           byOperation: operationPerformance(details),
-          slowFields: slowFieldPerformance(details)
-        }
+          byComponent: componentPerformance(details),
+          slowFields: slowFieldPerformance(details),
+          slowSteps: slowStepPerformance(details)
+        },
+        progress: {
+          currentEmpty: emptyProgress
+        },
+        debug: debugSnapshot()
       };
+      debugTrace('run-finish', {
+        complete: response.complete,
+        completed: response.totals.completed,
+        required: response.totals.required,
+        omitted: response.totals.omitted,
+        totalMs
+      });
+      response.debug = debugSnapshot();
+      response.debugOverlay = updateAutofillDebugOverlay(report, details);
       finishProgress({
         title: response.complete ? '处理完成' : '处理完成，仍有字段需要检查',
-        detail: `完成 ${response.totals.completed}/${response.totals.required}，实际写入 ${response.totals.filled}，待审核 ${response.totals.manualReview}，遗漏 ${response.totals.omitted}。`
+        detail: currentEmptyProgressDetailText(emptyProgress, response.totals)
       });
       return response;
     } catch (error) {
       if (error?.name === 'ResumeAutofillCancelled') {
         const totalMs = Math.round(performance.now() - started);
+        debugTrace('run-cancelled', { message: error.message || '', totalMs });
         finishProgress({
           title: '已取消本次填写',
           detail: '已经停止，后面的内容不会继续操作。',
@@ -1595,9 +2271,11 @@
           overwrite,
           message: error.message || '用户已取消填写',
           totals: { filled: 0, completed: 0, required: 0, omitted: 0, manualReview: 0, attempted: 0, ms: totalMs },
-          performance: { totalMs, stages }
+          performance: { totalMs, stages },
+          debug: debugSnapshot()
         };
       }
+      debugTrace('run-error', { message: error?.message || String(error), stack: error?.stack || '' });
       finishProgress({
         title: '填写失败',
         detail: '填写时遇到问题，详情可以在扩展窗口下载日志查看。',
@@ -1615,8 +2293,8 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const type = normalizedMessageType(message);
     if (type === 'RESUME_PROFILE_FILL_CURRENT_PAGE') {
-      runAutofill(message.profile, Boolean(message.overwrite)).then(sendResponse)
-        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      runAutofill(message.profile, Boolean(message.overwrite), { debug: Boolean(message.debug) }).then(sendResponse)
+        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error), debug: debugSnapshot() }));
       return true;
     }
   });
